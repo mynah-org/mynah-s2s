@@ -89,8 +89,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("wavs", nargs="+")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--fc-ctx-fix", default="auto", choices=["auto", "on", "off"],
-                    help="FC hand-back fix (selective): auto = ON for the official VoiceChat checkpoint only; off = rollback")
+    ap.add_argument("--fc-ctx-fix", default="auto", choices=["auto", "on", "off", "eotr_step"],
+                    help="FC hand-back fix (selective): auto = ON for the official VoiceChat checkpoint only; off = rollback; "
+                         "eotr_step = EXPERIMENT, the training layout's inserted EOTR slot (explicit only)")
     ap.add_argument("--strict", action="store_true",
                     help="fail if a requested optimisation cannot be enabled (default: continue without it, WARNING)")
     ap.add_argument("--preset", default="release", choices=list(presets.SINGLE),

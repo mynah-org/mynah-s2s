@@ -39,10 +39,17 @@ def _pad_id(engine) -> int:
     return int(engine.wrapper.model.stt_model.text_pad_id)
 
 
-def enable(engine, pad_fill: bool = True, channels=_CH, func_pad: bool = False) -> dict:
+def enable(engine, pad_fill: bool = True, channels=_CH, func_pad: bool = False, eotr_step: bool = False) -> dict:
     """pad_fill: real PAD in the context manager; channels: which FC-written buffers are copied back (diagnostic
     variants isolate which part changes the model's behaviour at the resume step); func_pad: write PAD over the FC span
     of the function channel (the official VoiceChat re-opens the call when EOTR is fed back at resume: FX5/round 12).
+    eotr_step (EXPERIMENT, off by default; owner GO 2026-11-13): the training layout's inserted EOTR slot. After a
+    phase-2 FC run that ends on the model's own EOTR, one more inserted FC step runs. It uses the same NeMo loop with
+    ``max_async_steps=1`` and consumes (text PAD, function EOTR, silence embedding), with no real audio and the live
+    queue detached. Its function prediction is recorded and overwritten with PAD (the training label at that slot), so
+    the step can never open or run a call. The main loop then resumes on (PAD, PAD), and any further call is decided
+    by the first real frame through the normal path. Cost: one inserted position (one more 80 ms TTS silence chunk);
+    no real audio frame is consumed.
     Every first main step after an FC hand-back records the tokens it ACTUALLY consumes (``stats["resume_inputs"]``)."""
     w = engine.wrapper
     if getattr(w, "_v2_fc_ctx_fix", None) is not None:
@@ -78,7 +85,7 @@ def enable(engine, pad_fill: bool = True, channels=_CH, func_pad: bool = False) 
     bufs: dict = {}                                       # stream_id → the session's context buffers
     lock = threading.Lock()
     stats = {"fc_calls": 0, "copies": 0, "copied_positions": 0, "no_context": 0, "errors": 0, "pad_id": pad,
-             "resume_inputs": []}
+             "resume_inputs": [], "eotr_steps": []}
     resume_pending: set = set()
 
     orig_infer = w.infer_one_step
@@ -105,6 +112,8 @@ def enable(engine, pad_fill: bool = True, channels=_CH, func_pad: bool = False) 
 
     def fc_fixed(*args, **kw):
         out = inner(*args, **kw)
+        if eotr_step:
+            out = _eotr_silent_step(w, inner, kw, out, pad, stats)
         try:
             stats["fc_calls"] += 1
             steps = int(out[0])
@@ -136,8 +145,71 @@ def enable(engine, pad_fill: bool = True, channels=_CH, func_pad: bool = False) 
     w.infer_one_step = infer_one_step
     w._v2_fc_ctx_fix = {"cls_init": orig_cls_init, "cls": cls, "infer": orig_infer, "had_infer_attr": had_infer_attr,
                         "fc_inner": inner, "bufs": bufs, "stats": stats}
-    return {"pad_id": pad, "pad_fill": pad_fill, "channels": channels, "func_pad": func_pad, "refilled_buffers": refilled,
-            "stats": stats}
+    return {"pad_id": pad, "pad_fill": pad_fill, "channels": channels, "func_pad": func_pad, "eotr_step": eotr_step,
+            "refilled_buffers": refilled, "stats": stats}
+
+
+EOTR_ID = 22
+
+
+def _eotr_silent_step(w, inner, kw: dict, out, pad: int, stats: dict):
+    """The inserted EOTR slot (see enable(eotr_step)). Returns the FC result extended by one step, or ``out`` unchanged
+    (the reason is recorded) when the phase did not end on the model's own EOTR (abort, quit, interrupt, step cap)."""
+    rec = {"stream": kw.get("stream_id")}
+    try:
+        steps = int(out[0])
+        cfi = int(kw["current_frame_idx"])
+        last = cfi + steps                                   # the position that holds the model's EOTR
+        gt, ga, gf = kw.get("gen_text"), kw.get("gen_asr_text"), kw.get("gen_function_text")
+        fc_state = kw.get("fc_state") or {}
+        ev = [kw.get("abort_event"), kw.get("quit_async_event")]
+        why = ("not phase 2" if not kw.get("tool_response_text") else "no steps" if steps <= 0
+               else "no buffer" if gf is None or gt is None else "end of buffer" if last + 1 >= gf.shape[1]
+               else "abort/quit" if any(e is not None and e.is_set() for e in ev)
+               else "natural interrupt" if fc_state.get("natural_interrupt")
+               else "no EOTR at the end" if int(gf[0, last]) != int(getattr(w, "_fc_eotr_id", None) or EOTR_ID) else None)
+        rec.update(frame=last + 1, phase_steps=steps)
+        if why:
+            rec["skipped"] = why
+            return out
+        rec["consumed"] = {"text": int(gt[0, last]), "asr": int(ga[0, last]) if ga is not None else None,
+                          "func": int(gf[0, last])}
+        seen = {}
+        llm = w.model_llm_interface
+        had_attr = "model_llm_interface" in w.__dict__
+
+        def spy(*a, **k):                                    # record what the silent step predicts (then overwritten)
+            ans = llm(*a, **k)
+            for key in ("predicted_token", "function_predicted_token"):
+                v = ans.get(key) if isinstance(ans, dict) else None
+                if v is not None:
+                    seen[key] = int(v.reshape(-1)[0]) if hasattr(v, "reshape") else int(v)
+            return ans
+
+        kw2 = dict(kw, fc_state={"forced_function_tokens": [pad], "active": False}, current_frame_idx=last,
+                   dynamic_cache=out[1], tts_state=out[2], rnnt_partial_hypotheses=out[4] if len(out) > 4 else None,
+                   tool_response_text=None, max_async_steps=1, live_audio_queue=None, realtime_audio=None,
+                   rnnt_text_queue=None, acknowledgement_tokens=None)
+        w.model_llm_interface = spy
+        try:
+            o2 = inner(**kw2)
+        finally:                                             # restore exactly what was there
+            if had_attr:
+                w.model_llm_interface = llm
+            else:
+                del w.model_llm_interface
+        rec.update(steps=int(o2[0]), pred_text=seen.get("predicted_token"), pred_func=seen.get("function_predicted_token"),
+                   written={"text": int(gt[0, last + 1]), "func": int(gf[0, last + 1])})
+        out = (steps + int(o2[0]), o2[1], o2[2], list(out[3] or []) + list(o2[3] or []),
+               *(o2[4:] if len(o2) > 4 else ()))
+        return out
+    except Exception as e:  # noqa: BLE001 - never break the FC path; recorded
+        rec["error"] = repr(e)
+        stats["errors"] += 1
+        return out
+    finally:
+        if len(stats["eotr_steps"]) < 500:
+            stats["eotr_steps"].append(rec)
 
 
 def forget(engine, stream_id) -> None:

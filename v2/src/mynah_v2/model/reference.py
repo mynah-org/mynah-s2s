@@ -257,13 +257,17 @@ class ReferenceEngine:
         semantics (real PAD + text/ASR copied back, function channel PAD → the resumed step consumes (PAD, PAD), never
         EOTR: EOTR re-opens the call on this model, FX5/round 12). Other checkpoints (e.g. the multilingual lab's
         D-V2.1) stay OFF: their hand-back semantics differ. mode: "auto" (default) | "on" | "off"; env
-        MYNAH_V2_FC_CTX_FIX overrides the default (rollback without code change)."""
+        MYNAH_V2_FC_CTX_FIX overrides the default (rollback without code change). "eotr_step" (explicit only, never
+        a default) = the experimental training-layout EOTR slot, see fc_ctx_fix.enable(eotr_step)."""
         mode = (mode or os.environ.get("MYNAH_V2_FC_CTX_FIX") or "auto").lower()
         ckpt = os.path.realpath(str(self.cfg.s2s.llm_checkpoint_path))
         official = os.path.basename(ckpt.rstrip("/")) == OFFICIAL_SNAPSHOT
-        on = mode == "on" or (mode == "auto" and official)
+        on = mode in ("on", "eotr_step") or (mode == "auto" and official)
         info = {"mode": mode, "official_checkpoint": official, "enabled": on}
-        if on:
+        if mode == "eotr_step":                  # EXPERIMENT (explicit only): the training layout's inserted EOTR slot
+            from mynah_v2.model import fc_ctx_fix
+            info["fix"] = fc_ctx_fix.enable(self, pad_fill=True, channels=fc_ctx_fix._CH, func_pad=False, eotr_step=True)
+        elif on:
             from mynah_v2.model import fc_ctx_fix
             info["fix"] = fc_ctx_fix.enable(self, pad_fill=True, channels=("gen_text", "gen_asr_text"), func_pad=True)
         return info

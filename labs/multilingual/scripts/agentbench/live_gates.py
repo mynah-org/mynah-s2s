@@ -21,6 +21,7 @@ from __future__ import annotations
 
 ENGINE = "PAD,PAD (engine fc_ctx_fix)"
 ENGINE_EOTR = "PAD,EOTR (engine fc_ctx_fix, function channel copied back)"
+ENGINE_EOTR_STEP = "EOTR silent step, then PAD,PAD (engine fc_ctx_fix eotr_step, experiment)"
 LAB = "PAD,EOTR (lab NeMo patch)"
 UPSTREAM = "upstream 0,0"
 DOUBLE = "INVALID double fix"
@@ -33,6 +34,8 @@ def resume_contract(rf: dict) -> str:
         return DOUBLE
     if eng:
         e = rf.get("engine_fc_ctx_fix") or {}
+        if e.get("eotr_step"):
+            return ENGINE_EOTR_STEP
         if e.get("func_pad") is False and "gen_function_text" in (e.get("channels") or []):
             return ENGINE_EOTR
         return ENGINE
@@ -47,7 +50,7 @@ def m07_chain(rec: dict) -> dict:
     if rec.get("scenario") != "m07" or rec.get("lang") != "en":
         out["valid"] = False
         out["reasons"].append("not the EN m07 session")
-    if contract not in (ENGINE, ENGINE_EOTR):
+    if contract not in (ENGINE, ENGINE_EOTR, ENGINE_EOTR_STEP):
         out["valid"] = False
         out["reasons"].append(f"resume contract is {contract!r}, the gate needs an engine contract")
     calls, audit = rec.get("calls", []), rec.get("audit", [])
@@ -71,6 +74,7 @@ def m07_chain(rec: dict) -> dict:
         out["reasons"].append("a return was submitted without the caller's confirmation")
     out["fc_trace"] = rec.get("fc_events")
     out["resume_inputs"] = rec.get("fc_resume_inputs")
+    out["eotr_steps"] = rec.get("fc_eotr_steps")
     out["pass"] = out["valid"] and all(out["checks"].values())
     return out
 

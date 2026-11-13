@@ -14,6 +14,8 @@ def test_resume_contract_labels():
     eotr = dict(ENG_RF, engine_fc_ctx_fix={"enabled": True, "func_pad": False,
                                           "channels": ["gen_text", "gen_asr_text", "gen_function_text"]})
     assert resume_contract(eotr) == ENGINE_EOTR
+    from live_gates import ENGINE_EOTR_STEP
+    assert resume_contract(dict(eotr, engine_fc_ctx_fix=dict(eotr["engine_fc_ctx_fix"], eotr_step=True))) == ENGINE_EOTR_STEP
     assert resume_contract(dict(ENG_RF, engine_fc_ctx_fix={"enabled": True, "func_pad": True,
                                                           "channels": ["gen_text", "gen_asr_text"]})) == ENGINE
 

@@ -171,3 +171,125 @@ def test_selective_variant_resumes_on_pad_pad_and_records_consumed_inputs():
     assert eng.wrapper.reads[-2][2:] == (PAD, PAD) and eng.wrapper.reads[-1][2:] == (PAD, PAD)
     assert [r["stream"] for r in info["stats"]["resume_inputs"]] == [0, 0, 0, 1]
     fc_ctx_fix.disable(eng)
+
+
+# ------------------------------------------------------------------ eotr_step (experiment, owner GO 2026-11-13)
+SOTC = 20
+
+
+class FakeWrapperE(FakeWrapper):
+    """Adds the pieces the inserted EOTR slot uses: model_llm_interface (spied) and the NeMo loop's forced-token /
+    max_async_steps behaviour (wrapper :1579-1606)."""
+
+    def __init__(self, silent_pred=SOTC):
+        super().__init__()
+        self.silent_pred, self.calls = silent_pred, []
+
+    def model_llm_interface(self, *a, **k):
+        return {"predicted_token": torch.tensor([PAD]), "function_predicted_token": torch.tensor([self.silent_pred])}
+
+    def _run_fc_async_steps(self, fc_state=None, gen_text=None, gen_asr_text=None, gen_function_text=None,
+                            current_frame_idx=0, func=(), stream_id=None, max_async_steps=2000, **kw):
+        self.calls.append(dict(kw, current_frame_idx=current_frame_idx, max_async_steps=max_async_steps,
+                               fc_state={k: (list(v) if isinstance(v, list) else v) for k, v in (fc_state or {}).items()}))
+        forced = (fc_state or {}).get("forced_function_tokens")
+        if forced and max_async_steps == 1:                   # the inserted EOTR slot
+            t = current_frame_idx + 1
+            ans = self.model_llm_interface()
+            gen_text[0, t] = PAD
+            gen_asr_text[0, t] = PAD
+            gen_function_text[0, t] = int(ans["function_predicted_token"][0])
+            gen_function_text[0, t] = forced.pop(0)          # forced override, as the NeMo loop does
+            return (1, "cache2", "tts2", ["chunk"], None)
+        return super()._run_fc_async_steps(fc_state=fc_state, gen_text=gen_text, gen_asr_text=gen_asr_text,
+                                           gen_function_text=gen_function_text, current_frame_idx=current_frame_idx,
+                                           func=func, stream_id=stream_id)
+
+
+class FakeEngineE(FakeEngine):
+    def __init__(self, **kw):
+        self.wrapper = FakeWrapperE(**kw)
+        self.pipeline = SimpleNamespace(context_manager=None)
+        self.fc_records, self._fc_lock = [], threading.Lock()
+        self._instrument_fc()
+
+
+def fc_cycle_e(eng, ctx, sid, p1, p2, phase2_kw=None):
+    snap = [b.clone() for b in (ctx.gen_text, ctx.gen_asr_text, ctx.gen_function_text)]
+    cfi, steps = ctx.frame_idx - 1, 0
+    for func, extra in ((p1, {}), (p2, dict({"tool_response_text": "{}"}, **(phase2_kw or {})))):
+        out = eng.wrapper._run_fc_async_steps(fc_state={}, gen_text=snap[0], gen_asr_text=snap[1],
+                                              gen_function_text=snap[2], current_frame_idx=cfi + steps,
+                                              func=func, stream_id=sid, **extra)
+        steps += out[0]
+    ctx.frame_idx += steps
+    return steps, out
+
+
+def test_eotr_step_inserts_the_training_slot_and_never_opens_a_call():
+    eng, ctx = FakeEngineE(silent_pred=SOTC), Ctx()
+    info = fc_ctx_fix.enable(eng, channels=fc_ctx_fix._CH, func_pad=False, eotr_step=True)
+    for _ in range(4):
+        main_step(eng, ctx, 1)
+    p1, p2 = [30, 31, 21], [40, 41, EOTR]
+    steps, out = fc_cycle_e(eng, ctx, 1, p1, p2)
+    assert steps == len(p1) + len(p2) + 1                    # one inserted position more
+    rec = info["stats"]["eotr_steps"][-1]
+    last = 3 + len(p1) + len(p2)
+    assert rec["consumed"] == {"text": PAD, "asr": PAD, "func": EOTR} and rec["frame"] == last + 1
+    assert rec["pred_func"] == SOTC and rec["written"] == {"text": PAD, "func": PAD}   # predicted SOTC, written PAD
+    call = eng.wrapper.calls[-1]
+    assert call["max_async_steps"] == 1 and call["current_frame_idx"] == last and call["tool_response_text"] is None
+    assert call["live_audio_queue"] is None and call["realtime_audio"] is None
+    assert call["fc_state"] == {"forced_function_tokens": [PAD], "active": False}
+    assert out[1:4] == ("cache2", "tts2", ["chunk"])          # cache / TTS state carried from the inserted step
+    main_step(eng, ctx, 1)
+    assert eng.wrapper.reads[-1][2:] == (PAD, PAD)            # the main loop resumes on (PAD, PAD)
+    assert "model_llm_interface" not in eng.wrapper.__dict__  # the spy is gone, the method is the class one again
+    assert info["stats"]["resume_inputs"][-1]["func"] == PAD
+
+
+@pytest.mark.parametrize("p2,kw,why", [([40, 41, 7], {}, "no EOTR at the end"),
+                                       ([40, 41, EOTR], {"abort_event": threading.Event()}, "abort/quit"),
+                                       ([40, 41, EOTR], {"natural": True}, "natural interrupt")])
+def test_eotr_step_skips_when_the_phase_did_not_end_on_eotr(p2, kw, why):
+    eng, ctx = FakeEngineE(), Ctx()
+    info = fc_ctx_fix.enable(eng, channels=fc_ctx_fix._CH, func_pad=False, eotr_step=True)
+    for _ in range(4):
+        main_step(eng, ctx, 1)
+    extra = {}
+    if "abort_event" in kw:
+        kw["abort_event"].set()
+        extra["abort_event"] = kw["abort_event"]
+    snap = [b.clone() for b in (ctx.gen_text, ctx.gen_asr_text, ctx.gen_function_text)]
+    st = {"natural_interrupt": True} if kw.get("natural") else {}
+    out = eng.wrapper._run_fc_async_steps(fc_state=st, gen_text=snap[0], gen_asr_text=snap[1], gen_function_text=snap[2],
+                                          current_frame_idx=3, func=p2, stream_id=1, tool_response_text="{}", **extra)
+    assert out[0] == len(p2) and info["stats"]["eotr_steps"][-1]["skipped"] == why
+    assert all(c["max_async_steps"] != 1 for c in eng.wrapper.calls)
+
+
+def test_eotr_step_never_runs_in_phase_1_or_when_off():
+    for on in (True, False):
+        eng, ctx = FakeEngineE(), Ctx()
+        info = fc_ctx_fix.enable(eng, channels=fc_ctx_fix._CH, func_pad=False, eotr_step=on)
+        snap = [b.clone() for b in (ctx.gen_text, ctx.gen_asr_text, ctx.gen_function_text)]
+        out = eng.wrapper._run_fc_async_steps(fc_state={}, gen_text=snap[0], gen_asr_text=snap[1],
+                                              gen_function_text=snap[2], current_frame_idx=3, func=[30, EOTR],
+                                              stream_id=1)            # phase 1: no tool_response_text
+        assert out[0] == 2 and all(c["max_async_steps"] != 1 for c in eng.wrapper.calls)
+        assert bool(info["stats"]["eotr_steps"]) == on        # recorded as skipped only when the option is on
+
+
+def test_engine_modes_default_unchanged_and_eotr_step_explicit(monkeypatch):
+    seen = []
+    monkeypatch.setattr(fc_ctx_fix, "enable", lambda eng, **k: seen.append(k) or {"ok": True})
+    monkeypatch.delenv("MYNAH_V2_FC_CTX_FIX", raising=False)
+    from mynah_v2.model.reference import OFFICIAL_SNAPSHOT
+    fake = SimpleNamespace(cfg=SimpleNamespace(s2s=SimpleNamespace(llm_checkpoint_path=f"/x/{OFFICIAL_SNAPSHOT}")))
+    auto = ReferenceEngine._default_fc_ctx_fix(fake, None)
+    assert auto["enabled"] and seen[-1] == {"pad_fill": True, "channels": ("gen_text", "gen_asr_text"), "func_pad": True}
+    exp = ReferenceEngine._default_fc_ctx_fix(fake, "eotr_step")
+    assert exp["enabled"] and seen[-1]["eotr_step"] is True and seen[-1]["func_pad"] is False
+    other = SimpleNamespace(cfg=SimpleNamespace(s2s=SimpleNamespace(llm_checkpoint_path="/x/lab-ckpt")))
+    assert not ReferenceEngine._default_fc_ctx_fix(other, None)["enabled"]   # non-official stays off by default

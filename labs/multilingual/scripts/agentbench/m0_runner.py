@@ -129,13 +129,17 @@ def engine_fix_summary(eng) -> dict:
     _fx = getattr(eng, "fc_ctx_fix_info", None) or {}
     d = {k: (list(v) if isinstance(v, tuple) else v) for k, v in _fx.items() if k != "fix"}
     if isinstance(_fx.get("fix"), dict):
-        d.update({k: _fx["fix"].get(k) for k in ("pad_id", "func_pad")}, channels=list(_fx["fix"].get("channels", ())))
+        d.update({k: _fx["fix"].get(k) for k in ("pad_id", "func_pad", "eotr_step")},
+                 channels=list(_fx["fix"].get("channels", ())))
     return d
 
 
 FC_RESUME = {  # the engine's own fc_ctx_fix, parameterised (no engine change); owner 2026-11-13: the 2x2 resume matrix
     "pad_pad": dict(pad_fill=True, channels=("gen_text", "gen_asr_text"), func_pad=True),     # the engine default
     "pad_eotr": dict(pad_fill=True, channels=("gen_text", "gen_asr_text", "gen_function_text"), func_pad=False),
+    # EXPERIMENT (owner GO 2026-11-13): the training layout's inserted EOTR slot, then (PAD, PAD)
+    "eotr_step": dict(pad_fill=True, channels=("gen_text", "gen_asr_text", "gen_function_text"), func_pad=False,
+                      eotr_step=True),
 }
 
 
@@ -240,7 +244,7 @@ def main():
     ap.add_argument("--no-fc-fix", action="store_true",
                     help="force the post-FC runtime fix flags to 0 (lab default is already OFF since 2026-11-12 14:30)")
     ap.add_argument("--fc-resume-by-label", default="",
-                    help="'label=pad_pad|label=pad_eotr|label=off': re-arm the engine fc_ctx_fix per plan label")
+                    help="'label=pad_pad|label=pad_eotr|label=eotr_step|label=off': re-arm the engine fc_ctx_fix per plan label")
     ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
     ap.add_argument("--ml-dir", default=str(LAB_HOME / "ckpt/asr-ml"))
     a = ap.parse_args()
@@ -409,6 +413,7 @@ def main():
                 raise SystemExit("both FC hand-back fixes active for this session: refused")
             _rs = ((getattr(eng, "fc_ctx_fix_info", None) or {}).get("fix") or {}).get("stats") or {}
             n_resume0 = len(_rs.get("resume_inputs", []))
+            n_eotr0 = len(_rs.get("eotr_steps", []))
             t0 = time.monotonic()
             sess.open(prompt)
             run_paced(sess, wav, pace="realtime", tail_silence_s=a.tail_s, max_extra_s=a.max_extra_s, drain=True)
@@ -418,6 +423,7 @@ def main():
             import live_gates
             fcev = live_gates.fc_events(od / "trace.jsonl")              # FC openings, calls, results, resumes (M4/C3)
             resume_inputs = list(_rs.get("resume_inputs", []))[n_resume0:]
+            eotr_steps = list(_rs.get("eotr_steps", []))[n_eotr0:]
             if un_obs is not None:
                 un_obs()
                 obs_rows.close()
@@ -449,7 +455,7 @@ def main():
                    "audio_in_s": round(wav.numel() / 16000, 1), "audio_out_s": round(len(agent) / T.OUTPUT_SR, 1),
                    "stats": {k: v for k, v in vars(sess.stats).items() if k not in ("step_ms", "step_ms_model")},
                    "grounding_violations": sess.controller.grounding_violations,
-                   "fc_events": fcev, "fc_resume_inputs": resume_inputs}
+                   "fc_events": fcev, "fc_resume_inputs": resume_inputs, "fc_eotr_steps": eotr_steps}
             (od / "summary.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False))
             with open(out / "records.jsonl", "a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
