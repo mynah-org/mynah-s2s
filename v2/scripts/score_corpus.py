@@ -2,7 +2,7 @@
 
 Three evidences, kept separate (AGENTS.md):
   model  = the agent's internal text stream + tool calls (summary.json);
-  asr    = OmniASR CTC 3B v2 of the audio actually spoken (asr_omni3b.json, asr_dirs.py layout);
+  asr    = OmniASR CTC 3B v2 of the audio actually spoken (asr_omni3b.json, scripts/asr_eval.py);
   ground = SQLite / tool ground truth (corpus expectations: function, arguments, status, date).
 Per category:
   tool_orders*   : expected function called, order_id argument (normalized) exact, status + date in model text / ASR,

@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from mynah_v2 import presets
 from mynah_v2.agent.tools import ORDERS_SCHEMA, ToolRegistry, make_orders_db, orders_tool
 from mynah_v2.model import perf
 from mynah_v2.model.reference import ReferenceEngine, build_cfg
@@ -103,34 +104,57 @@ def _audio_cmp(a, b):
             "identical": bool(d.max() == 0)}
 
 
+
+def _handoff_summary(h):
+    """V2_HANDOFF_TRACE=1: host time per baton hand-off, grouped by (resumed-from phase -> parked-at phase)."""
+    if h is None:
+        return None
+    import statistics
+    g = {}
+    for sid, prev, nxt, hand_ms, run_ms in h:
+        g.setdefault(f"{prev}->{nxt}", []).append((hand_ms, run_ms))
+    out = {}
+    for k, v in sorted(g.items()):
+        run = [x[1] for x in v]
+        hand = [x[0] for x in v]
+        out[k] = {"n": len(v), "run_ms_p50": round(statistics.median(run), 3), "run_ms_sum": round(sum(run), 1),
+                  "handoff_ms_p50": round(statistics.median(hand), 3), "handoff_ms_sum": round(sum(hand), 1)}
+    return {"by_transition": out, "n": len(h), "raw": h}
+
 def main():
     global TICK
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", required=True)
+    ap.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True,
+                    help="regression gate (default): fail if a requested optimisation cannot be enabled; --no-strict "
+                         "continues without it (WARNING) and records the fallback")
+    ap.add_argument("--preset", default="release", choices=list(presets.MULTI),
+                    help="release (default) = the configuration of the published benchmarks; reference = no V2 "
+                         "execution optimisations. Explicit flags below override the preset")
     ap.add_argument("--spec", default=str(Path(__file__).parents[1] / "eval/two_session_v1.json"))
     ap.add_argument("--audio-root", required=True, help="dir containing corpus_v1/ and capability_v1/ renders")
     ap.add_argument("--out", required=True)
     ap.add_argument("--fc-ctx-fix", default="auto", choices=["auto", "on", "off"],
                     help="FC hand-back fix (selective): auto = ON for the official VoiceChat checkpoint only; off = rollback")
-    ap.add_argument("--graphs", type=int, default=0, help="BatchedThinker CUDA graphs (0 = eager)")
+    ap.add_argument("--graphs", type=int, default=None, help="BatchedThinker CUDA graphs (0 = eager)")
     ap.add_argument("--tail-s", type=float, default=6.0)
     ap.add_argument("--drain-s", type=float, default=40.0,
                     help="after the scripted audio, keep feeding silence while an FC cycle is open (+ tail after it "
                          "closes), up to this many seconds; same rule for solo and pair (FC is wall-clock driven)")
-    ap.add_argument("--profile", default="", help="perf profile for BOTH solo and pair (e.g. optimized-graph-s4); "
+    ap.add_argument("--profile", default=None, help="perf profile for BOTH solo and pair (e.g. optimized-graph-s4); "
                     "default: the exact pair (mamba_host_pos + no_timer_sync)")
-    ap.add_argument("--exp", default="", help="comma list of perf experiments applied after the profile (solo AND pair), "
+    ap.add_argument("--exp", default=None, help="comma list of perf experiments applied after the profile (solo AND pair), "
                     "e.g. fc_ctx_fix")
-    ap.add_argument("--breakdown", action="store_true",
+    ap.add_argument("--breakdown", action=argparse.BooleanOptionalAction, default=None,
                     help="per-component CUDA-event breakdown (perception / Thinker / EarTTS / codec, FC threads tagged) "
                          "for the solo phase and the multi-session phase (runtime/comp_timer.py)")
     ap.add_argument("--max-sessions", type=int, default=8, help="sessions taken from the group (all by default)")
     ap.add_argument("--lmax", type=int, default=4096, help="BatchedThinker static K/V window per row")
-    ap.add_argument("--perc-batch", default="off", choices=["off", "on", "on-permel", "graph", "graph-permel"],
+    ap.add_argument("--perc-batch", default=None, choices=["off", "on", "on-permel", "graph", "graph-permel"],
                     help="multi-session phase only: batch the cache-aware perception of the sessions ready in a round "
                          "(model/perception_batch.py); on = eager, graph = CUDA graphs per row count pre-captured "
                          "before the sessions open; -permel = mel preprocessor per session")
-    ap.add_argument("--eartts-rng", default="global", choices=["global", "session"],
+    ap.add_argument("--eartts-rng", default=None, choices=["global", "session"],
                     help="EarTTS sampling noise: global = upstream (default CUDA generator, shared by every session and "
                          "thread); session = per-session counter-based noise from the session seed and its EarTTS step "
                          "(model/eartts_rng.py), identical whatever the neighbours / row")
@@ -143,23 +167,27 @@ def main():
     ap.add_argument("--fc-budget", type=int, default=-1,
                     help="multi-session phase: max FC-thread Thinker requests served inside one round (all pumps of "
                          "the round); between rounds only idle time serves them. -1 = unlimited (legacy, default)")
-    ap.add_argument("--fc-merge", default="on", choices=["on", "off"],
+    ap.add_argument("--rnnt-overlap", default=None, choices=["on", "off"],
+                    help="run each session's user-side RNN-T decode step on a side stream while the batched Thinker "
+                         "runs (bit-identical outputs; preset default: on in release / release-exact)")
+    ap.add_argument("--fc-merge", default=None, choices=["on", "off"],
                     help="multi-session phase: queued FC-thread Thinker decode requests of attached sessions join the "
                          "round's batched Thinker step as extra rows (default on; off = legacy B=1 step_one service, "
                          "lower FC cycle latency (~3 s on L40S) but FC bursts in the rounds)")
     ap.add_argument("--fc-force-after-s", type=float, default=1.0,
                     help="FC budget anti-deadlock escape: serve one more FC request when a session has not parked "
                          "for this long while FC requests are queued (counted as forced)")
+    presets.add_determinism_args(ap)
     ap.add_argument("--allow-global-rng-batch", action="store_true",
                     help="allow --eartts-batch with --eartts-rng global (only to reproduce VAL1; VAL2 defect)")
-    ap.add_argument("--eartts-batch", default="off", choices=["off", "on", "eager"],
+    ap.add_argument("--eartts-batch", default=None, choices=["off", "on", "eager"],
                     help="multi-session phase only: ONE EarTTS step over the sessions parked at it (model/eartts_batch.py; "
                          "needs eartts_graph_full; pooled slots). on = graphs per bucket pre-captured before the "
                          "sessions open; eager = no graph. Not exact (batched GEMMs, shared RNG draw)")
-    ap.add_argument("--codec-batch", default="off", choices=["off", "on"],
+    ap.add_argument("--codec-batch", default=None, choices=["off", "on"],
                     help="multi-session phase only: batch the main-path codec decode of the sessions of a round "
                          "(model/codec_batch.py; audio-only, ~1e-6 vs per-session)")
-    ap.add_argument("--capture-policy", default="lazy", choices=["lazy", "barrier", "precapture"],
+    ap.add_argument("--capture-policy", default=None, choices=["lazy", "barrier", "precapture"],
                     help="CUDA-graph capture policy for the MULTI-session phase (model/capture_guard.py): lazy = legacy; "
                          "barrier = capture only when the capturing thread is the only GPU-issuing one, else eager + "
                          "retry, failed capture recovered; precapture = barrier + every BatchedThinker (n_rows, bucket) "
@@ -171,20 +199,32 @@ def main():
                          "keep less than this free (sessions still to open + run-time peak)")
     a = ap.parse_args()
     TICK = a.tick_s
+    prof_win = None
+    if os.environ.get("V2_TORCH_PROFILE"):            # "k0-k1": torch.profiler over pair rounds k0..k1 (diagnostics)
+        prof_win = tuple(int(x) for x in os.environ["V2_TORCH_PROFILE"].split("-"))
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
     spec = json.loads(Path(a.spec).read_text())
     group = next(g for g in spec["groups"] if g["id"] == a.group)
     sess = group["sessions"][: a.max_sessions]       # N-session gate (B = N rows in the batched backend)
     srcs = {k: json.loads((Path(a.spec).parent / v).read_text()) for k, v in spec["sources"].items()}
+    preset_info = presets.fill(a, presets.MULTI, a.preset)
+    a.profile = presets.multi_profile_for(len(sess), a.profile)
+    print("PRESET", a.preset, preset_info, "profile", a.profile, flush=True)
 
-    eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo"), overrides={"s2s.deterministic": True}), fc_ctx_fix=a.fc_ctx_fix)
-    if a.profile:
-        perf.apply_profile(a.profile, eng)
-    else:
-        for n in ("mamba_host_pos", "no_timer_sync"):
-            perf.enable(n, eng)
-    exp_info = {n: str(perf.enable(n, eng))[:300] for n in a.exp.split(",") if n}
+    eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo"), overrides=presets.determinism_overrides(a)),
+                          fc_ctx_fix=a.fc_ctx_fix)
+    det_info = presets.apply_determinism(a)
+    prof, prof_info = None, None
+    if prof_win is not None:                             # label before the profile: the fused norms keep the labels
+        from mynah_v2.runtime import comp_timer as _ct
+        from mynah_v2.runtime import op_profiler
+        _ct.PROFILE_LABELS = True
+        prof_info = {"window": prof_win, "eartts_labels": op_profiler.label_eartts(eng.wrapper.model.tts_model)}
+        print("TORCH_PROFILE " + json.dumps(prof_info), flush=True)
+    opt = presets.apply(eng, a.profile or None, a.exp if a.profile else ",".join(["mamba_host_pos", "no_timer_sync", a.exp]),
+                        strict=a.strict)
+    exp_info = {n: v for n, v in opt["active"].items() if n in a.exp.split(",")}
     eartts_dtype_info = None
     eartts_rng_info = None
     if a.eartts_batch != "off" and a.eartts_rng == "global" and not a.allow_global_rng_batch:
@@ -361,7 +401,7 @@ def main():
                           batch_eartts=a.eartts_batch != "off", eartts_graphs=a.eartts_batch == "on",
                           eartts_precapture=a.eartts_batch == "on",
                           fc_budget=None if a.fc_budget < 0 else a.fc_budget, fc_force_after_s=a.fc_force_after_s,
-                          fc_merge=a.fc_merge == "on")
+                          fc_merge=a.fc_merge == "on", rnnt_overlap=a.rnnt_overlap == "on")
     if ct is not None and rz.ebatch is not None:
         ct._wrap(rz.ebatch, "run", "eartts_batched")          # n >= 2; lone / first steps stay "eartts"
     rz_eartts_capture = getattr(rz, "eartts_capture", None)
@@ -395,6 +435,10 @@ def main():
     t0 = time.perf_counter()
     t0_ns = time.monotonic_ns()
     fc_round_trace = []
+    # opt-in host profile of the multi-session rounds: V2_CPROFILE=FIRST-LAST (round indices). One cProfile for the
+    # process (Python >= 3.12 profiles every thread through sys.monitoring), saved as <out>/cprofile.prof
+    cprof_win = tuple(int(x) for x in os.environ["V2_CPROFILE"].split("-")) if os.environ.get("V2_CPROFILE") else None
+    cprof = None
     feeds, k = {sid: Feed(sid) for sid in chunks}, -1
     while True:
         k += 1
@@ -404,7 +448,27 @@ def main():
         arrival = t0 + k * TICK
         ts = time.perf_counter()
         nlog = len(rz.job_log)
+        if prof_win is not None and k == prof_win[0]:
+            torch.cuda.synchronize()
+            prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                      torch.profiler.ProfilerActivity.CUDA])
+            prof.__enter__()
+        if cprof_win is not None and k == cprof_win[0]:
+            import cProfile
+            cprof = cProfile.Profile()
+            cprof.enable()
         res = rz.step_jobs(jobs)
+        if cprof is not None and k == cprof_win[1]:
+            cprof.disable()
+            cprof.dump_stats(str(out / "cprofile.prof"))
+            cprof = None
+        if prof is not None and k == prof_win[1]:
+            torch.cuda.synchronize()
+            prof.__exit__(None, None, None)
+            prof_info["summary"] = {x: y for x, y in op_profiler.summarize(prof, out, prof_win[1] - prof_win[0] + 1).items()
+                                    if x in ("kernel_ms_per_round", "by_label", "by_kind_dtype")}
+            print("TORCH_PROFILE_DONE " + json.dumps(prof_info["summary"]["by_label"]), flush=True)
+            prof = None
         dt = (time.perf_counter() - ts) * 1e3
         rounds.append(dt)
         fc_round_trace.append(dict(rz.fc_rounds[-1]) if rz.fc_rounds else None)
@@ -486,6 +550,8 @@ def main():
         stats["backend_close_error"] = f"{type(e).__name__}: {e}"
     if ct is not None:
         ct.uninstall()
+    handoff_info = _handoff_summary(rz.handoffs)
+    rnnt_overlap_info = dict(rz.rnnt_stats) if rz.rnnt_overlap else None
     del rz, m, bt
     import gc
     gc.collect()
@@ -493,13 +559,15 @@ def main():
     snap("after_backend_close_empty_cache")         # should return to N0_before_backend (else something stays alive)
 
     # ------------------------------------------------------------------ compare
-    res = {"tick_s": TICK, "group": a.group, "graphs": bool(a.graphs), "profile": a.profile or "exact-pair", "exp": exp_info,
+    res = {"tick_s": TICK, "group": a.group, "graphs": bool(a.graphs), "profile": a.profile or "exact-pair", "exp": exp_info, "preset": a.preset, "optimisations": opt,
            "fc_ctx_fix_info": {k: v for k, v in eng.fc_ctx_fix_info.items() if k != "fix"}, "breakdown": breakdown, "gpu": torch.cuda.get_device_name(), "sessions": {},
            "rendezvous_stats": {k: (v if not isinstance(v, dict) else {str(x): y for x, y in v.items()})
                                 for k, v in stats.items()},
            "memory": {"phases": mem_phases, "solo": mem_solo, "pair": mem_pair, "pair_samples": mem_samples},
            "lmax": a.lmax, "perc_batch": a.perc_batch, "codec_batch": a.codec_batch,
            "eartts_batch": a.eartts_batch, "eartts_dtype": a.eartts_dtype, "eartts_dtype_info": eartts_dtype_info,
+           "determinism": det_info,
+           "handoffs": handoff_info, "rnnt_overlap": rnnt_overlap_info,
            "eartts_rng": a.eartts_rng, "eartts_rng_info": eartts_rng_info,
            "eartts_rng_counters": _rng_counters(),
            "eartts_rng_composition_dependent": a.eartts_batch != "off" and a.eartts_rng == "global",

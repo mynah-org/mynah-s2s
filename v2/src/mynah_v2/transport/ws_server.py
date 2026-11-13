@@ -15,8 +15,15 @@ Wire format (one connection = one session; ``max_sessions`` concurrent, default 
            unless ?verbose=1)
     text   {"type": "session.closed", ...stats}
 Backpressure: inbound audio waits in a bounded queue (``max_backlog_s``); beyond it the oldest audio is dropped and
-an ``audio.dropped`` notice is sent. Cleanup: disconnect -> the worker drains, closes the session, the engine stays
-loaded for the next connection.
+an ``audio.dropped`` notice is sent. Cleanup: disconnect / session.cancel -> queued audio dropped, open calls
+cancelled, session closed; session.end -> the in-flight call is answered first (bounded by ``max_drain_s``). The
+engine stays loaded for the next connection.
+Liveness: a client that sends nothing for ``idle_timeout_s`` (no audio, no control message; a realtime client streams
+continuously, silence included) is closed as a cancel ("idle_timeout"), so a silent or stuck client cannot hold the
+only slot. Dead TCP peers are closed by the WebSocket keepalive pings. If the engine does not finish closing a session
+within ``close_timeout_s`` (e.g. a hung GPU step), the slot is NOT handed to another client (the engine may still be
+running): the server turns unhealthy, refuses new sessions with an explicit error and needs a restart. Outbound
+messages for a client that is gone are discarded instead of accumulating while the session drains.
 """
 
 from __future__ import annotations
@@ -48,6 +55,8 @@ class ServerConfig:
     max_backlog_s: float = 10.0
     post_fc_s: float = 4.0          # line kept open after a tool call when the client ends the session
     max_drain_s: float = 90.0
+    idle_timeout_s: float = 60.0    # no inbound message for this long -> cancel close
+    close_timeout_s: float = 180.0  # engine close longer than this -> server unhealthy (slot kept, restart needed)
     trace_dir: str | None = None
     default_mode: str = "reference"
     default_prompt: str | None = None
@@ -96,6 +105,7 @@ class SessionWorker(threading.Thread):
         self.max_backlog = max_backlog_bytes
         self.lock = threading.Lock()
         self.on_drop = on_drop
+        self.inbound_dropped_bytes, self.inbound_dropped_events = 0, 0     # backlog overflow (audio.dropped notices)
         self.post_fc_s, self.max_drain_s = post_fc_s, max_drain_s
         session.on_audio = lambda a: send_bytes((np.clip(a.numpy(), -1, 1) * 32767).astype("<i2").tobytes())
 
@@ -115,6 +125,8 @@ class SessionWorker(threading.Thread):
                 self.backlog -= len(old)
                 dropped += len(old)
         if dropped:
+            self.inbound_dropped_bytes += dropped
+            self.inbound_dropped_events += 1
             self.on_drop(dropped)
 
     def stop(self, kind: str = "normal") -> None:
@@ -153,6 +165,7 @@ class VoiceServer:
         self.cfg = cfg
         self.active = 0
         self.engine_lock = threading.Lock()
+        self.unhealthy: str | None = None
         self.tracer_factory = tracer_factory or self._default_tracer
 
     def _default_tracer(self, sid: str) -> E.Tracer:
@@ -165,6 +178,10 @@ class VoiceServer:
         path = getattr(getattr(ws, "request", None), "path", None) or getattr(ws, "path", "/")
         qs = parse_qs(urlparse(path).query)
         verbose = qs.get("verbose", ["0"])[0] == "1"
+        if self.unhealthy is not None:
+            await ws.send(json.dumps({"type": "error", "error": f"unhealthy: {self.unhealthy}"}))
+            await ws.close(code=1011, reason="server unhealthy")
+            return
         if self.active >= self.cfg.max_sessions or not self.engine_lock.acquire(blocking=False):
             await ws.send(json.dumps({"type": "error", "error": "busy"}))
             await ws.close(code=1013, reason="busy")
@@ -175,7 +192,11 @@ class VoiceServer:
         tracer = self.tracer_factory(sid)
         out_q: asyncio.Queue = asyncio.Queue()
 
+        gone = {"v": False}                  # client unreachable: outbound messages are discarded
+
         def send_threadsafe(msg) -> None:
+            if gone["v"] and msg is not None:
+                return
             loop.call_soon_threadsafe(out_q.put_nowait, msg)
 
         def on_ev(ev: E.Event) -> None:
@@ -190,7 +211,12 @@ class VoiceServer:
                 msg = await out_q.get()
                 if msg is None:
                     return
-                await ws.send(msg)
+                if gone["v"]:
+                    continue
+                try:
+                    await ws.send(msg)
+                except Exception:  # noqa: BLE001 - connection closed: keep draining the queue, send nothing more
+                    gone["v"] = True
 
         send_task = asyncio.create_task(sender())
         worker = None
@@ -198,7 +224,8 @@ class VoiceServer:
         try:
             mode = qs.get("mode", [self.cfg.default_mode])[0]
             prompt = self.cfg.default_prompt
-            first = await ws.recv()
+            idle = self.cfg.idle_timeout_s
+            first = await asyncio.wait_for(ws.recv(), idle)
             pending_audio = None
             in_rate = 16000
             if isinstance(first, str):
@@ -227,7 +254,16 @@ class VoiceServer:
             worker.start()
             if pending_audio is not None:
                 worker.push(to16k(pending_audio))
-            async for msg in ws:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), idle)
+                except asyncio.TimeoutError:
+                    send_threadsafe(json.dumps({"type": "error", "error": "idle_timeout",
+                                                "idle_timeout_s": idle}))
+                    break
+                except Exception:  # noqa: BLE001 - websockets ConnectionClosed*: client gone -> cancel close
+                    gone["v"] = True
+                    break
                 if isinstance(msg, bytes):
                     worker.push(to16k(msg))
                 else:
@@ -240,16 +276,28 @@ class VoiceServer:
                         break
                     if m.get("type") == "session.cancel":
                         break
+        except asyncio.TimeoutError:
+            send_threadsafe(json.dumps({"type": "error", "error": "idle_timeout", "idle_timeout_s": self.cfg.idle_timeout_s}))
         except Exception as e:  # noqa: BLE001 - report and clean up
             send_threadsafe(json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"}))
         finally:
+            hung = False
             if worker is not None:
                 worker.stop(end_kind)
-                await loop.run_in_executor(None, worker.join)
+                try:
+                    await asyncio.wait_for(loop.run_in_executor(None, worker.join), self.cfg.close_timeout_s)
+                except asyncio.TimeoutError:
+                    hung = True
+                    self.unhealthy = (f"session {sid} did not close within {self.cfg.close_timeout_s:.0f} s "
+                                      "(engine step stuck?); restart the server")
+                    send_threadsafe(json.dumps({"type": "error", "error": f"unhealthy: {self.unhealthy}"}))
+            if worker is not None and not hung:
                 s = worker.session.stats
                 send_threadsafe(json.dumps({"type": "session.closed", "session_id": sid,
                                             "chunks_in": s.chunks_in, "buffered": s.chunks_buffered,
                                             "replayed": s.chunks_replayed, "dropped": s.chunks_dropped,
+                                            "inbound_dropped_bytes": worker.inbound_dropped_bytes,
+                                            "inbound_dropped_events": worker.inbound_dropped_events,
                                             "kind": getattr(worker, "close_kind", None),
                                             "cancelled_calls": s.calls_cancelled_on_close}))
             send_threadsafe(None)
@@ -259,7 +307,8 @@ class VoiceServer:
                 send_task.cancel()
             tracer.close()
             self.active -= 1
-            self.engine_lock.release()
+            if not hung:                     # a stuck engine keeps the slot: no second session on a busy GPU
+                self.engine_lock.release()
 
     async def serve(self, ready: Callable[[], None] | None = None) -> None:
         import websockets

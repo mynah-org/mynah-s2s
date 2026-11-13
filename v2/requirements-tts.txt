@@ -1,0 +1,8 @@
+# Synthetic test-audio TTS (scripts/make_corpus.py), installed with --no-deps into $MYNAH_HOME/cache/pylib-tts and put on
+# PYTHONPATH only while rendering: everything else (torch, numpy, librosa, ...) comes from the engine venv. These four
+# are exactly the packages the reference corpus was rendered with; installing qwen-tts WITH its dependencies pulls a
+# different torch / numpy into that path and changes the rendered audio (0/40 identical WAVs in our clean-clone test).
+qwen-tts==0.1.1
+transformers==4.57.3
+onnxruntime==1.31.1
+sox==1.5.0

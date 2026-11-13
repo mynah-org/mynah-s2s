@@ -1,0 +1,173 @@
+{
+ "corpus": "v2-golden-corpus-v1",
+ "corpus_sha256": "088961577b1746b836635f90783bb096b3fe75189d919c822bec35bd59ad9b59",
+ "tts": {
+  "engine": "qwen-tts==0.1.1",
+  "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+  "seed": 7,
+  "synthetic": true
+ },
+ "items": {
+  "t01": {
+   "sha256": "8ae8a883f582b6e4116831b2e6c3a3c288d8108420c5aa3feea7fcbda8d066fb",
+   "duration": 30.92
+  },
+  "t02": {
+   "sha256": "a7202339ab641c76147575d3f785f09b7042ffdb80091fb6cc8903b58cdfbe59",
+   "duration": 30.2
+  },
+  "t03": {
+   "sha256": "efc5ce33b4205033caac9a60505d0daa655f939a5df1ec7140470e1fc35cde82",
+   "duration": 27.64
+  },
+  "t04": {
+   "sha256": "2e66b15a75f5b7201c904e73f427ab29fd8ffe1889bce06b1dd5aecbe5de134c",
+   "duration": 29.0
+  },
+  "t05": {
+   "sha256": "994e6430608181bc8759cc6dd2e9b355b8a5e129d6152a1e0c90f4e63852af3a",
+   "duration": 30.6
+  },
+  "t06": {
+   "sha256": "8e8c738664f4e290700a30e115416d74c78e6e0c98a27eeafcf5cd990b34cd17",
+   "duration": 27.32
+  },
+  "t07": {
+   "sha256": "96fe1ae84d70875e203fcfa4edac99e6666462a51bc168d4a4e7faacdddc2571",
+   "duration": 27.96
+  },
+  "t08": {
+   "sha256": "0f5743d0b23428411093ec25194a3b9ee7c93e235ea4f72391f785c570c2ae21",
+   "duration": 28.84
+  },
+  "t09": {
+   "sha256": "f163adab99ea3f5d29b2e50ce2c5dc139ec2414d3f016528df8e653147c77fae",
+   "duration": 27.24
+  },
+  "t10": {
+   "sha256": "abf718982243fcc519db4c4d647f6e9a2abf0041931dc8759d8c3256bd2ddc30",
+   "duration": 28.2
+  },
+  "t11": {
+   "sha256": "fc1ebfc45afb2086a6e50d135d3e1959dc9e943c0a25aed364740f9fcaffc534",
+   "duration": 28.92
+  },
+  "t12": {
+   "sha256": "c280da41f433ce2ed3d47efc1b3c38905e7b9c463a997c33ea0e0cf874b7bd35",
+   "duration": 27.0
+  },
+  "t13": {
+   "sha256": "0582eeb55461947e17bd56cf1898ef7c1fcb29795b814a42e39493f55077f92d",
+   "duration": 38.28
+  },
+  "t14": {
+   "sha256": "04925a96816ccdb1653d9ccb99ff711650e9cd6c884f6ccb8470080cebd59d62",
+   "duration": 41.96
+  },
+  "r01": {
+   "sha256": "d5fe27a8786561ec8e5c65a59db9947564371ec5c50b60ec5531d0234bed09c6",
+   "duration": 21.72
+  },
+  "r02": {
+   "sha256": "9896078e7e16f8c45ef42ce3a8e5a5ce003f1200c5b75b04b34a51ac6873c7bf",
+   "duration": 23.0
+  },
+  "r03": {
+   "sha256": "92bec5e1a8d74f0d7fbb100c10395abf1042dfd72ce44a4c9fd567cbd8245f80",
+   "duration": 24.44
+  },
+  "r04": {
+   "sha256": "23ff1ba834b6504c234d7c5e7e363389654a5d23570b00397031d2688ef95129",
+   "duration": 23.64
+  },
+  "q01": {
+   "sha256": "aa0f3a1349a3b5384bed6335f4f346e9498578bfde93c61fec3a9d63a6cb8033",
+   "duration": 19.64
+  },
+  "q02": {
+   "sha256": "301fde4024c4ad1e0ff8cf05b7608d839d6c383bc32f111de8f1d51bd6d027b4",
+   "duration": 22.28
+  },
+  "q03": {
+   "sha256": "7811d94e3518166d0d6fee21695ffc78d369083d460f620430ccac2041dd519f",
+   "duration": 18.92
+  },
+  "q04": {
+   "sha256": "6454ba48361182d4ec624aa26eef7e969543b6ecfc262fc85727d79dd7f2e977",
+   "duration": 20.52
+  },
+  "q05": {
+   "sha256": "2b47743a6e02f8fe3f5774f076857a9d49dc17e296770499c2825ac68e268d19",
+   "duration": 19.56
+  },
+  "q06": {
+   "sha256": "ce189e863581ee2c1035c8c703e3e5f8129c5808e523dee5afc1c4517625849c",
+   "duration": 19.64
+  },
+  "q07": {
+   "sha256": "a918d2b542699bc3ff62cc3a2168b1100a3481ab03f994646a435f9b2b7fc181",
+   "duration": 22.12
+  },
+  "q08": {
+   "sha256": "3eadb20f392583f517ec8694fc5b3256898f4c984666c3977db2b0ecb8ca58a9",
+   "duration": 23.96
+  },
+  "q09": {
+   "sha256": "1b3d3519e513b3eb44c26ab1575ac1b2017edd41d8edc42cb236b185cd81e313",
+   "duration": 19.88
+  },
+  "q10": {
+   "sha256": "a6b7b5dfd6cb5811e19a461ed47094020cf374ba14d5a5fa39e0f59609973dcd",
+   "duration": 23.32
+  },
+  "q11": {
+   "sha256": "4543c16c989dbfff144f586389d0e579c136db270de52831e7e93dce9e5ec4f4",
+   "duration": 20.2
+  },
+  "q12": {
+   "sha256": "b743be570bd38bcc43913a1a42d8b0838f24617ff16abab1c4e7794f558f6b67",
+   "duration": 19.24
+  },
+  "s01": {
+   "sha256": "9b561ba959f8269e93cc4fb3915250ddda77b084da7f7d39a9b280aa403749b8",
+   "duration": 23.72
+  },
+  "s02": {
+   "sha256": "7b294c794fd618b73ad624f2f79430ec4d7fe806759c5922ef8309ccdfed2787",
+   "duration": 25.16
+  },
+  "s03": {
+   "sha256": "cac379c0a7d42cf16abebd25711c363c5b39191337062b78c271057c6e01537c",
+   "duration": 24.12
+  },
+  "s04": {
+   "sha256": "8c6d405f788ab1ff5cfb81e94fd03f01cfb9b0813299e05198bb6a324c62e68e",
+   "duration": 25.24
+  },
+  "s05": {
+   "sha256": "9b01653bfa672a56beae97c2a7c3a89279413af2ce8c350e80e8f60adddc1745",
+   "duration": 23.96
+  },
+  "s06": {
+   "sha256": "84657bcea26b67631bbf4410c4a10d9a885fae2a4b1d34f8264c7af6896e2a66",
+   "duration": 23.0
+  },
+  "s07": {
+   "sha256": "01c9a0db6e07e0266a7709f2a270e8849e0d235742cc3251f699f0eec70fbc66",
+   "duration": 24.12
+  },
+  "s08": {
+   "sha256": "0ef6b03375b4565b0ae6f40f63797763ad0e445c8ddd75812198b2edc3ed2ef4",
+   "duration": 23.48
+  },
+  "s09": {
+   "sha256": "b1b4a61a8d8f6b11c3b901eb0905eaaeee11256ff89b93c67c9e26640d2b27bd",
+   "duration": 23.4
+  },
+  "s10": {
+   "sha256": "21f291e7621bda5cbfda70b975d9755207e9fda1470a56ef81b0129bb7612203",
+   "duration": 24.04
+  }
+ }
+}

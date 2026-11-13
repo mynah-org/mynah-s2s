@@ -106,6 +106,42 @@ class _Req:
     done: threading.Event = field(default_factory=threading.Event)
     result: Any = None
     error: Optional[BaseException] = None
+    rnnt: Any = None                   # RNN-T overlap: (frame, state) captured at park time
+
+
+def _rnnt_inputs_from_caller():
+    """(rnnt_frame, rnnt_state) of the infer_one_step frame that is calling the Thinker, computed exactly as NVIDIA's
+    code does right after it (W: rnnt_enc[:, emb_idx, :]); None when not available (no RNN-T, other caller)."""
+    import sys
+    f = sys._getframe(2)
+    while f is not None and f.f_code.co_name != "infer_one_step":
+        f = f.f_back
+    if f is None:
+        return None
+    L = f.f_locals
+    state, asr_emb = L.get("rnnt_partial_hypotheses"), L.get("asr_emb")
+    w = L.get("self")
+    if state is None or asr_emb is None or w is None or not isinstance(state, dict):
+        return None
+    try:
+        pc = L.get("perception_cache")
+        emb_idx = L["frame_offset"] if (w.use_perception_cache and pc is not None and pc.is_initialized()) \
+            else L["current_frame_index"]
+        emb_idx = min(emb_idx, asr_emb.shape[1] - 1)
+    except (KeyError, AttributeError):
+        return None
+    return asr_emb[:, emb_idx, :], state
+
+
+def _record_stream_all(x, stream) -> None:
+    if isinstance(x, torch.Tensor):
+        x.record_stream(stream)
+    elif isinstance(x, dict):
+        for v in x.values():
+            _record_stream_all(v, stream)
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            _record_stream_all(v, stream)
 
 
 class _Worker:
@@ -152,7 +188,8 @@ class RendezvousEngine:
                  batch_perception: bool = False, perception_batch_mel: bool = True,
                  perception_graphs: bool = False, batch_codec: bool = False, batch_eartts: bool = False,
                  eartts_graphs: bool = True, eartts_precapture: bool = False,
-                 fc_budget: Optional[int] = None, fc_force_after_s: float = 1.0, fc_merge: bool = True):
+                 fc_budget: Optional[int] = None, fc_force_after_s: float = 1.0, fc_merge: bool = True,
+                 rnnt_overlap: Optional[bool] = None):
         self.multi, self.backend = multi, backend
         # FC budget (VAL3): max FC-thread Thinker requests served INSIDE one round, summed over every pump() of the
         # round; None = unlimited (legacy). Outside rounds (idle pump between rounds, open/close) service is unlimited.
@@ -180,11 +217,25 @@ class RendezvousEngine:
                       "attach": 0, "detach": 0, "reattach_after_b1": 0}
         self.calls: list[dict] = []                   # audit: one entry per Thinker execution
         self.job_log: list[dict] = []                 # one entry per session job: start/end, frames by route, waits
+        # opt-in (V2_HANDOFF_TRACE=1): one record per baton hand-off = host time a session thread runs between two
+        # parks (from its resume to its next park / job end), keyed by the phase it resumed from and parked at
+        import os as _os
+        self.handoffs: Optional[list] = [] if _os.environ.get("V2_HANDOFF_TRACE") == "1" else None
         self._inner = self.owner.forward              # whatever is installed (backend's B=1 / upstream)
         self._had_forward = "forward" in self.owner.__dict__
         self._intercept = self._make_interceptor()
         self.owner.forward = self._intercept
         self._wrap_fc()
+        # RNN-T overlap (release preset; None = env V2_RNNT_OVERLAP=1): run each parked session's RNN-T decode step
+        # (user-ASR / turn-taking input) on a side stream WHILE the batched Thinker runs (see _rnnt_prefetch); the
+        # wrapper's own call then takes the result. Bit-identical outputs; needs CUDA (off otherwise).
+        if rnnt_overlap is None:
+            rnnt_overlap = _os.environ.get("V2_RNNT_OVERLAP") == "1"
+        self.rnnt_overlap = bool(rnnt_overlap) and torch.cuda.is_available()
+        self._rnnt_pre: dict = {}
+        self.rnnt_stats = {"prefetched": 0, "used": 0, "miss": 0, "skipped": 0}
+        if self.rnnt_overlap:
+            self._wrap_rnnt()
         self.pbatch = None
         if batch_perception:
             self._wrap_perception(perception_batch_mel, perception_graphs)
@@ -236,6 +287,8 @@ class RendezvousEngine:
                                      f"request from {t.name} refused (would advance it twice)")
             req = _Req(sid, input_embeds, cache, kw, t, from_fc)
             req.t_park = time.perf_counter()
+            if self.rnnt_overlap and not from_fc:
+                req.rnnt = _rnnt_inputs_from_caller()
             # grad / inference mode are THREAD-LOCAL in torch: the coordinator must run the Thinker in the mode of the
             # requesting thread (the wrapper runs without grad). Otherwise every forward on the coordinator builds and
             # keeps an autograd graph (round 9b, Ada: +~120 MB per chunk → OOM at chunk 42).
@@ -260,6 +313,63 @@ class RendezvousEngine:
             return req.result
         forward.__v2_rendezvous__ = True
         return forward
+
+    # ------------------------------------------------------------------------------------------------ RNN-T overlap
+    # NVIDIA's infer_one_step runs, per session and frame, AFTER the Thinker: forced turn-taking (Thinker output),
+    # then _rnnt_step(asr_emb frame, rnnt_state) (user-side RNN-T greedy decode: joint + predictor, B=1, with host
+    # syncs), then the RNN-T turn-taking. _rnnt_step reads only the perception frame and the RNN-T state left by the
+    # previous frame (forced turn-taking only flips rnnt_state['forced_bos'] in place, which _rnnt_step carries by
+    # reference), so the same call can run earlier: on a side stream while the batched Thinker occupies the GPU.
+    # Same ops, same batch size 1, same inputs -> same values. The wrapper's call takes the prefetched result only
+    # if it gets the very same state object and frame (and every carried state value is unchanged), else it runs
+    # the original step.
+    def _rnnt_prefetch(self, batch, pre_ev) -> None:
+        w = self.engine.wrapper
+        side = getattr(self, "_rnnt_stream", None)
+        if side is None:
+            side = self._rnnt_stream = torch.cuda.Stream()
+        for r in batch:
+            inp = getattr(r, "rnnt", None)
+            if inp is None:
+                self.rnnt_stats["skipped"] += 1
+                continue
+            frame, state = inp
+            snap = {k: v for k, v in state.items()}
+            with torch.cuda.stream(side):
+                side.wait_event(pre_ev)
+                with torch.no_grad():
+                    res = self._rnnt_inner(frame, state)
+                ev = torch.cuda.Event()
+                ev.record(side)
+            self._rnnt_pre[r.sid] = (state, frame.data_ptr(), tuple(frame.shape), snap, res, ev)
+            self.rnnt_stats["prefetched"] += 1
+
+    def _wrap_rnnt(self):
+        w = self.engine.wrapper
+        self._rnnt_inner = w._rnnt_step
+        self._rnnt_had = "_rnnt_step" in w.__dict__
+        workers = self.workers
+
+        def step(encoder_frame, rnnt_state):
+            t = threading.current_thread()
+            sid = next((s for s, wk in workers.items() if wk.thread is t), None)
+            pre = self._rnnt_pre.pop(sid, None) if sid is not None else None
+            if pre is not None:
+                state, ptr, shape, snap, res, ev = pre
+                same = (rnnt_state is state and encoder_frame.data_ptr() == ptr and tuple(encoder_frame.shape) == shape
+                        and rnnt_state.keys() == snap.keys() and all(rnnt_state[k] is v for k, v in snap.items()))
+                if same:
+                    main = torch.cuda.current_stream()
+                    main.wait_event(ev)
+                    new_state, is_blank = res
+                    _record_stream_all(new_state, main)
+                    is_blank.record_stream(main)
+                    self.rnnt_stats["used"] += 1
+                    return new_state, is_blank
+                self.rnnt_stats["miss"] += 1
+            return self._rnnt_inner(encoder_frame, rnnt_state)
+        self._rnnt_wrapper = step
+        w._rnnt_step = step
 
     def _wrap_fc(self):
         """FC background thread: takes Thinker ownership of its session for its whole duration (explicit phase)."""
@@ -615,8 +725,14 @@ class RendezvousEngine:
             r.route = "b2" if (len(batch) >= 2 and r in batch) else ("fc" if r.from_fc else "b1")
         if len(batch) >= 2:
             t0 = time.perf_counter()
+            pre_ev = None
+            if self.rnnt_overlap:
+                pre_ev = torch.cuda.Event()
+                pre_ev.record()                        # inputs of the RNN-T steps are ready before the Thinker
             try:
                 outs = self.backend.step({r.sid: r.x for r in batch})
+                if pre_ev is not None:
+                    self._rnnt_prefetch(batch, pre_ev)
                 for r in batch:
                     r.result = self._wrap_out(outs[r.sid], r.cache)
             except BaseException as e:  # noqa: BLE001 - a batched failure fails every member (not attributable)
@@ -682,13 +798,20 @@ class RendezvousEngine:
         """Give the baton to ``sid`` (switch its state in, start a job or resume it) and wait until it parks or ends,
         serving FC requests meanwhile. Returns the worker state."""
         w = self.workers[sid]
+        prev = "start" if job is not None else getattr(w.req, "kind", "thinker")
+        th0 = time.perf_counter()
         self._handoff(sid, w, job)
+        th1 = time.perf_counter()
         t_wait = time.monotonic()
         deadline = t_wait + self.timeout
         while True:
             self.pump(force=time.monotonic() - t_wait > self.fc_force_after_s)
             with self.cv:
                 if w.state in ("parked", "done", "failed"):
+                    if self.handoffs is not None:
+                        nxt = getattr(w.req, "kind", "thinker") if w.state == "parked" else w.state
+                        self.handoffs.append((sid, prev or "thinker", nxt or "thinker", round((th1 - th0) * 1e3, 3),
+                                              round((time.perf_counter() - th1) * 1e3, 3)))
                     if w.state != "parked" and getattr(w, "log", None) is not None:
                         w.log["t_end"], w.log["state"] = time.perf_counter(), w.state
                         self.job_log.append(w.log)
@@ -881,6 +1004,11 @@ class RendezvousEngine:
                     self.owner.forward = self._inner
                 else:
                     del self.owner.forward
+            if self.rnnt_overlap and self.engine.wrapper.__dict__.get("_rnnt_step") is getattr(self, "_rnnt_wrapper", None):
+                if self._rnnt_had:
+                    self.engine.wrapper._rnnt_step = self._rnnt_inner
+                else:
+                    del self.engine.wrapper._rnnt_step
             if getattr(self.engine.wrapper, "_run_fc_async_steps", None) is not self._fc_prev:
                 self.engine.wrapper._run_fc_async_steps = self._fc_prev
             if self.ebatch is not None and self._duplex.__dict__.get("infer_codes_one_step") is self._tts_intercept:

@@ -302,7 +302,7 @@ def _make_generate_step(mod_ns, cache: dict):
             mog_mu, mog_logs = self.mog_head.infer(mog_input_embeds, guidance_scale=guidance_scale_i,
                                                    top_p_or_k=top_p_or_k_i)
             z = mog_mu + torch.exp(mog_logs) * _rng_randn_like(mog_mu) * noise_scale_i   # default: torch.randn_like
-            code = depthsum_encoding_step(self.rvq_embs, z, code, cnt, k)
+            code = getattr(self, "_v2_depthsum_step", depthsum_encoding_step)(self.rvq_embs, z, code, cnt, k)
             cnt += k
         return code, lm_logits, eos_flag
     return generate_step
@@ -629,25 +629,30 @@ experiment("perception_graph")((_pg_enable, _pg_disable))
 # ``assert (window_envelope > 1e-11).all()`` (ear_tts_vae_codec.py:248, the device-wide sync behind codec host == GPU
 # time) runs once per frame count; same ops, same tensor -> bit-identical by construction (verified on GPU anyway).
 # ``codec_fc_d2h``: FC-thread decode output ``.cpu()`` -> pinned async copy + event, waited on first data read.
-def fuse_rmsnorms(root) -> int:
+def fuse_rmsnorms(root, bf16_native: bool = False, types=("Gemma3RMSNorm",)) -> int:
     """Gemma3RMSNorm.forward = (x.float() * rsqrt(mean(x^2) + eps)) * (1 + w.float()), cast back to x's dtype:
-    ~7 elementwise/reduce kernels per call (EarTTS: 28 layers x 6 norms per step). Replace it (instance attribute)
-    with ONE torch rms_norm over x.float() with the precomputed FP32 weight (1 + w), cast back at the end: the same
-    formula and precision (FP32 activations: <= 1e-5; BF16 activations: bit-identical through a 6-layer chain in the
-    CPU test), fewer kernels (L40S, B=4, graph: EarTTS -2 ms GPU/round FP32, -2.75 ms BF16; ASR unchanged).
-    The precomputed weight is taken NOW (its FP32 value): apply before any in-place dtype change of the norms."""
+    ~7 elementwise/reduce kernels per call. Replace it (instance attribute) with ONE torch rms_norm over x.float() with
+    the precomputed FP32 weight (1 + w): same formula and precision, fewer kernels (reduction order may differ ~1 ulp).
+    Default (exact): every dtype goes through the FP32 math (cast in, fused norm with FP32 (1 + w), cast out) = the
+    reference formula; for BF16 inputs that is 3 kernels instead of ~9. bf16_native=True: rms_norm directly on BF16
+    with a BF16 (1 + w) (FP32 accumulation inside, no casts) — faster, but rounds (1 + w) and the normalized value
+    separately (double rounding, ≤ 2 BF16 ulp).
+    The precomputed weight is taken NOW (in its FP32 value): apply before any in-place dtype change of the norms."""
     n = 0
     for mod in root.modules():
-        if type(mod).__name__ != "Gemma3RMSNorm" or "_v2_w1" in mod.__dict__:
+        if type(mod).__name__ not in types or "_v2_w1" in mod.__dict__:
             continue
-        prev = mod.__dict__.get("forward")                   # an existing instance override (e.g. a profiler label)
+        prev = mod.__dict__.get("forward")                   # an existing instance override (profiler label wrapper)
         label = getattr(prev, "_v2_label", None)
         if prev is not None and label is None:
             continue                                         # unknown override: leave it alone
         w1 = 1.0 + mod.weight.detach().float()
+        w1_bf16 = w1.to(torch.bfloat16)                     # --eartts-dtype bf16: native BF16 path, no cast kernels
         mod._v2_w1 = w1
 
-        def fwd(x, _w1=w1, _eps=float(mod.eps), _d=(int(mod.weight.shape[0]),)):
+        def fwd(x, _w1=w1, _w1b=w1_bf16, _eps=float(mod.eps), _d=(int(mod.weight.shape[0]),), _native=bf16_native):
+            if _native and x.dtype == torch.bfloat16:      # rms_norm accumulates in FP32 internally; output BF16
+                return torch.nn.functional.rms_norm(x, _d, _w1b, _eps)
             return torch.nn.functional.rms_norm(x.float(), _d, _w1, _eps).type_as(x)
         if label is not None:
             fused = fwd
@@ -662,9 +667,9 @@ def fuse_rmsnorms(root) -> int:
     return n
 
 
-def unfuse_rmsnorms(root) -> None:
+def unfuse_rmsnorms(root, types=("Gemma3RMSNorm",)) -> None:
     for mod in root.modules():
-        if type(mod).__name__ == "Gemma3RMSNorm" and "_v2_w1" in mod.__dict__:
+        if type(mod).__name__ in types and "_v2_w1" in mod.__dict__:
             prev = mod.__dict__.pop("_v2_prev_forward", None)
             if prev is not None:
                 mod.forward = prev
@@ -685,6 +690,88 @@ def _ernorm_disable(engine) -> None:
 
 
 experiment("eartts_fused_rmsnorm")((_ernorm_enable, _ernorm_disable))
+
+
+# NeMo's EarTTS MoG head uses its own RMSNorm class with the same formula (x.float() * rsqrt(mean(x^2)+eps) * (1+w),
+# cast back): 3 MLP layers + 1 final norm, run at each of the 8 unmasking iterations of every EarTTS step.
+def _mognorm_enable(engine) -> dict:
+    return {"norms": fuse_rmsnorms(_find_eartts(engine).mog_head, types=("RMSNorm",))}
+
+
+def _mognorm_disable(engine) -> None:
+    unfuse_rmsnorms(_find_eartts(engine).mog_head, types=("RMSNorm",))
+
+
+experiment("eartts_fused_rmsnorm_mog")((_mognorm_enable, _mognorm_disable))
+
+
+# --- eartts_rvq_cache: hoist constant RVQ-table work out of the per-iteration MoG loop (bit-exact) -------------------
+# Upstream NeMo ear_tts_model.py recomputes, at every one of the 8 unmasking iterations of every EarTTS step:
+#   depthsum_embedding:      F.pad(self.rvq_embs, [0, 0, 0, 1])  -> a full copy of the [31, 1024, 512] FP32 table
+#   depthsum_encoding_step:  embs[i].pow(2).sum(-1) for each quantizer i -> constant per-code squared norms
+# Both depend only on the weights. Computing them once with the same ops gives the same values, so the per-step
+# arithmetic (and its order) is unchanged. Recomputed if rvq_embs is replaced (set_rvq_embs) via a version key.
+
+def _rvq_key(m):
+    e = m.rvq_embs
+    return (e.data_ptr(), e._version, tuple(e.shape), e.dtype)
+
+
+def _rvq_consts(m):
+    key = _rvq_key(m)
+    c = m.__dict__.get("_v2_rvq_consts")
+    if c is None or c[0] != key:
+        with torch.no_grad():
+            padded = torch.nn.functional.pad(m.rvq_embs, [0, 0, 0, 1])
+            sq = [m.rvq_embs[i].pow(2).sum(-1) for i in range(m.rvq_embs.shape[0])]
+        c = (key, padded, sq)
+        m.__dict__["_v2_rvq_consts"] = c
+    return c
+
+
+def _depthsum_embedding_cached(self, code):
+    F = torch.nn.functional
+    b, t, d = code.size()
+    _, v, h = self.rvq_embs.size()
+    ret = torch.zeros((b, t, h), device=code.device)
+    embs = _rvq_consts(self)[1]
+    for i in range(d):
+        ret = ret + F.embedding(code[..., i], embs[i])
+    return ret
+
+
+def _make_depthsum_step_cached(m):
+    F = torch.nn.functional
+
+    def step(embs, r, code, depth_str=0, k=72):
+        sq = _rvq_consts(m)[2]
+        for i in range(depth_str, depth_str + k):
+            idx_sel = (sq[i] - 2 * (r.unsqueeze(-2) @ embs[i].transpose(-1, -2)).squeeze(-2)).argmin(-1)
+            emb_i = F.embedding(idx_sel, embs[i])
+            r = r - emb_i
+            code[..., i] = idx_sel
+        return code
+    return step
+
+
+def _rvq_enable(engine) -> dict:
+    m = _find_eartts(engine)
+    _rvq_consts(m)
+    m.depthsum_embedding = types.MethodType(_depthsum_embedding_cached, m)
+    m._v2_depthsum_step = _make_depthsum_step_cached(m)
+    e = m.rvq_embs
+    return {"rvq_embs": list(e.shape), "dtype": str(e.dtype), "padded_MB": round(e.numel() * e.element_size() / 2**20, 1)}
+
+
+def _rvq_disable(engine) -> None:
+    m = _find_eartts(engine)
+    for k in ("depthsum_embedding", "_v2_depthsum_step", "_v2_rvq_consts"):
+        m.__dict__.pop(k, None)
+
+
+experiment("eartts_rvq_cache")((_rvq_enable, _rvq_disable))
+experiment("eartts_fused_rmsnorm_bf16native")((lambda e: {"norms": fuse_rmsnorms(_find_eartts(e).backbone, bf16_native=True)},
+                                               _ernorm_disable))
 
 
 def _codec_nosync_enable(engine) -> dict:

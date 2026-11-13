@@ -18,6 +18,7 @@ import soundfile as sf
 import torch
 import torchaudio.functional as AF
 
+from mynah_v2 import presets
 from mynah_v2.agent.controller import Controller
 from mynah_v2.agent.tools import ORDERS_SCHEMA, ToolLedger, ToolRegistry, make_orders_db, orders_tool
 from mynah_v2.model import tokens as T
@@ -33,6 +34,13 @@ def load_16k(path):
     wav, sr = sf.read(path, dtype="float32", always_2d=True)
     wav = torch.from_numpy(wav.T.copy()).mean(0)
     return AF.resample(wav.unsqueeze(0), sr, 16000)[0] if sr != 16000 else wav
+
+
+def read_system_message(arg: str | None) -> str | None:
+    """--system-message value: literal text, or @path to a UTF-8 text file. None keeps NVIDIA's default message."""
+    if not arg:
+        return None
+    return Path(arg[1:]).read_text(encoding="utf-8").strip() if arg.startswith("@") else arg
 
 
 def render_prompt(tools: list[dict], system_message: str | None = None) -> str:
@@ -83,13 +91,23 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--fc-ctx-fix", default="auto", choices=["auto", "on", "off"],
                     help="FC hand-back fix (selective): auto = ON for the official VoiceChat checkpoint only; off = rollback")
-    ap.add_argument("--mode", default="reference", choices=["reference", "enhanced"])
+    ap.add_argument("--strict", action="store_true",
+                    help="fail if a requested optimisation cannot be enabled (default: continue without it, WARNING)")
+    ap.add_argument("--preset", default="release", choices=list(presets.SINGLE),
+                    help="release (default): enhanced mode + the fastest gated single-session optimisations (CUDA graphs, "
+                         "int8 Thinker MLP, fused EarTTS norm, codec, RVQ cache, fast attention); release-exact: the "
+                         "same with bit-exact attention; reference: NVIDIA's reference step. Explicit flags override it")
+    ap.add_argument("--mode", default=None, choices=["reference", "enhanced"])
     ap.add_argument("--pace", default="realtime", choices=["realtime", "fast"])
     ap.add_argument("--tail-silence", type=float, default=6.0)
     ap.add_argument("--tools", default="orders,random", help="comma list: orders,random")
     ap.add_argument("--no-prompt", action="store_true")
+    ap.add_argument("--system-message", default=None,
+                    help="persona / instructions placed in NVIDIA's FC prompt template together with the tool schemas "
+                         "(text, or @file.txt); default: NVIDIA's default system message")
     ap.add_argument("--tool-delay", type=float, default=0.0)
     ap.add_argument("--override", action="append", default=[], help="cfg key=value (OmegaConf dotlist)")
+    presets.add_determinism_args(ap)
     ap.add_argument("--no-llm-cache", action="store_true",
                     help="diagnostic: NVIDIA's shipped no-cache Thinker (full-history recompute per step); "
                          "default is the V2 incremental Thinker (mynah_v2.model.llm_cache, gate scripts/cache_parity.py)")
@@ -124,7 +142,7 @@ def main():
                          "numerics slightly (measured: one turn onset shifted by 1 frame), so never for parity runs")
     ap.add_argument("--orders-json", default=None, help="SQLite seed rows [[order_id,status,date,tracking],...]")
     ap.add_argument("--seed", type=int, default=None, help="reseed python/numpy/torch before each input (reproducible sampling)")
-    ap.add_argument("--exp", default="", help="comma list of mynah_v2.model.perf experiments (ENHANCED only), applied "
+    ap.add_argument("--exp", default=None, help="comma list of mynah_v2.model.perf experiments (ENHANCED only), applied "
                     "after --perf-profile; non-exact ones (thinker_w8, heads_w8) change the model")
     ap.add_argument("--perf-profile", default=None, choices=["optimized-exact", "optimized-graph"],
                     help="validated performance profile (mynah_v2.model.perf.PROFILES); ENHANCED only")
@@ -133,6 +151,8 @@ def main():
     ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128])
     ap.add_argument("--int4-clip", action="store_true", help="per-group clipping search (MSE)")
     a = ap.parse_args()
+    preset_info = presets.fill(a, presets.SINGLE, a.preset)
+    print("PRESET", a.preset, preset_info, flush=True)
     if a.thinker_int4 and a.mode == "reference":
         ap.error("--thinker-int4 is experimental and never allowed in REFERENCE mode")
     if a.pace == "fast" and a.tools:
@@ -157,7 +177,7 @@ def main():
     if "random" in names:
         import offline_voicechat_fc_infer as fcmod
         reg.schemas += fcmod.DEFAULT_TOOLS  # handler = NVIDIA builtin generate_random_number
-    overrides = {}
+    overrides = presets.determinism_overrides(a)
     for kv in a.override:
         k, v = kv.split("=", 1)
         overrides[k] = yaml.safe_load(v)
@@ -179,6 +199,7 @@ def main():
         return s.model_step if s else None
 
     eng = ReferenceEngine(cfg, llm_cache=not a.no_llm_cache, fc_ctx_fix=a.fc_ctx_fix)
+    det_info = presets.apply_determinism(a)
     cache_info = eng.llm_cache_info
     quant_info = None
     if a.thinker_int4:
@@ -186,16 +207,11 @@ def main():
         quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip)
         print("THINKER_QUANT", quant_info, flush=True)
     perf_info = None
-    if a.perf_profile:
-        from mynah_v2.model import perf
-        perf_info = {"profile": a.perf_profile, "experiments": perf.apply_profile(a.perf_profile, eng)}
+    if a.perf_profile or a.exp:
+        perf_info = presets.apply(eng, a.perf_profile, a.exp, strict=a.strict)
         print("PERF_PROFILE", perf_info, flush=True)
-    if a.exp:
-        from mynah_v2.model import perf
-        perf_info = {**(perf_info or {}), "exp": {n: perf.enable(n, eng) for n in a.exp.split(",")}}
-        print("PERF_EXP", perf_info["exp"], flush=True)
     print(f"engine loaded in {eng.load_s:.1f}s, chunk={eng.chunk_samples}", flush=True)
-    prompt = None if a.no_prompt else render_prompt(reg.schemas)
+    prompt = None if a.no_prompt else render_prompt(reg.schemas, read_system_message(a.system_message))
     summary_all = []
     items = [(Path(w).stem, w, load_16k(w)) for w in a.wavs]
     if a.pad_silence > 0:
@@ -269,7 +285,7 @@ def main():
         tr.close()
         agent = np.concatenate(agent_chunks) if agent_chunks else np.zeros(0, np.float32)
         sf.write(od / "agent.wav", agent, T.OUTPUT_SR)
-        sf.write(od / "output.wav", agent, T.OUTPUT_SR)  # name expected by scripts/agent/asr_dirs.py (OmniASR)
+        sf.write(od / "output.wav", agent, T.OUTPUT_SR)  # name expected by scripts/asr_eval.py (OmniASR)
         user = AF.resample(wav.unsqueeze(0), 16000, T.OUTPUT_SR)[0].numpy()
         L = max(len(user), len(agent))
         sf.write(od / "combined.wav", np.stack([np.pad(user, (0, L - len(user))), np.pad(agent, (0, L - len(agent)))], 1),
@@ -297,6 +313,7 @@ def main():
             "consumed": sess.controller.consumed, "grounding_violations": sess.controller.grounding_violations,
             "max_mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2),
             "llm_cache": cache_info, "thinker_quant": quant_info, "perf_profile": perf_info,
+            "preset": {"name": a.preset, **preset_info}, "determinism": det_info,
         }
         summ["token_ids"] = {"text": list(sess.text_ids), "func": list(sess.func_ids)}
         if tt is not None:

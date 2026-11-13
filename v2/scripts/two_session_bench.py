@@ -833,7 +833,7 @@ def compare_all(spec: dict, run_dir: Path, base_dir: Path, driver_results: dict,
     return {"spec": spec["path"], "spec_sha256": spec["sha256"], "run": str(run_dir), "baseline": str(base_dir),
             "verdict": verdict, "groups": groups,
             "notes": ["evidence = model internal text + tool ledger + traces; no ASR of the spoken audio here "
-                      "(run scripts/agent/asr_dirs.py on the agent.wav dirs for the audio evidence)",
+                      "(run scripts/asr_eval.py on the output.wav dirs for the audio evidence)",
                       "realtime pacing caps throughput at input_rate_bound_chunks_per_s"]}
 
 

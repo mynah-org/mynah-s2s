@@ -1,7 +1,7 @@
 """Audio-side quality gate for experiments that change the TTS numerics (e.g. EarTTS BF16), CPU only.
 
 Inputs: a perf_ab run directory (baseline.wav / experiment.wav + *_text.json) and an OmniASR run over the two WAVs
-(asr_dirs.py layout: <asr_dir>/{fp32,bf16}/output.wav + asr_omni3b.json). For each side:
+(asr_eval.py layout: <asr_dir>/{fp32,bf16}/output.wav + asr_omni3b.json). For each side:
   * hallucination: word error rate of the ASR against the model's internal text, and the share of ASR words that
     never occur in the internal text;
   * repetition: share of repeated word 3-grams in the ASR;
@@ -90,7 +90,7 @@ def main():
     ab, asr = Path(a.ab), Path(a.asr)
     rec = json.loads((asr / "asr_omni3b.json").read_text())
 
-    def asr_of(name):                       # asr_dirs.py layout: {"sessions": [{"scenario", "segments": [...]}]}
+    def asr_of(name):                       # asr_eval.py layout: {"sessions": [{"scenario", "segments": [...]}]}
         for it in rec.get("sessions", []):
             if it.get("scenario") == name:
                 return " ".join(seg.get("text", "") for seg in it.get("segments", []))

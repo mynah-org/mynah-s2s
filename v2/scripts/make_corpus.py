@@ -1,12 +1,12 @@
 """Render the fixed V2 regression corpus (eval/corpus_v1.json) to user-side WAVs (24 kHz mono PCM16) + JSON sidecars.
 
-Synthetic caller only (Qwen3-TTS 0.6B CustomVoice, pinned revision, preset speakers, fixed seed per utterance), same
-timeline convention as scripts/agent/make_scenarios.py: the first offset is absolute, later offsets are measured from
+Synthetic caller only (Qwen3-TTS 0.6B CustomVoice, pinned revision, preset speakers, fixed seed per utterance).
+Timeline convention: the first offset is absolute, later offsets are measured from
 the end of the previous utterance; tail_s of silence after the last one. Writes <out>/<id>.wav, <out>/<id>.json,
 <out>/orders.json, <out>/manifest.json (sha256 of every WAV). Refuses an existing output directory.
 
-Runs with the V2 interpreter and PYTHONPATH=~/mynah-s2s/cache/pylib-tts (qwen-tts 0.1.1 + transformers 4.57.3,
-isolated from the engine's packages).
+Runs with the V2 interpreter and PYTHONPATH=$MYNAH_HOME/cache/pylib-tts (qwen-tts 0.1.1 + transformers 4.57.3,
+isolated from the engine's packages); `make corpus` sets this up. Install the TTS with `make setup-tts`.
 """
 
 from __future__ import annotations
@@ -32,8 +32,16 @@ def main():
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
     from huggingface_hub import snapshot_download
-    from qwen_tts import Qwen3TTSModel
-    snap = snapshot_download(spec["tts"]["model"], revision=spec["tts"]["revision"], local_files_only=True)
+    try:
+        from qwen_tts import Qwen3TTSModel
+    except ImportError as e:
+        raise SystemExit(f"TTS_MISSING: qwen-tts is not importable ({e}). Install it with `make setup-tts` "
+                         "(or bash v2/scripts/setup_cuda.sh --only tts) and run through `make corpus`.")
+    try:
+        snap = snapshot_download(spec["tts"]["model"], revision=spec["tts"]["revision"], local_files_only=True)
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"TTS_MISSING: {spec['tts']['model']}@{spec['tts']['revision'][:8]} is not in the local HF "
+                         f"cache ({type(e).__name__}). Download it with `make setup-tts`.")
     m = Qwen3TTSModel.from_pretrained(snap, device_map="cuda", dtype=torch.bfloat16, attn_implementation="sdpa")
     manifest = {"corpus": spec["name"], "corpus_sha256": hashlib.sha256(Path(a.corpus).read_bytes()).hexdigest(),
                 "tts": spec["tts"], "items": {}}

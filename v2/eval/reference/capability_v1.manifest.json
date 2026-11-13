@@ -1,0 +1,49 @@
+{
+ "corpus": "v2-capability-v1",
+ "corpus_sha256": "686c1f9ba33dc09d40af44418cec0aaa78345ded6f998b996119609161dfce6f",
+ "tts": {
+  "engine": "qwen-tts==0.1.1",
+  "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+  "seed": 7,
+  "synthetic": true
+ },
+ "items": {
+  "c01": {
+   "sha256": "f145f547ae3558e040c9cbad0796bcfd853f9b398ef130afbc62a91933cf85d6",
+   "duration": 21.64
+  },
+  "c02": {
+   "sha256": "63033f73f087b9893d4a0bcd889403c14c8f6a53c904b52ee059b41a6da29188",
+   "duration": 22.36
+  },
+  "c03": {
+   "sha256": "c905c86ed57a4c0a5b059b42f5400043926a484f45dbed390dc515bfa0e3c1c8",
+   "duration": 20.68
+  },
+  "c04": {
+   "sha256": "d0cf7a9d7f6ab744a9c39ba852c651d9aad20651383cc3aeb6795f9acb896348",
+   "duration": 28.2
+  },
+  "c05": {
+   "sha256": "ebafddf3d5ffe5fbb1e81e548d802036e2fdaf7acb67524e9805c285fcfcf7e8",
+   "duration": 23.72
+  },
+  "c06": {
+   "sha256": "0fd6dca6c867b329db8d837bdd917ee6b38d63fc21d0ac7e05803ebb20453394",
+   "duration": 19.08
+  },
+  "c07": {
+   "sha256": "8e559b7a704f24c0a97f5a19e9cd89a992e8c0161daa0fede97d421b81407d09",
+   "duration": 29.96
+  },
+  "c08": {
+   "sha256": "b88332e4bee3fbd8cfcac8d4af539ccb22817ecf1ea128dd8dd29419b5d87784",
+   "duration": 27.32
+  },
+  "c09": {
+   "sha256": "3c16ffca7176cee08052787afd4fffa408db04a0bbd3d30d713bc850d1f089b1",
+   "duration": 26.6
+  }
+ }
+}

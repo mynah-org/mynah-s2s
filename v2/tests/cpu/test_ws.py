@@ -159,3 +159,83 @@ def test_ws_disconnect_without_session_end_is_a_cancel_close(tmp_path):
     rows = [json.loads(l) for f in tmp_path.glob("ws-*.jsonl") for l in f.read_text().splitlines()]
     closed = [r for r in rows if r["ev"] == "session.closed"][0]
     assert closed["kind"] == "cancel" and eng.k < 20
+
+
+def test_ws_silent_client_is_closed_after_the_idle_timeout(tmp_path):
+    import websockets
+    eng = FakeEngine()
+    srv = VoiceServer(eng, ServerConfig(host="127.0.0.1", port=0, trace_dir=str(tmp_path), idle_timeout_s=0.3))
+
+    async def main():
+        async with websockets.serve(srv.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with websockets.connect(f"ws://127.0.0.1:{port}/v1/session") as ws:
+                await ws.send(json.dumps({"type": "session.start"}))
+                await ws.recv()                          # session.created, then silence (no audio, no end)
+                msgs = []
+                async for m in ws:
+                    if isinstance(m, str):
+                        msgs.append(json.loads(m))
+                        if msgs[-1].get("type") == "session.closed":
+                            break
+            for _ in range(100):
+                if srv.active == 0 and not srv.engine_lock.locked():
+                    return msgs
+                await asyncio.sleep(0.05)
+            return None
+
+    msgs = asyncio.run(main())
+    assert msgs is not None, "slot not released after the idle timeout"
+    assert any(m.get("error") == "idle_timeout" for m in msgs)
+    assert [m for m in msgs if m.get("type") == "session.closed"][0]["kind"] == "cancel"
+
+
+def test_ws_client_that_never_sends_is_closed_after_the_idle_timeout(tmp_path):
+    import websockets
+    srv = VoiceServer(FakeEngine(), ServerConfig(host="127.0.0.1", port=0, idle_timeout_s=0.3))
+
+    async def main():
+        async with websockets.serve(srv.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with websockets.connect(f"ws://127.0.0.1:{port}/v1/session") as ws:
+                msg = json.loads(await ws.recv())        # nothing sent at all
+            for _ in range(100):
+                if srv.active == 0 and not srv.engine_lock.locked():
+                    return msg
+                await asyncio.sleep(0.05)
+            return None
+
+    assert asyncio.run(main())["error"] == "idle_timeout"
+
+
+def test_ws_stuck_close_turns_the_server_unhealthy_and_keeps_the_slot(tmp_path):
+    import threading
+
+    import websockets
+
+    release = threading.Event()
+
+    class StuckClose(FakeEngine):
+        def close(self):
+            release.wait(10)                             # a hung engine step / close
+            super().close()
+
+    srv = VoiceServer(StuckClose(), ServerConfig(host="127.0.0.1", port=0, close_timeout_s=0.3))
+
+    async def main():
+        async with websockets.serve(srv.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with websockets.connect(f"ws://127.0.0.1:{port}/v1/session") as ws:
+                await ws.send(json.dumps({"type": "session.start"}))
+                await ws.recv()
+                await ws.send(json.dumps({"type": "session.cancel"}))
+                await asyncio.sleep(0.8)
+            async with websockets.connect(f"ws://127.0.0.1:{port}/v1/session") as ws2:
+                return json.loads(await ws2.recv())
+
+    try:
+        msg = asyncio.run(main())
+    finally:
+        release.set()
+    assert msg["error"].startswith("unhealthy:")
+    assert srv.unhealthy is not None and srv.engine_lock.locked()

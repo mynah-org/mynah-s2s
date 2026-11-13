@@ -311,7 +311,7 @@ ORDERS_SCHEMA = {
     "required": ["order_id"],
 }
 
-# Same facts as the earlier cycle's fixture (scripts/agent/mock_tools.py) so scenario WAVs stay comparable;
+# Same facts as the earlier test fixture so scenario WAVs stay comparable across project cycles;
 # dates spelled out (TTS-friendly, model-card advice: "ASCII-only and TTS-friendly" responses).
 DEFAULT_ORDERS = [
     ("XYZ123", "shipped", "November 12, 2026", "7319"),

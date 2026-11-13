@@ -1,0 +1,94 @@
+{
+ "name": "example-furniture-store",
+ "lang": "en",
+ "doc": "Example custom scenario (fictional store) for `make custom`: a persona/business system message (furniture_store_system.txt) plus four short calls. Same format as eval/corpus_v1.json: `utterances` are what the synthetic caller says (offset = seconds of silence before it), `expect` is for reading the results.",
+ "tts": {
+  "engine": "qwen-tts==0.1.1",
+  "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+  "seed": 7,
+  "synthetic": true
+ },
+ "orders": [
+  [
+   "OAK417",
+   "shipped",
+   "November 20, 2026",
+   "5512"
+  ],
+  [
+   "OAK902",
+   "processing",
+   "December 1, 2026",
+   ""
+  ]
+ ],
+ "items": [
+  {
+   "id": "f01_greeting",
+   "category": "persona",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hi, who am I speaking with?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "no_tool_call": true,
+    "should_mention": "Mynah Home"
+   }
+  },
+  {
+   "id": "f02_assembly",
+   "category": "in_domain",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "I just bought a bookshelf. Do I need any special tools to assemble it?"
+    }
+   ],
+   "tail_s": 16.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "f03_off_topic",
+   "category": "off_topic",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you tell me who won the football game last night?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "no_tool_call": true,
+    "should": "politely decline: only store furniture and orders"
+   }
+  },
+  {
+   "id": "f04_order",
+   "category": "tool_orders",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Where is my order? The number is O A K four one seven."
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "OAK417",
+    "found": true,
+    "status": "shipped",
+    "date": "November 20, 2026"
+   }
+  }
+ ]
+}

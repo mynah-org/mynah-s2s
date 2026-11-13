@@ -151,6 +151,9 @@ class SessionStateStore:
         self._installed = False
         self._original: dict[str, Any] = {}      # swap: owner value at install; routed: instance __dict__ value
         self._classes: dict[str, type] = {}
+        # hot path of every session switch (several per round per session): resolved once
+        self._swap = [(self.owners[s.owner], s.attr, s.key) for s in self.specs if not s.routed]
+        self._poisons = {key: Poisoned(key) for _, _, key in self._swap}
 
     # ---------------------------------------------------------------------------------------------------- install
     def install(self) -> None:
@@ -201,9 +204,8 @@ class SessionStateStore:
         self._installed = False
 
     def _poison(self) -> None:
-        for s in self.specs:
-            if not s.routed:
-                setattr(self.owners[s.owner], s.attr, Poisoned(s.key))
+        for o, attr, key in self._swap:
+            setattr(o, attr, self._poisons[key])
 
     # ---------------------------------------------------------------------------------------------------- sessions
     def open(self, sid: SessionId, seed: int | None = None, overrides: dict | None = None,
@@ -231,13 +233,12 @@ class SessionStateStore:
         if self._active != sid:
             raise SessionStateError(f"capture({sid!r}) but the swapped-in session is {self._active!r}")
         rec = self._records[sid]
-        for s in self.specs:
-            if s.routed:
-                continue
-            v = getattr(self.owners[s.owner], s.attr)
-            if isinstance(v, Poisoned):
-                raise SessionStateError(f"{s.key} was poisoned while {sid!r} was active")
-            rec.fields[s.key] = v
+        fields = rec.fields
+        for o, attr, key in self._swap:
+            v = getattr(o, attr)
+            if type(v) is Poisoned:
+                raise SessionStateError(f"{key} was poisoned while {sid!r} was active")
+            fields[key] = v
         if self.rng:
             rec.rng = rng_get(self.cuda_rng)
         self._poison()
@@ -255,12 +256,12 @@ class SessionStateStore:
             return
         if self._active is not None:
             raise SessionStateError(f"restore({sid!r}) while {self._active!r} is swapped in: capture it first")
-        if set(rec.fields) != self.keys:
-            raise SessionStateError(f"record of {sid!r} has fields {sorted(set(rec.fields) ^ self.keys)} "
+        fields = rec.fields
+        if fields.keys() != self.keys:
+            raise SessionStateError(f"record of {sid!r} has fields {sorted(set(fields) ^ self.keys)} "
                                     "that do not match the registry")
-        for s in self.specs:
-            if not s.routed:
-                setattr(self.owners[s.owner], s.attr, rec.fields[s.key])
+        for o, attr, key in self._swap:
+            setattr(o, attr, fields[key])
         if self.rng:
             if rec.rng is not None:
                 rng_set(rec.rng)

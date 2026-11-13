@@ -20,6 +20,8 @@ from collections import defaultdict
 
 import torch
 
+PROFILE_LABELS = False                 # V2_TORCH_PROFILE: also open a record_function per call (comp:<c>/<tag>)
+
 
 class CompTimer:
     def __init__(self):
@@ -40,7 +42,12 @@ class CompTimer:
             e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             t0 = time.perf_counter()
             e0.record()
-            out = orig(*a, **kw)
+            if PROFILE_LABELS:
+                tg = "fc" if "_fc_async" in threading.current_thread().name else "main"
+                with torch.profiler.record_function(f"comp:{comp}/{tg}"):
+                    out = orig(*a, **kw)
+            else:
+                out = orig(*a, **kw)
             e1.record()
             # upstream FC threads: threading.Thread(target=_fc_async_thread_fn) → default name "Thread-N (_fc_async…)"
             tag = "fc" if "_fc_async" in threading.current_thread().name else "main"
