@@ -40,9 +40,14 @@ The two script directories must stay siblings: `agentbench` imports `../multilin
   the NeMo streaming FC hand-back.
 - **Live sessions** (`agentbench/m0_runner` and the probes that use `Session`) run through the engine's FC hand-back
   fix `fc_ctx_fix`, which resumes after a call with (PAD, PAD). The lab's older live results used a NeMo patch that
-  resumed with (PAD, EOTR). They are kept apart and are not comparable. `m0_runner` still sets the lab's old
-  `S2S_FIX_*` environment flags, which have no effect on an unpatched NeMo. Its `runtime_fix` field therefore does not
-  describe the engine's fix. **The live path is not yet re-validated on this engine.**
+  resumed with (PAD, EOTR). They are kept apart and are not comparable.
+  - `m0_runner`'s `S2S_FIX_*` flags are **legacy**: they act only on that frozen patch and do nothing on a clean NeMo.
+    On this engine, run it with `--no-fc-fix`.
+  - Every live record now carries `runtime_fix.engine_fc_ctx_fix` and `runtime_fix.resume_contract`
+    (`agentbench/live_gates.py`). A run with both fixes active is refused.
+  - `live_gates.m07_chain` is the mandatory live regression: EN m07 must keep the legitimate second call
+    (`find_customer` → `prepare_return`).
+  - **The live path is not yet re-validated on this engine.**
 - **Adapters and checkpoints** trained before the migration were produced with an earlier engine snapshot. Each one is
   declared compatible only after the construction-parity and bit-exact checks pass.
 

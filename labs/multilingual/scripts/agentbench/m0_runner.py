@@ -83,7 +83,12 @@ def apply_fc_fix_defaults(environ, disable: bool) -> dict:
       chain, while (PAD, PAD) loses it on the official checkpoint.
 
     Rollback: --no-fc-fix forces both to 0 (the upstream NVIDIA contract). An explicit env value always wins. The
-    effective flags go into summary.json `runtime_fix` of every session."""
+    effective flags go into summary.json `runtime_fix` of every session.
+
+    LEGACY on this repository's engine (owner 2026-11-13, D4): the flags act only on the frozen lab NeMo patch. On a
+    clean NeMo they do nothing; the engine's own `fc_ctx_fix` (resume (PAD, PAD), default ON for the official
+    checkpoint) does the hand-back. Run with --no-fc-fix there. `runtime_fix` records the engine fix and the
+    `resume_contract` actually used (live_gates.resume_contract); a run with both fixes active is refused."""
     for k, on in zip(FC_FIX_FLAGS, ("1", "all")):
         if disable:
             environ[k] = "0"
@@ -216,10 +221,20 @@ def main():
         runtime_fix["v2_src"] = str(Path(_v2.__file__).resolve().parent)
     except Exception as _e:  # noqa: BLE001 - provenance must never break a run
         runtime_fix["provenance_error"] = repr(_e)
+    _fx = getattr(eng, "fc_ctx_fix_info", None) or {}               # the engine's own FC hand-back fix (M4: recorded)
+    runtime_fix["engine_fc_ctx_fix"] = {k: (list(v) if isinstance(v, tuple) else v) for k, v in _fx.items() if k != "fix"}
+    if isinstance(_fx.get("fix"), dict):
+        runtime_fix["engine_fc_ctx_fix"].update({k: _fx["fix"].get(k) for k in ("pad_id", "func_pad")},
+                                                channels=list(_fx["fix"].get("channels", ())))
+    from live_gates import DOUBLE, resume_contract
+    runtime_fix["resume_contract"] = resume_contract(runtime_fix)
     print("RUNTIME_FIX", runtime_fix, flush=True)
+    if runtime_fix["resume_contract"] == DOUBLE:
+        raise SystemExit("both FC hand-back fixes are active (lab NeMo patch + engine fc_ctx_fix): refused, results "
+                         "would be mislabelled. On this engine pass --no-fc-fix and use a clean NeMo")
     if any(v != "0" for v in fc_flags.values()) and not runtime_fix["patched"]:
-        raise SystemExit("post-FC fix requested but the NeMo build on PYTHONPATH is not patched: put "
-                         "~/mynah-s2s/ml/nemo-speech-ml on PYTHONPATH (scripts/multilingual/ml_env.sh) or pass --no-fc-fix")
+        raise SystemExit("legacy lab post-FC flags requested but the NeMo on PYTHONPATH is not the lab patch. On this "
+                         "repository's engine pass --no-fc-fix: the engine's fc_ctx_fix does the hand-back (PAD, PAD)")
     defs = {"vc": "vc"}
     for kv in filter(None, a.frontend_defs.split("|")):
         k, v = kv.split("=", 1)
