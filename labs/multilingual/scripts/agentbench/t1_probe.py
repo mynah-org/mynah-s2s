@@ -39,6 +39,8 @@ import math
 import sys
 import time
 from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent / "multilingual"))   # labpaths (MYNAH_HOME / MYNAH_LAB_HOME)
+from labpaths import LAB_HOME  # noqa: E402
 
 import torch
 
@@ -346,9 +348,9 @@ def gate(th, audio: torch.Tensor, rec: dict[int, int], call: tuple[int, list[int
 def main():  # pragma: no cover - GPU
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--audio-root", default=str(Path.home() / "mynah-s2s/ml/data/agentbench/tts_m1"))
-    ap.add_argument("--a-m03-trace", default=str(Path.home() / "mynah-s2s/ml/results/agentbench/m1-parity/vc_en_m03/trace.jsonl"))
-    ap.add_argument("--a-m08-trace", default=str(Path.home() / "mynah-s2s/ml/results/agentbench/m1/vc_en_m08/trace.jsonl"))
+    ap.add_argument("--audio-root", default=str(LAB_HOME / "data/agentbench/tts_m1"))
+    ap.add_argument("--a-m03-trace", default=str(LAB_HOME / "results/agentbench/m1-parity/vc_en_m03/trace.jsonl"))
+    ap.add_argument("--a-m08-trace", default=str(LAB_HOME / "results/agentbench/m1/vc_en_m08/trace.jsonl"))
     ap.add_argument("--budget-s", type=float, default=13.5 * 60, help="soft stop for optional units (job timeout is the hard cap)")
     ap.add_argument("--lead-s", type=float, default=7.0)
     ap.add_argument("--tail-s", type=float, default=3.0)
@@ -404,10 +406,10 @@ def main():  # pragma: no cover - GPU
     fe = FrontEnd(eng)
     fe.snapshot()
     t = time.monotonic()
-    ckpt = {"en": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-en"),
-            "ml": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-ml")}
+    ckpt = {"en": load_nemo_dir(LAB_HOME / "ckpt/asr-en"),
+            "ml": load_nemo_dir(LAB_HOME / "ckpt/asr-ml")}
     timing["ckpt_load"] = round(time.monotonic() - t, 1)
-    R = str(Path.home() / "mynah-s2s/ml/results")
+    R = str(LAB_HOME / "results")
     ARMS = {"A": "vc",
             "C-ridge": f"enc=ml;att=56;rnnt=ml;ln=orig;map={R}/maps/ridge_ml_out.pt",
             "D-V2.1": f"enc=ml;att=56;rnnt=ml;ln={R}/v21/distill/v21/encoder_ln_best.pt;adapter={R}/v21/distill/v21/adapter_best.pt",

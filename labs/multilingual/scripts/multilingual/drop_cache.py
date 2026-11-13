@@ -3,8 +3,9 @@ allocations share the 121 GB with the page cache. Prints MemAvailable before/aft
 import os
 import sys
 from pathlib import Path
+from labpaths import HF_CACHE, LAB_HOME, MYNAH_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
-ROOTS = [Path.home() / "mynah-s2s/hf-cache", Path.home() / "mynah-s2s/ml", Path.home() / "mynah-s2s/data"]
+ROOTS = [HF_CACHE, LAB_HOME, MYNAH_HOME / "data"]
 
 
 def avail():

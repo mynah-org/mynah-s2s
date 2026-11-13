@@ -24,6 +24,8 @@ import torchaudio.functional as AF
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "multilingual"))   # labpaths (MYNAH_HOME / MYNAH_LAB_HOME)
+from labpaths import LAB_HOME  # noqa: E402
 from tenant_backend import TenantBackend  # noqa: E402
 
 from mynah_v2.agent.controller import Controller  # noqa: E402
@@ -95,6 +97,32 @@ def apply_fc_fix_defaults(environ, disable: bool) -> dict:
         else:
             environ.setdefault(k, on)
     return {k: environ[k] for k in FC_FIX_FLAGS}
+
+
+def write_run_config(out, eng, runtime_fix: dict) -> dict:
+    """Provenance of a live run (owner 2026-11-13, C3): engine commit + source hash, NeMo commit, checkpoint, preset,
+    the engine's FC hand-back fix, the resume contract and the effective config. The legacy lab flags are recorded with
+    whether they had any effect, so they can never be mistaken for an active fix."""
+    import hashlib
+    import os
+    import subprocess
+    import mynah_v2
+    from omegaconf import OmegaConf
+    src = Path(mynah_v2.__file__).resolve().parent
+    h = hashlib.sha256()
+    for f in sorted(src.rglob("*.py")):
+        h.update(f.relative_to(src).as_posix().encode() + b"\0" + f.read_bytes())
+    git = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    cfg = OmegaConf.to_container(eng.cfg, resolve=True)
+    rc = {"engine_commit": os.environ.get("MYNAH_ENGINE_COMMIT") or git or None, "engine_src": str(src),
+          "engine_src_sha256": h.hexdigest(), "nemo_git": runtime_fix.get("nemo_git"), "nemo_dirty": runtime_fix.get("nemo_dirty"),
+          "checkpoint": cfg.get("s2s", {}).get("llm_checkpoint_path") if isinstance(cfg, dict) else None,
+          "preset": "none (ReferenceEngine, llm_cache=True, m0_runner defaults)",
+          "engine_fc_ctx_fix": runtime_fix.get("engine_fc_ctx_fix"), "resume_contract": runtime_fix.get("resume_contract"),
+          "legacy_lab_flags": {k: runtime_fix.get(k) for k in ("S2S_FIX_CONTEXT_PAD", "S2S_FIX_FC_TOKEN_SYNC")},
+          "legacy_lab_flags_effective": runtime_fix.get("legacy_lab_flags_effective"), "effective_cfg": cfg}
+    (out / "run_config.json").write_text(json.dumps(rc, indent=1, default=str))
+    return rc
 
 
 FALLBACK_OFF_FRAMES = 10 ** 9   # first_turn_fallback_frames when the first-turn fallback is disabled (config only)
@@ -186,8 +214,8 @@ def main():
                     help="do not START a session if elapsed + the longest session so far would exceed this (0 = off)")
     ap.add_argument("--no-fc-fix", action="store_true",
                     help="force the post-FC runtime fix flags to 0 (lab default is already OFF since 2026-11-12 14:30)")
-    ap.add_argument("--en-dir", default=str(Path.home() / "mynah-s2s/ml/ckpt/asr-en"))
-    ap.add_argument("--ml-dir", default=str(Path.home() / "mynah-s2s/ml/ckpt/asr-ml"))
+    ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
+    ap.add_argument("--ml-dir", default=str(LAB_HOME / "ckpt/asr-ml"))
     a = ap.parse_args()
     import os as _os0
     fc_flags = apply_fc_fix_defaults(_os0.environ, a.no_fc_fix)
@@ -232,6 +260,8 @@ def main():
     if runtime_fix["resume_contract"] == DOUBLE:
         raise SystemExit("both FC hand-back fixes are active (lab NeMo patch + engine fc_ctx_fix): refused, results "
                          "would be mislabelled. On this engine pass --no-fc-fix and use a clean NeMo")
+    runtime_fix["legacy_lab_flags_effective"] = bool(runtime_fix["patched"])   # S2S_FIX_* act only on the lab patch
+    write_run_config(out, eng, runtime_fix)
     if any(v != "0" for v in fc_flags.values()) and not runtime_fix["patched"]:
         raise SystemExit("legacy lab post-FC flags requested but the NeMo on PYTHONPATH is not the lab patch. On this "
                          "repository's engine pass --no-fc-fix: the engine's fc_ctx_fix does the hand-back (PAD, PAD)")
@@ -346,12 +376,17 @@ def main():
                 sys.path.insert(0, str(HERE))
                 import observe
                 un_obs = observe.install(eng.wrapper, obs_rows)
+            _rs = ((getattr(eng, "fc_ctx_fix_info", None) or {}).get("fix") or {}).get("stats") or {}
+            n_resume0 = len(_rs.get("resume_inputs", []))
             t0 = time.monotonic()
             sess.open(prompt)
             run_paced(sess, wav, pace="realtime", tail_silence_s=a.tail_s, max_extra_s=a.max_extra_s, drain=True)
             wall = time.monotonic() - t0
             sess.close("normal")
             tr.close()
+            import live_gates
+            fcev = live_gates.fc_events(od / "trace.jsonl")              # FC openings, calls, results, resumes (M4/C3)
+            resume_inputs = list(_rs.get("resume_inputs", []))[n_resume0:]
             if un_obs is not None:
                 un_obs()
                 obs_rows.close()
@@ -382,7 +417,8 @@ def main():
                    "function_text": "".join(sess.func_text), "wall_s": round(wall, 1),
                    "audio_in_s": round(wav.numel() / 16000, 1), "audio_out_s": round(len(agent) / T.OUTPUT_SR, 1),
                    "stats": {k: v for k, v in vars(sess.stats).items() if k not in ("step_ms", "step_ms_model")},
-                   "grounding_violations": sess.controller.grounding_violations}
+                   "grounding_violations": sess.controller.grounding_violations,
+                   "fc_events": fcev, "fc_resume_inputs": resume_inputs}
             (od / "summary.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False))
             with open(out / "records.jsonl", "a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")

@@ -19,11 +19,12 @@ import re
 import time
 import unicodedata
 from pathlib import Path
+from labpaths import HF_CACHE  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
 import torch
 
-NANO = Path.home() / "mynah-s2s/hf-cache/models--nvidia--NVIDIA-Nemotron-Nano-9B-v2/snapshots/6533e8de2c68e4536bf7c411d7a3ce5734111476"
-VC = Path.home() / "mynah-s2s/hf-cache/models--nvidia--NVIDIA-NemotronLabs-VoiceChat-11B/snapshots/443794ea956ef0065f001967ffd00e77f519cb39/model.safetensors"
+NANO = HF_CACHE / "models--nvidia--NVIDIA-Nemotron-Nano-9B-v2/snapshots/6533e8de2c68e4536bf7c411d7a3ce5734111476"
+VC = HF_CACHE / "models--nvidia--NVIDIA-NemotronLabs-VoiceChat-11B/snapshots/443794ea956ef0065f001967ffd00e77f519cb39/model.safetensors"
 
 TOOLS = [
     {"type": "function", "function": {"name": "get_order_status", "description": "Look up the status of an order by its ID.",

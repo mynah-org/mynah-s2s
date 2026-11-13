@@ -39,13 +39,15 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "multilingual"))   # labpaths (MYNAH_HOME / MYNAH_LAB_HOME)
+from labpaths import LAB_HOME  # noqa: E402
 from t1_probe import BOS, EOS, EOTC, PAD, SOTC, Thinker, fc_call, frame_tokens, logp_rows, trace_session  # noqa: E402
 
 EOTR = 22
 CONTRACTS = "0/0,12/12,12/0,0/22,12/22,12/22s"
 # first-cell wall estimates for the budget guard (job 278: m08 41 s = 225 forced steps + 5 re-call decodes, ~85 ms/step)
 FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 55.0, "m03_empty": 40.0}
-RES = Path.home() / "mynah-s2s/ml/results/agentbench"
+RES = LAB_HOME / "results/agentbench"
 SCEN = {
     "m03_empty": {"clip": "m03_t0", "trace": RES / "m1-parity/vc_en_m03/trace.jsonl", "trace_arm": "A",
                   "tool": "search_catalog", "args": {"query": "3-seat sofa"}, "result_args": {"query": "zzz qqq"},
@@ -118,7 +120,7 @@ def summarise(rows: list[dict]) -> dict:
 def main():  # pragma: no cover - GPU
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--data-root", default=str(Path.home() / "mynah-s2s/ml/data/agentbench"))
+    ap.add_argument("--data-root", default=str(LAB_HOME / "data/agentbench"))
     ap.add_argument("--scenarios", default="m08_vr,m03_empty,m07_chain")
     ap.add_argument("--arms", default="A,D-V2.1,C-ridge")
     ap.add_argument("--contracts", default=CONTRACTS)
@@ -212,11 +214,11 @@ def main():  # pragma: no cover - GPU
     ARMS = {"A": "vc",
             "C-ridge": "enc=ml;att=56;rnnt=ml;ln=orig;map={R}/maps/ridge_ml_out.pt",
             "D-V2.1": "enc=ml;att=56;rnnt=ml;ln={R}/v21/distill/v21/encoder_ln_best.pt;adapter={R}/v21/distill/v21/adapter_best.pt"}
-    R = str(Path.home() / "mynah-s2s/ml/results")
+    R = str(LAB_HOME / "results")
     fe = FrontEnd(eng)
     fe.snapshot()
-    ckpt = {"en": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-en"),
-            "ml": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-ml")}
+    ckpt = {"en": load_nemo_dir(LAB_HOME / "ckpt/asr-en"),
+            "ml": load_nemo_dir(LAB_HOME / "ckpt/asr-ml")}
     def clip_path(sc):   # the audio root of the LIVE session each trace comes from (m07: tts_m0_en, others tts_m1)
         root = Path(a.data_root) / SCEN[sc].get("audio_root", "tts_m1")
         man = {(r["id"], r["lang"], r["voice"]): r for r in map(json.loads, open(root / "manifest.jsonl"))}

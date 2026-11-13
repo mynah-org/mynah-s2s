@@ -7,8 +7,9 @@ Writes <out> (json verdict); never overwrites."""
 import json
 import sys
 from pathlib import Path
+from labpaths import LAB_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
-R = Path.home() / "mynah-s2s/ml/results"
+R = LAB_HOME / "results"
 out = Path(sys.argv[1])
 if out.exists():
     raise SystemExit(f"{out} exists")

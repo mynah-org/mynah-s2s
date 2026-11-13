@@ -14,10 +14,11 @@ import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+from labpaths import LAB_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-R = Path.home() / "mynah-s2s/ml/results"
+R = LAB_HOME / "results"
 
 # manual strict exclusions (experiments.md, E5 vs a1r sections): (run, variant, lang, id)
 MANUAL_FP = {

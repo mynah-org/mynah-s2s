@@ -27,10 +27,11 @@ import time
 import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
+from labpaths import LAB_HOME, MYNAH_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
 HOME = Path.home()
 import os  # noqa: E402
-V2 = Path(os.environ.get("V2_DIR", HOME / "mynah-s2s/ml/data/v2"))
+V2 = Path(os.environ.get("V2_DIR", LAB_HOME / "data/v2"))
 HERE = Path(__file__).resolve().parent
 LANGS = {"it": "Italian", "fr": "French", "de": "German", "es": "Spanish"}
 
@@ -132,7 +133,7 @@ def eval_texts() -> list[str]:
     qa = json.load(open(HERE / "qa_corpus.json"))
     for it in qa["items"]:
         t += list(it["text"].values())
-    for l in open(HOME / "mynah-s2s/data/eval/v1/manifest.jsonl"):
+    for l in open(MYNAH_HOME / "data/eval/v1/manifest.jsonl"):
         r = json.loads(l)
         t.append(r.get("transcript", ""))
     return [x for x in t if x]
@@ -205,7 +206,7 @@ def cmd_minds(a):
     import soundfile as sf
     sys.path.insert(0, str(HERE))
     from render_qa import resample
-    raw = HOME / "mynah-s2s/data/eval/raw/minds14"
+    raw = MYNAH_HOME / "data/eval/raw/minds14"
     rnd = random.Random(20261111)
     rows, corpus = [], []
     for lang, code, n in (("it", "it-IT", a.n_it), ("fr", "fr-FR", a.n_fr), ("en", "en-US", a.n_en)):

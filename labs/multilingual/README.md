@@ -52,8 +52,13 @@ The two script directories must stay siblings: `agentbench` imports `../multilin
   declared compatible only after the construction-parity and bit-exact checks pass.
 
 ## Paths
-Defaults follow the lab's machine layout under `~/mynah-s2s` (`ml/data`, `ml/ckpt`, `ml/results`, `hf-cache`). Most
-scripts take explicit `--data` / `--out` / checkpoint arguments. The defaults do **not** read `MYNAH_HOME` yet.
+Every lab script resolves its machine layout through `scripts/multilingual/labpaths.py`:
+- `MYNAH_HOME`: the engine's root (`hf-cache`, `third_party`, `data`). Same variable and default as the engine.
+- `MYNAH_LAB_HOME`: the lab's root (`data`, `ckpt`, `results`). Default `$MYNAH_HOME/ml`.
+
+With neither variable set, the paths are the historical ones (`~/mynah-s2s`, `~/mynah-s2s/ml`). Most scripts also
+take explicit `--data` / `--out` / checkpoint arguments. The only remaining `Path.home()` is `corpus_v2.py`'s pair of
+external Common Voice pools, which sit outside this layout.
 
 ## Install and test
 Inference-only users install nothing from here: the engine's `v2/pyproject.toml` is unchanged.

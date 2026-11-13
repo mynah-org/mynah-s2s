@@ -29,6 +29,8 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "multilingual"))   # labpaths (MYNAH_HOME / MYNAH_LAB_HOME)
+from labpaths import LAB_HOME  # noqa: E402
 from t1_probe import (BOS, EOTC, PAD, SOTC, Thinker, branch_fc, end_frame, fixed_history, frame_tokens,  # noqa: E402
                       logp_rows, name_candidates, prev_shift, region_stats, run_frames, trace_session)
 
@@ -93,8 +95,8 @@ def listening(rows: list[dict], lo: int, hi: int, pauses: list[int]) -> dict:
 def main():  # pragma: no cover - GPU
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--data-root", default=str(Path.home() / "mynah-s2s/ml/data/agentbench"))
-    ap.add_argument("--a-trace", default=str(Path.home() / "mynah-s2s/ml/results/agentbench/m1-parity/vc_en_m03/trace.jsonl"))
+    ap.add_argument("--data-root", default=str(LAB_HOME / "data/agentbench"))
+    ap.add_argument("--a-trace", default=str(LAB_HOME / "results/agentbench/m1-parity/vc_en_m03/trace.jsonl"))
     ap.add_argument("--arms", default="A,C-ridge,C-cal,D-V2.1")
     ap.add_argument("--budget-s", type=float, default=540.0)
     ap.add_argument("--arg-steps", type=int, default=36)
@@ -141,7 +143,7 @@ def main():  # pragma: no cover - GPU
     hist = fixed_history(frame_tokens(trace_session(a.a_trace)), 4000)
     assert all(hist[t] == BOS for t in A_OPENER_BOS), [hist[t] for t in A_OPENER_BOS]
     common, rest = name_candidates(th.encode)
-    R = str(Path.home() / "mynah-s2s/ml/results")
+    R = str(LAB_HOME / "results")
     ARMS = {"A": "vc",
             "C-ridge": f"enc=ml;att=56;rnnt=ml;ln=orig;map={R}/maps/ridge_ml_out.pt",
             "C-cal": f"enc=ml;att=56;rnnt=ml;ln=orig;map={R}/maps/ridge_ml_out_cal.pt",
@@ -151,8 +153,8 @@ def main():  # pragma: no cover - GPU
         ARMS[k] = v
     fe = FrontEnd(eng)
     fe.snapshot()
-    ckpt = {"en": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-en"),
-            "ml": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-ml")}
+    ckpt = {"en": load_nemo_dir(LAB_HOME / "ckpt/asr-en"),
+            "ml": load_nemo_dir(LAB_HOME / "ckpt/asr-ml")}
     clips = {}
     for sid, lang, root, gold in [c for c in CLIPS if not a.clips or f"{c[0]}_{c[1]}" in a.clips.split(",")]:
         rr = Path(a.data_root) / root

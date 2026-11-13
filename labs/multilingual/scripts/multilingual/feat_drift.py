@@ -12,8 +12,9 @@ import sys
 
 import torch
 
-R = str(__import__("pathlib").Path.home() / "mynah-s2s/ml/results") + "/"
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+from labpaths import LAB_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
+R = str(LAB_HOME / "results") + "/"
 from adapters import load_adapter  # noqa: E402
 
 torch.set_grad_enabled(False)
@@ -40,7 +41,7 @@ for k, ad in ads.items():
     print("drift", k, d)
 
 # LayerNorm drift (E5, V2.1) vs the ML checkpoint
-sd = torch.load(str(__import__("pathlib").Path.home() / "mynah-s2s/ml/ckpt/asr-ml/model_weights.ckpt"), map_location="cpu", weights_only=True)
+sd = torch.load(str(LAB_HOME / "ckpt/asr-ml/model_weights.ckpt"), map_location="cpu", weights_only=True)
 for k, p in {"e5": "distill/e5/encoder_ln_best.pt", "v21": "v21/distill/v21/encoder_ln_best.pt"}.items():
     ln = torch.load(R + p, map_location="cpu", weights_only=True)
     rel = []

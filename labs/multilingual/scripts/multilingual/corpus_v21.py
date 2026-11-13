@@ -4,7 +4,7 @@ The LLMs never invent facts here. Qwen2.5 only translates SVAMP (numbers checked
 only answers the EN text to record text capability (the knowledge filter). Teacher replies are later validated
 against the gold (teacher_gold), not against an LLM answer.
 
-Subcommands (data dir V21 = ~/mynah-s2s/ml/data/v21):
+Subcommands (data dir V21 = $MYNAH_LAB_HOME/data/v21):
   select       CPU  MKQA + SVAMP candidates (form filters only) -> cand.jsonl
   textfilter   GPU  Nano answers each EN question from text -> text_filter.jsonl (pass/fail kept, never dropped)
   translate    GPU  SVAMP EN -> IT/FR with Qwen2.5; numbers must be identical -> svamp_tr.jsonl
@@ -27,12 +27,13 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+from labpaths import LAB_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from corpus_v2 import Nano, QWEN_TR, content, is_refusal, jacc, norm, num_words, sha, write_new  # noqa: E402
 
-V21 = Path.home() / "mynah-s2s/ml/data/v21"
+V21 = LAB_HOME / "data/v21"
 LANGS = ("en", "it", "fr")
 SEED = 20261112
 TIME_SENSITIVE = re.compile(r"\b(current|currently|latest|now|this year|last|newest|recent|next|new season|"
@@ -393,7 +394,7 @@ def cmd_fix_eval(a):
         if r["lang"] in ("it", "fr") and r["id"] in rev[r["lang"]]:
             r["text"] = rev[r["lang"]][r["id"]]
     plan_p.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
-    fz = Path.home() / "mynah-s2s/ml/results/v21/eval_freeze.json"
+    fz = LAB_HOME / "results/v21/eval_freeze.json"
     write_new(fz, obj={"frozen_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                        "rule": "no edits driven by model outputs; a later change is a new eval version",
                        "sha256": {str(p): sha(p) for p in (qa_p, plan_p, Path(a.review))},

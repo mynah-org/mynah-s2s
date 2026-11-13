@@ -23,6 +23,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
+from labpaths import LAB_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
 import numpy as np
 import soundfile as sf
@@ -113,8 +114,8 @@ def main():
     ap.add_argument("--langs", default="en,it,fr")
     ap.add_argument("--voices", default="aiden")
     ap.add_argument("--variants", nargs="+", default=["vc"])
-    ap.add_argument("--en-dir", default=str(Path.home() / "mynah-s2s/ml/ckpt/asr-en"))
-    ap.add_argument("--ml-dir", default=str(Path.home() / "mynah-s2s/ml/ckpt/asr-ml"))
+    ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
+    ap.add_argument("--ml-dir", default=str(LAB_HOME / "ckpt/asr-ml"))
     ap.add_argument("--prompt", default="You are a helpful assistant.")
     ap.add_argument("--tail-s", type=float, default=8.0)
     ap.add_argument("--limit", type=int, default=0)

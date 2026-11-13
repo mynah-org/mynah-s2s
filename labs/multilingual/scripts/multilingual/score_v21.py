@@ -13,13 +13,14 @@ import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+from labpaths import MYNAH_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from corpus_v2 import is_refusal  # noqa: E402
 from gold_v21 import echo, hit, spec  # noqa: E402
 
-HOME = Path.home() / "mynah-s2s"
+HOME = MYNAH_HOME
 D, R = HOME / "ml/data/v21", HOME / "ml/results/v21"
 SPLITS = {"dev": "e2e-dev", "test": "e2e-test", "uncond": "e2e-uncond"}
 # blinded manual labels of the OLD automatic hits (manual_test.json / manual_devuncond.json): indices judged false

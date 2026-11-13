@@ -12,10 +12,11 @@ import json
 import re
 import unicodedata
 from pathlib import Path
+from labpaths import HF_CACHE  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
 import torch
 
-NANO = Path.home() / "mynah-s2s/hf-cache/models--nvidia--NVIDIA-Nemotron-Nano-9B-v2/snapshots/6533e8de2c68e4536bf7c411d7a3ce5734111476"
+NANO = HF_CACHE / "models--nvidia--NVIDIA-Nemotron-Nano-9B-v2/snapshots/6533e8de2c68e4536bf7c411d7a3ce5734111476"
 TOPICS = ["cooking and recipes", "travel and directions", "weather and seasons", "shopping and orders", "health and sport",
           "music and films", "science for kids", "history", "animals and nature", "numbers and arithmetic",
           "personal facts the user tells about themselves (name, age, city, job, pets) followed by a question about them",

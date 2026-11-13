@@ -14,10 +14,10 @@ from pathlib import Path
 import torch
 import yaml
 from safetensors import safe_open
+from labpaths import HF_CACHE, LAB_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
-HOME = Path.home()
-VC_CKPT = HOME / "mynah-s2s/hf-cache/models--nvidia--NVIDIA-NemotronLabs-VoiceChat-11B/snapshots/443794ea956ef0065f001967ffd00e77f519cb39"
-ASR_DIRS = {"en": HOME / "mynah-s2s/ml/ckpt/asr-en", "ml": HOME / "mynah-s2s/ml/ckpt/asr-ml"}
+VC_CKPT = HF_CACHE / "models--nvidia--NVIDIA-NemotronLabs-VoiceChat-11B/snapshots/443794ea956ef0065f001967ffd00e77f519cb39"
+ASR_DIRS = {"en": LAB_HOME / "ckpt/asr-en", "ml": LAB_HOME / "ckpt/asr-ml"}
 DEFAULT_ATT = {"vc": [70, 0], "en": [70, 0], "ml": [56, 0]}
 
 

@@ -52,6 +52,8 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "multilingual"))   # labpaths (MYNAH_HOME / MYNAH_LAB_HOME)
+from labpaths import LAB_HOME  # noqa: E402
 from t1_probe import (BOS, EOS, EOTC, PAD, SOTC, Thinker, fc_call, frame_tokens, logp_rows,  # noqa: E402
                       prev_shift, trace_session)
 
@@ -166,8 +168,8 @@ def run_state(th, cache, sched, feats, sil, record=True, dump=None):
 def main():  # pragma: no cover - GPU
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--audio-root", default=str(Path.home() / "mynah-s2s/ml/data/agentbench/tts_m1"))
-    ap.add_argument("--a-trace", default=str(Path.home() / "mynah-s2s/ml/results/agentbench/m1-parity/vc_en_m03/trace.jsonl"))
+    ap.add_argument("--audio-root", default=str(LAB_HOME / "data/agentbench/tts_m1"))
+    ap.add_argument("--a-trace", default=str(LAB_HOME / "results/agentbench/m1-parity/vc_en_m03/trace.jsonl"))
     ap.add_argument("--budget-s", type=float, default=165.0)
     ap.add_argument("--n-free", type=int, default=33)
     ap.add_argument("--tail-s", type=float, default=10.0)
@@ -244,11 +246,11 @@ def main():  # pragma: no cover - GPU
             "C-ridge": "enc=ml;att=56;rnnt=ml;ln=orig;map={R}/maps/ridge_ml_out.pt",
             "D-V2.1": "enc=ml;att=56;rnnt=ml;ln={R}/v21/distill/v21/encoder_ln_best.pt;adapter={R}/v21/distill/v21/adapter_best.pt",
             "D-E5": "enc=ml;att=56;rnnt=ml;ln={R}/distill/e5/encoder_ln_best.pt;adapter={R}/distill/e5/adapter_best.pt"}
-    R = str(Path.home() / "mynah-s2s/ml/results")
+    R = str(LAB_HOME / "results")
     fe = FrontEnd(eng)
     fe.snapshot()
-    ckpt = {"en": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-en"),
-            "ml": load_nemo_dir(Path.home() / "mynah-s2s/ml/ckpt/asr-ml")}
+    ckpt = {"en": load_nemo_dir(LAB_HOME / "ckpt/asr-en"),
+            "ml": load_nemo_dir(LAB_HOME / "ckpt/asr-ml")}
     man = {(r["id"], r["lang"], r["voice"]): r for r in map(json.loads, open(Path(a.audio_root) / "manifest.jsonl"))}
     x = load_16k(Path(a.audio_root) / man[("m03_t0", "en", "vivian")]["path"])
     wav = torch.cat([torch.zeros(int(7.0 * 16000)), x, torch.zeros(int(a.tail_s * 16000))])

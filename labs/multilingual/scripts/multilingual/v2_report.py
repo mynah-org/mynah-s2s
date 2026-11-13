@@ -6,8 +6,9 @@ import json
 import time
 from collections import Counter
 from pathlib import Path
+from labpaths import MYNAH_HOME  # noqa: E402  (MYNAH_HOME / MYNAH_LAB_HOME, no hard-coded home layout)
 
-HOME = Path.home() / "mynah-s2s"
+HOME = MYNAH_HOME
 R = HOME / "ml/results/v2"
 D = HOME / "ml/data/v2"
 
