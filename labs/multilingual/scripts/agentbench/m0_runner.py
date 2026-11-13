@@ -125,6 +125,31 @@ def write_run_config(out, eng, runtime_fix: dict) -> dict:
     return rc
 
 
+def engine_fix_summary(eng) -> dict:
+    _fx = getattr(eng, "fc_ctx_fix_info", None) or {}
+    d = {k: (list(v) if isinstance(v, tuple) else v) for k, v in _fx.items() if k != "fix"}
+    if isinstance(_fx.get("fix"), dict):
+        d.update({k: _fx["fix"].get(k) for k in ("pad_id", "func_pad")}, channels=list(_fx["fix"].get("channels", ())))
+    return d
+
+
+FC_RESUME = {  # the engine's own fc_ctx_fix, parameterised (no engine change); owner 2026-11-13: the 2x2 resume matrix
+    "pad_pad": dict(pad_fill=True, channels=("gen_text", "gen_asr_text"), func_pad=True),     # the engine default
+    "pad_eotr": dict(pad_fill=True, channels=("gen_text", "gen_asr_text", "gen_function_text"), func_pad=False),
+}
+
+
+def set_fc_resume(eng, contract: str) -> None:
+    """Re-arm the engine's FC hand-back fix with the given resume contract before a session ('off' = upstream)."""
+    from mynah_v2.model import fc_ctx_fix as FX
+    prev = getattr(eng, "fc_ctx_fix_info", None) or {}
+    if getattr(eng.wrapper, "_v2_fc_ctx_fix", None) is not None:
+        FX.disable(eng)
+    info = FX.enable(eng, **FC_RESUME[contract]) if contract != "off" else None
+    eng.fc_ctx_fix_info = {"mode": f"runner:{contract}", "official_checkpoint": prev.get("official_checkpoint"),
+                           "enabled": contract != "off", **({"fix": info} if info else {})}
+
+
 FALLBACK_OFF_FRAMES = 10 ** 9   # first_turn_fallback_frames when the first-turn fallback is disabled (config only)
 
 
@@ -214,6 +239,8 @@ def main():
                     help="do not START a session if elapsed + the longest session so far would exceed this (0 = off)")
     ap.add_argument("--no-fc-fix", action="store_true",
                     help="force the post-FC runtime fix flags to 0 (lab default is already OFF since 2026-11-12 14:30)")
+    ap.add_argument("--fc-resume-by-label", default="",
+                    help="'label=pad_pad|label=pad_eotr|label=off': re-arm the engine fc_ctx_fix per plan label")
     ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
     ap.add_argument("--ml-dir", default=str(LAB_HOME / "ckpt/asr-ml"))
     a = ap.parse_args()
@@ -249,11 +276,7 @@ def main():
         runtime_fix["v2_src"] = str(Path(_v2.__file__).resolve().parent)
     except Exception as _e:  # noqa: BLE001 - provenance must never break a run
         runtime_fix["provenance_error"] = repr(_e)
-    _fx = getattr(eng, "fc_ctx_fix_info", None) or {}               # the engine's own FC hand-back fix (M4: recorded)
-    runtime_fix["engine_fc_ctx_fix"] = {k: (list(v) if isinstance(v, tuple) else v) for k, v in _fx.items() if k != "fix"}
-    if isinstance(_fx.get("fix"), dict):
-        runtime_fix["engine_fc_ctx_fix"].update({k: _fx["fix"].get(k) for k in ("pad_id", "func_pad")},
-                                                channels=list(_fx["fix"].get("channels", ())))
+    runtime_fix["engine_fc_ctx_fix"] = engine_fix_summary(eng)     # the engine's own FC hand-back fix (M4: recorded)
     from live_gates import DOUBLE, resume_contract
     runtime_fix["resume_contract"] = resume_contract(runtime_fix)
     print("RUNTIME_FIX", runtime_fix, flush=True)
@@ -376,6 +399,14 @@ def main():
                 sys.path.insert(0, str(HERE))
                 import observe
                 un_obs = observe.install(eng.wrapper, obs_rows)
+            res_by_label = dict(kv.split("=", 1) for kv in filter(None, a.fc_resume_by_label.split("|")))
+            if lab in res_by_label:
+                set_fc_resume(eng, res_by_label[lab])
+            sess_fix = dict(runtime_fix, engine_fc_ctx_fix=engine_fix_summary(eng))
+            sess_fix["resume_contract"] = resume_contract(sess_fix)
+            print("SESSION_FIX", lab, sess_fix["resume_contract"], sess_fix["engine_fc_ctx_fix"], flush=True)
+            if sess_fix["resume_contract"] == DOUBLE:
+                raise SystemExit("both FC hand-back fixes active for this session: refused")
             _rs = ((getattr(eng, "fc_ctx_fix_info", None) or {}).get("fix") or {}).get("stats") or {}
             n_resume0 = len(_rs.get("resume_inputs", []))
             t0 = time.monotonic()
@@ -410,7 +441,7 @@ def main():
                    "frontend": frontend_info, "find_format": ff, "force_customer": a.force_customer, "spec": spec["name"], "lead_s": lead_s,
                    "first_turn_fallback": fb, "first_turn_fallback_frames": fb_effective,
                    "observe_rows": len(obs_rows), "opening": op, "turn_cfg": turn_cfg,
-                   "runtime_fix": dict(runtime_fix, context_text_pad_id=getattr(
+                   "runtime_fix": dict(sess_fix, context_text_pad_id=getattr(
                        getattr(eng.pipeline, "context_manager", None), "text_pad_id", None)),
                    "guided_open": (guided_open.summarise(guided_rows, openers[sc["id"]]) if op == "guided" else None),
                    "calls": calls, "audit": backend.audit, "agent_text": "".join(sess.text),

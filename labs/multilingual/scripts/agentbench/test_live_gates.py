@@ -10,6 +10,12 @@ def test_resume_contract_labels():
     assert resume_contract({"patched": False, "S2S_FIX_CONTEXT_PAD": "1"}) == UPSTREAM      # flags inert on clean NeMo
     assert resume_contract({}) == UPSTREAM
     assert resume_contract(dict(ENG_RF, patched=True, S2S_FIX_FC_TOKEN_SYNC="all")) == DOUBLE
+    from live_gates import ENGINE_EOTR
+    eotr = dict(ENG_RF, engine_fc_ctx_fix={"enabled": True, "func_pad": False,
+                                          "channels": ["gen_text", "gen_asr_text", "gen_function_text"]})
+    assert resume_contract(eotr) == ENGINE_EOTR
+    assert resume_contract(dict(ENG_RF, engine_fc_ctx_fix={"enabled": True, "func_pad": True,
+                                                          "channels": ["gen_text", "gen_asr_text"]})) == ENGINE
 
 
 def rec(calls, audit, rf=ENG_RF, scenario="m07", lang="en"):

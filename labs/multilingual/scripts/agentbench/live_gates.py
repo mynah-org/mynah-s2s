@@ -20,6 +20,7 @@ Extra calls after the chain (re-opened calls) are reported, not failed.
 from __future__ import annotations
 
 ENGINE = "PAD,PAD (engine fc_ctx_fix)"
+ENGINE_EOTR = "PAD,EOTR (engine fc_ctx_fix, function channel copied back)"
 LAB = "PAD,EOTR (lab NeMo patch)"
 UPSTREAM = "upstream 0,0"
 DOUBLE = "INVALID double fix"
@@ -30,7 +31,12 @@ def resume_contract(rf: dict) -> str:
     lab = bool(rf.get("patched")) and any(str(rf.get(k, "0")) != "0" for k in ("S2S_FIX_CONTEXT_PAD", "S2S_FIX_FC_TOKEN_SYNC"))
     if eng and lab:
         return DOUBLE
-    return ENGINE if eng else LAB if lab else UPSTREAM
+    if eng:
+        e = rf.get("engine_fc_ctx_fix") or {}
+        if e.get("func_pad") is False and "gen_function_text" in (e.get("channels") or []):
+            return ENGINE_EOTR
+        return ENGINE
+    return LAB if lab else UPSTREAM
 
 
 def m07_chain(rec: dict) -> dict:
@@ -41,9 +47,9 @@ def m07_chain(rec: dict) -> dict:
     if rec.get("scenario") != "m07" or rec.get("lang") != "en":
         out["valid"] = False
         out["reasons"].append("not the EN m07 session")
-    if contract != ENGINE:
+    if contract not in (ENGINE, ENGINE_EOTR):
         out["valid"] = False
-        out["reasons"].append(f"resume contract is {contract!r}, the gate needs {ENGINE!r}")
+        out["reasons"].append(f"resume contract is {contract!r}, the gate needs an engine contract")
     calls, audit = rec.get("calls", []), rec.get("audit", [])
     names = [c.get("name") for c in calls]
     out["calls"] = names
