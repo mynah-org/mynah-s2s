@@ -79,3 +79,15 @@ def test_c2_compare(tmp_path):
         except SystemExit as e:
             got = e.code
         assert got == code, (name, json.load(open(tmp_path / f"r_{name}.json"))["c2"])
+
+
+def test_compare_cli(tmp_path):
+    """The command line used by the job (run 2 broke here: the unit tests bypassed argparse)."""
+    import subprocess
+    row = {"arm": "a", "set": "glex_dev", "id": "x", "lang": "it", "tokens": [1], "score": {}}
+    _write(tmp_path / "o", [row], [{"call": 0}])
+    _write(tmp_path / "n", [row], [{"call": 0}])
+    r = subprocess.run([sys.executable, str(Path(M.__file__)), "compare", "--old", str(tmp_path / "o"), "--new",
+                        str(tmp_path / "n"), "--kind", "c1", "--out", str(tmp_path / "r.json")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert json.load(open(tmp_path / "r.json"))["pass"]

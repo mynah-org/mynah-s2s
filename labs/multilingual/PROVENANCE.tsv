@@ -126,7 +126,7 @@ scripts/multilingual/verify_asr_v2.py	scripts/multilingual/verify_asr_v2.py	7125
 -	scripts/multilingual/ml_env.sh	ab66f7e716770544e492bf4660195d1633f28120	-	-	not-migrated	not migrated: lab env for the patched NeMo; private repo ops/
 -	scripts/multilingual/v2_watch.sh	48908f585779c5c3b639d341f1f074ebb28798cf	-	-	not-migrated	not migrated: retired V2-night watchdog (host ops); private repo ops/
 -	scripts/multilingual/v2_decide.py	7a77a7b7fc1a314e64018b06098413554ae8137e	-	-	not-migrated	not migrated: V2-night job generator (host ops: lock, queue); private repo ops/
-scripts/multilingual/m4_parity.py	-	-	-	e8a01fc1e2c948b7008593020cc5f89627c6e4b249fe1117fc5a8e9758a2e308	new	M4 construction-parity / C1 / C2 wrapper written after the migration (not in the lab history)
-scripts/multilingual/test_m4_parity.py	-	-	-	0387cc6536442fe32311090ddc3adee11d0160f3d69fd1c93d7bacb240089a36	new	CPU tests of the M4 comparison logic
+scripts/multilingual/m4_parity.py	-	-	-	294e6a473f67193ee9948caa473a84572a82e4f063e56d9e6dc3aed9c38c444f	new	M4 construction-parity / C1 / C2 wrapper written after the migration (not in the lab history)
+scripts/multilingual/test_m4_parity.py	-	-	-	d7b2ce3067651be39099b0cc855fd4c8ca2e42ec43586e53d40874e166b79f2d	new	CPU tests of the M4 comparison logic
 scripts/agentbench/live_gates.py	-	-	-	14d6359bb95b8b1b019accd0e3fe600bfc22f86e31bb8a1c108a07bddaa3b410	new	resume-contract label + the mandatory EN m07 chain gate (find_customer -> prepare_return)
 scripts/agentbench/test_live_gates.py	-	-	-	e0e2e9f3d7371ce291654e05701ab0bedb213fd56618b2fda7323c86b93e1c35	new	CPU tests of live_gates

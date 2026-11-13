@@ -8,7 +8,7 @@ same process.
 
   m4_parity.py c1 --lab-dir D --out O [--compare-to OLD/construction.json] -- <glex_free.py args>
   m4_parity.py c2 --lab-dir D --out O [--compare-to OLD/construction.json] -- <session_distill.py train args>
-  m4_parity.py compare --old O1 --new O2 --mode c1|c2 --out report.json
+  m4_parity.py compare --old O1 --new O2 --kind c1|c2 --out report.json
 
 Recorded (construction.json, written right after the engine load, before anything else):
 - module tree (names, types);
@@ -295,8 +295,12 @@ def main():
     ap.add_argument("--light", action="store_true", help="tensor metadata without the sha256 of the bytes (c2: saves time)")
     ap.add_argument("--old", default="")
     ap.add_argument("--new", default="")
+    ap.add_argument("--kind", choices=["c1", "c2"], default="", help="compare: which comparison")
     a = ap.parse_args(argv)
     if a.mode == "compare":
+        if not a.kind:
+            ap.error("compare needs --kind c1|c2")
+        a.mode = a.kind
         compare(a)
     else:
         run(a.mode, a, rest)
