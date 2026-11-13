@@ -131,4 +131,4 @@ scripts/multilingual/test_m4_parity.py	-	-	-	d7b2ce3067651be39099b0cc855fd4c8ca2
 scripts/agentbench/live_gates.py	-	-	-	caf24c4a19e0e95260c0809793feca64f93ecf1d4e21af2f74055add734fb7e6	new	resume-contract label + the mandatory EN m07 chain gate (find_customer -> prepare_return)
 scripts/agentbench/test_live_gates.py	-	-	-	8f1f711eb3f8b68cc2a736487fd7db59f650f481852a3267369081397fe81e30	new	CPU tests of live_gates
 scripts/multilingual/labpaths.py	-	-	-	0f91d95a6721a7f7216f49bbe70196a0168e0300b3ee676021b0894c8c6812a3	new	MYNAH_HOME / MYNAH_LAB_HOME resolution for every lab script (C3)
-scripts/multilingual/test_labpaths.py	-	-	-	200db65e3c88f0ce688a45f231c5727e1ae557cc48d7279d2f004a34b6534ff6	new	defaults = historical layout, env overrides, no hard-coded home layout left
+scripts/multilingual/test_labpaths.py	-	-	-	c1414f12a359f2150e0ee66feaeaa0834b0ec24633f1347175b4d11b9777a916	new	defaults = historical layout, env overrides, no hard-coded home layout left

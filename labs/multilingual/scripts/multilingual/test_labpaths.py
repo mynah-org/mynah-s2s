@@ -20,8 +20,8 @@ def test_defaults_are_the_historical_layout():
 
 
 def test_env_overrides():
-    assert run({"MYNAH_HOME": "/x/home"}) == ["/x/home", "/x/home/ml", "/x/home/hf-cache"]
-    assert run({"MYNAH_HOME": "/x/home", "MYNAH_LAB_HOME": "/archive/ml"}) == ["/x/home", "/archive/ml", "/x/home/hf-cache"]
+    assert run({"MYNAH_HOME": "/x/root"}) == ["/x/root", "/x/root/ml", "/x/root/hf-cache"]
+    assert run({"MYNAH_HOME": "/x/root", "MYNAH_LAB_HOME": "/archive/ml"}) == ["/x/root", "/archive/ml", "/x/root/hf-cache"]
 
 
 def test_no_hard_coded_home_layout_left():
