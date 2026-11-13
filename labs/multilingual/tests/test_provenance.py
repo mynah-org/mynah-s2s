@@ -28,5 +28,7 @@ def test_status_is_consistent():
             assert r["source_sha256"] == r["dest_sha256"], r["dest"]
         elif r["status"] == "edited":
             assert r["source_sha256"] != r["dest_sha256"] and r["note"], r["dest"]
+        elif r["status"] == "new":
+            assert r["source_git_blob"] == "-" and r["note"], r["dest"]
         else:
             assert r["status"] == "not-migrated" and r["note"], r

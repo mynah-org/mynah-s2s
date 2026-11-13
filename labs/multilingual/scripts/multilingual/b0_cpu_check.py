@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--lora-frozen", action="store_true", help="ablation: LoRA installed at B = 0 but not trainable")
     a = ap.parse_args()
+    torch.manual_seed(0)                            # every init / draw below is reproducible (owner 2026-11-13)
     assert not torch.cuda.is_available()
     torch.cuda.default_stream = lambda *x, **k: None
     torch.cuda.stream = lambda *x, **k: contextlib.nullcontext()
@@ -108,7 +109,7 @@ def main():
         y_frozen = thinker(f.detach(), lora_on=False)
     y_joint = thinker(f, lora_on=True)
     ok["parity_init_joint_vs_frozen"] = bool(torch.equal(y_joint.detach(), y_frozen))
-    torch.nn.functional.cross_entropy(y_joint[0].float(), torch.randint(0, 32, (y_joint.shape[1],))).backward()
+    torch.nn.functional.cross_entropy(y_joint[0].float(), torch.randint(0, 32, (y_joint.shape[1],), generator=torch.Generator().manual_seed(0))).backward()
     g = lambda ps: float(torch.sqrt(sum((p.grad ** 2).sum() for p in ps if p.grad is not None)))  # noqa: E731
     rep["grad"] = {"encoder_ln": g(list(ln.values())), "adapter_affine": g(list(ad.affine.parameters())),
                    "adapter_mlp": g([p for n, p in ad.named_parameters() if not n.startswith("affine.")])}
