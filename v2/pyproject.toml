@@ -1,0 +1,76 @@
+[project]
+name = "mynah-v2"
+version = "0.1.0"
+description = "mynah-s2s V2: experimental multi-session runtime for NVIDIA VoiceChat 11B"
+license = {text = "MIT"}
+requires-python = "==3.12.*"
+dependencies = [
+  # Pins follow the VoiceChat 11B model card (offline inference recipe) for parity.
+  "torch==2.10.0",
+  "torchaudio==2.10.0",
+  "transformers==4.56.0",
+  "tokenizers==0.22.0",
+  "lhotse==1.32.2",
+  "huggingface-hub==0.34.4",
+  "jinja2",
+  "einops",
+  "nemo-toolkit",
+  "lightning",
+  "hydra-core",
+  "omegaconf",
+  "peft",
+  "librosa",
+  "soundfile",
+  "sentencepiece",
+  "whisper-normalizer",
+  "jiwer",
+  "inflect",
+  "torch-audiomentations",
+  "sacrebleu",
+  "websockets>=13",
+  "numpy",
+  # NeMo common / asr / lightning requirement sets (requirements/*.txt @ 097dfe9e), minus training-only extras.
+  "datasets", "pandas", "sacremoses>=0.0.43", "mediapy==1.1.6",
+  "cloudpickle", "fiddle", "lightning>2.2.1,<=2.4.0", "torchmetrics>=0.11.0", "webdataset>=0.2.86",
+  "braceexpand", "editdistance", "g2p-en", "kaldi-python-io", "marshmallow", "pyannote.core",
+  "pyannote.metrics", "pydub", "pyloudnorm", "resampy", "ruamel.yaml", "scipy", "texterrors<1.0.0",
+  "kornia", "matplotlib", "nltk", "attrdict", "janome", "jieba", "pypinyin", "pypinyin-dict", "seaborn", "nemo-text-processing; platform_machine == \"never\"",
+  "wandb", "megatron-core", "setuptools>=70", "ninja", "packaging", "wheel",
+    # Mamba kernels required by NemotronH remote code (modeling_nemotron_h.py:56-65); see scripts/setup_cuda.sh.
+  "causal-conv1d==1.6.2.post1", "mamba-ssm==2.3.2.post1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+no-build-isolation-package = ["causal-conv1d", "mamba-ssm"]
+# NeMo pins protobuf/fsspec in its own requirements; keep them.
+override-dependencies = [
+  "transformers==4.56.0", "hydra-core==1.3.2", "omegaconf==2.3.0",
+  # mamba-ssm 2.3.2 pulls Mamba-3 / TileLang deps that NemotronH does not use (ssd + selective_state_update only).
+  "tilelang; sys_platform == 'never'", "quack-kernels; sys_platform == 'never'", "apache-tvm-ffi; sys_platform == 'never'",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+# NVIDIA NeMo Speech, branch nemotron-labs-voicechat @ 097dfe9e (Apache-2.0, not vendored).
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "097dfe9e2f55baf653b83035868bdc89849f1b47" }
+# causal-conv1d / mamba-ssm: built from source for your GPU arch by scripts/setup_cuda.sh.
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs CUDA + the VoiceChat checkpoint"]

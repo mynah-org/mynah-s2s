@@ -1,0 +1,179 @@
+{
+ "name": "two_session_sameid_v1",
+ "lang": "en",
+ "doc": "Targeted isolation check: BOTH sessions ask for the SAME clearly recognized order id (corpus_v1 t02, ABC456: recognized correctly in round 13/15) against DIFFERENT DB fixtures. Each answer must come from its own DB. Same audio on purpose (the id must really be shared), different seeds.",
+ "sources": {
+  "corpus_v1": "corpus_v1.json",
+  "capability_v1": "capability_v1.json"
+ },
+ "chunk_ms": 160,
+ "fixtures": {
+  "corpus_default": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "processing",
+    "November 15, 2026",
+    "4402"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "shipped",
+    "November 14, 2026",
+    "8423"
+   ]
+  ],
+  "abc_delivered": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "delivered",
+    "October 3, 2026",
+    "7777"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "shipped",
+    "November 14, 2026",
+    "8423"
+   ]
+  ]
+ },
+ "groups": [
+  {
+   "id": "p6_same_id_clear",
+   "kind": "pair",
+   "doc": "ABC456: A processing / Nov 15 / 4402; B delivered / Oct 3 / 7777",
+   "sessions": [
+    {
+     "sid": "p6A",
+     "source": "corpus_v1",
+     "item": "t02",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 1601,
+     "tool_delay_s": 0.0,
+     "expect": {
+      "function": "get_order_status",
+      "order_id": "ABC456",
+      "found": true,
+      "status": "processing",
+      "date": "November 15, 2026"
+     },
+     "leak_regex": "deliver|october|7777|seven thousand seven hundred"
+    },
+    {
+     "sid": "p6B",
+     "source": "corpus_v1",
+     "item": "t02",
+     "tools": "orders,random",
+     "fixture": "abc_delivered",
+     "seed": 1602,
+     "tool_delay_s": 0.0,
+     "expect": {
+      "function": "get_order_status",
+      "order_id": "ABC456",
+      "found": true,
+      "status": "delivered",
+      "date": "October 3, 2026"
+     },
+     "leak_regex": "processing|fifteenth|4402|four thousand four hundred"
+    }
+   ]
+  }
+ ]
+}

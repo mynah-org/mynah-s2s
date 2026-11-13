@@ -1,0 +1,89 @@
+{
+ "name": "fcmulti_v1",
+ "lang": "en",
+ "doc": "Concatenated EN conversations built from existing corpus_v1 / capability_v1 clips (no new TTS): consecutive legitimate tool calls, a long multi-turn session, and user speech arriving while an FC cycle is open (interrupt/abort path). Each part is followed by `gap_s` of silence; `overlay` starts a second clip `at_s` seconds after the end of the first one. i01/i02 overlay relative to the END of the clip (c07 is 30 s incl. trailing silence \u2192 lands after the FC: a normal next turn, not an interrupt); i03/i04 use an absolute start inside the measured FC window.",
+ "items": {
+  "m01": {
+   "parts": [
+    "corpus_v1/r01",
+    "capability_v1/c09"
+   ],
+   "gap_s": 12,
+   "expect_calls": [
+    "generate_random_number",
+    "generate_random_number"
+   ]
+  },
+  "m02": {
+   "parts": [
+    "capability_v1/c07",
+    "corpus_v1/r01"
+   ],
+   "gap_s": 12,
+   "expect_calls": [
+    "get_order_status",
+    "generate_random_number"
+   ]
+  },
+  "long01": {
+   "parts": [
+    "corpus_v1/s05",
+    "corpus_v1/q09",
+    "corpus_v1/r01",
+    "capability_v1/c07",
+    "capability_v1/c09",
+    "corpus_v1/q01",
+    "corpus_v1/t14"
+   ],
+   "gap_s": 10,
+   "expect_calls": [
+    "generate_random_number",
+    "get_order_status",
+    "generate_random_number",
+    "get_order_status"
+   ]
+  },
+  "i01": {
+   "parts": [
+    "capability_v1/c07"
+   ],
+   "overlay": {
+    "clip": "corpus_v1/q09",
+    "at_s": 2.0
+   },
+   "gap_s": 14
+  },
+  "i02": {
+   "parts": [
+    "capability_v1/c07"
+   ],
+   "overlay": {
+    "clip": "corpus_v1/q09",
+    "at_s": 3.5
+   },
+   "gap_s": 14
+  },
+  "i03": {
+   "parts": [
+    "capability_v1/c07"
+   ],
+   "overlay": {
+    "clip": "corpus_v1/q09",
+    "at_abs_s": 10.8
+   },
+   "gap_s": 10,
+   "doc": "user speech starts inside FC phase 1 (FC open ~9.7-15.4 s on the Ada for c07) \u2192 abort/quit path"
+  },
+  "i04": {
+   "parts": [
+    "capability_v1/c07"
+   ],
+   "overlay": {
+    "clip": "corpus_v1/q09",
+    "at_abs_s": 13.0
+   },
+   "gap_s": 10,
+   "doc": "user speech starts around the tool gap / phase 2"
+  }
+ }
+}

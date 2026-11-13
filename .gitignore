@@ -1,0 +1,61 @@
+# Experiment outputs and heavy artefacts (never committed)
+reports/
+results/
+**/reports/
+**/results/
+*.prof
+*.trace
+*.nsys-rep
+*.qdrep
+*_trace.json
+*_trace.json.gz
+torch_trace*.json*
+runs/
+tb_logs/
+*.dump
+
+# Python / uv
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.uv/
+uv-cache/
+build/
+dist/
+*.egg-info/
+
+# Models, checkpoints, weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.nemo
+*.gguf
+*.bin
+hf-cache/
+.hf_home/
+
+# Audio (generated / recordings); small approved fixtures must be added explicitly with git add -f
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.npz
+
+# Local config, secrets, logs, temp
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_*
+*.log
+*.tmp
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,241 @@
+{
+ "name": "multi_session_v1",
+ "lang": "en",
+ "doc": "N-session realtime gates (B=4 target, B=8 exploratory): independent EN sessions, distinct audio, continuous realtime chunks; mixed groups have overlapping tool calls (orders/random) + plain sessions, no-tool groups isolate the decode path. Every session is also run solo (same process) for the functional comparison.",
+ "sources": {
+  "corpus_v1": "corpus_v1.json",
+  "capability_v1": "capability_v1.json"
+ },
+ "chunk_ms": 160,
+ "fixtures": {
+  "corpus_default": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "processing",
+    "November 15, 2026",
+    "4402"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "shipped",
+    "November 14, 2026",
+    "8423"
+   ]
+  ]
+ },
+ "groups": [
+  {
+   "id": "m4_notools",
+   "kind": "pair",
+   "doc": "4 plain sessions",
+   "sessions": [
+    {
+     "sid": "a",
+     "source": "corpus_v1",
+     "item": "q01",
+     "tools": "",
+     "fixture": null,
+     "seed": 4101,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "b",
+     "source": "corpus_v1",
+     "item": "q03",
+     "tools": "",
+     "fixture": null,
+     "seed": 4102,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "c",
+     "source": "corpus_v1",
+     "item": "q09",
+     "tools": "",
+     "fixture": null,
+     "seed": 4103,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "d",
+     "source": "corpus_v1",
+     "item": "s05",
+     "tools": "",
+     "fixture": null,
+     "seed": 4104,
+     "tool_delay_s": 0.0
+    }
+   ]
+  },
+  {
+   "id": "m4_mixed",
+   "kind": "pair",
+   "doc": "2 order calls + 2 plain",
+   "sessions": [
+    {
+     "sid": "a",
+     "source": "corpus_v1",
+     "item": "t02",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 4201,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "b",
+     "source": "corpus_v1",
+     "item": "t04",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 4202,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "c",
+     "source": "corpus_v1",
+     "item": "q09",
+     "tools": "",
+     "fixture": null,
+     "seed": 4203,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "d",
+     "source": "corpus_v1",
+     "item": "s05",
+     "tools": "",
+     "fixture": null,
+     "seed": 4204,
+     "tool_delay_s": 0.0
+    }
+   ]
+  },
+  {
+   "id": "m8_mixed",
+   "kind": "pair",
+   "doc": "3 order calls + 1 random + 4 plain",
+   "sessions": [
+    {
+     "sid": "a",
+     "source": "corpus_v1",
+     "item": "t02",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 4301,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "b",
+     "source": "corpus_v1",
+     "item": "t04",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 4302,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "c",
+     "source": "corpus_v1",
+     "item": "t05",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 4303,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "d",
+     "source": "corpus_v1",
+     "item": "r02",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 4304,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "e",
+     "source": "corpus_v1",
+     "item": "q01",
+     "tools": "",
+     "fixture": null,
+     "seed": 4305,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "f",
+     "source": "corpus_v1",
+     "item": "q03",
+     "tools": "",
+     "fixture": null,
+     "seed": 4306,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "g",
+     "source": "corpus_v1",
+     "item": "q09",
+     "tools": "",
+     "fixture": null,
+     "seed": 4307,
+     "tool_delay_s": 0.0
+    },
+    {
+     "sid": "h",
+     "source": "corpus_v1",
+     "item": "s05",
+     "tools": "",
+     "fixture": null,
+     "seed": 4308,
+     "tool_delay_s": 0.0
+    }
+   ]
+  }
+ ]
+}

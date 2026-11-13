@@ -1,0 +1,632 @@
+{
+ "name": "v2-two-session-v1",
+ "lang": "en",
+ "doc": "Two-session isolation/throughput fixture for the VoiceChat 11B V2 true-batching path (runtime/batch_contract.py I1-I9). Every session = an existing EN corpus_v1/capability_v1 item (rendered WAV, different audio per session) + its OWN orders fixture + its own seed. Fixtures conflict on the ids the sessions ask about, so a cross-session leak of tool results is visible in the spoken answer (leak_regex = the OTHER sessions' fixture-specific facts) and in the tool result itself (checked against every fixture of the group). 'expect' overrides the source item's expect when the fixture changes the facts. sequence ticks are 160 ms chunks; a detached session consumes no chunks. Never used for training.",
+ "sources": {
+  "corpus_v1": "corpus_v1.json",
+  "capability_v1": "capability_v1.json"
+ },
+ "chunk_ms": 160,
+ "fixtures": {
+  "corpus_default": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "processing",
+    "November 15, 2026",
+    "4402"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "shipped",
+    "November 14, 2026",
+    "8423"
+   ]
+  ],
+  "jkl_shipped": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "processing",
+    "November 15, 2026",
+    "4402"
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "shipped",
+    "November 14, 2026",
+    "8423"
+   ],
+   [
+    "JKL789",
+    "shipped",
+    "November 21, 2026",
+    "5150"
+   ]
+  ],
+  "qqq_delivered": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "processing",
+    "November 15, 2026",
+    "4402"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "shipped",
+    "November 14, 2026",
+    "8423"
+   ],
+   [
+    "QQQ999",
+    "delivered",
+    "October 7, 2026",
+    "6021"
+   ]
+  ],
+  "mnp_delivered_no_abc": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "shipped",
+    "November 14, 2026",
+    "8423"
+   ],
+   [
+    "MNP204",
+    "delivered",
+    "November 9, 2026",
+    "3316"
+   ]
+  ],
+  "wxy_processing": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "processing",
+    "November 15, 2026",
+    "4402"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "DEF246",
+    "shipped",
+    "November 18, 2026",
+    "6650"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "WXY615",
+    "processing",
+    "November 28, 2026",
+    "1290"
+   ]
+  ],
+  "def_cancelled_no_wxy": [
+   [
+    "XYZ123",
+    "shipped",
+    "November 12, 2026",
+    "7319"
+   ],
+   [
+    "ABC456",
+    "processing",
+    "November 15, 2026",
+    "4402"
+   ],
+   [
+    "JKL789",
+    "cancelled",
+    "",
+    ""
+   ],
+   [
+    "MNP204",
+    "shipped",
+    "December 3, 2026",
+    "5581"
+   ],
+   [
+    "QRS518",
+    "delivered",
+    "November 2, 2026",
+    "2207"
+   ],
+   [
+    "TUV930",
+    "processing",
+    "November 20, 2026",
+    "9134"
+   ],
+   [
+    "GHK371",
+    "delivered",
+    "October 30, 2026",
+    "1876"
+   ],
+   [
+    "BCD802",
+    "processing",
+    "November 25, 2026",
+    "3049"
+   ],
+   [
+    "DEF246",
+    "cancelled",
+    "",
+    ""
+   ]
+  ]
+ },
+ "groups": [
+  {
+   "id": "p1_same_id_conflict",
+   "kind": "pair",
+   "doc": "Same order id JKL789, different audio and conflicting fixtures: A's backend says shipped Nov 21, B's says cancelled. A cross-session tool-result leak shows up as the other fixture's status/date in the answer.",
+   "sessions": [
+    {
+     "sid": "p1A",
+     "source": "corpus_v1",
+     "item": "t03",
+     "tools": "orders,random",
+     "fixture": "jkl_shipped",
+     "seed": 1101,
+     "tool_delay_s": 0.0,
+     "expect": {
+      "function": "get_order_status",
+      "order_id": "JKL789",
+      "found": true,
+      "status": "shipped",
+      "date": "November 21, 2026"
+     },
+     "leak_regex": "cancel"
+    },
+    {
+     "sid": "p1B",
+     "source": "capability_v1",
+     "item": "c08",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 1102,
+     "tool_delay_s": 0.0,
+     "leak_regex": "\\bship|november|twenty[- ]?first|\\b21(st)?\\b"
+    }
+   ]
+  },
+  {
+   "id": "p2_found_vs_not_found",
+   "kind": "pair",
+   "doc": "Same order id QQQ999: found + delivered Oct 7 in A's fixture, absent (not found) in B's.",
+   "sessions": [
+    {
+     "sid": "p2A",
+     "source": "corpus_v1",
+     "item": "t11",
+     "tools": "orders,random",
+     "fixture": "qqq_delivered",
+     "seed": 1201,
+     "tool_delay_s": 0.0,
+     "expect": {
+      "function": "get_order_status",
+      "order_id": "QQQ999",
+      "found": true,
+      "status": "delivered",
+      "date": "October 7, 2026"
+     },
+     "leak_regex": "not (be )?f(ou|i)nd|couldn.?t find|can.?t find|cannot find|no (such )?order|unable to (find|locate)|no record"
+    },
+    {
+     "sid": "p2B",
+     "source": "capability_v1",
+     "item": "c07",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 1202,
+     "tool_delay_s": 0.0,
+     "leak_regex": "deliver|october|seventh|\\b7th\\b"
+    }
+   ]
+  },
+  {
+   "id": "p3_overlapping_tool_calls",
+   "kind": "pair",
+   "doc": "Both sessions call get_order_status at overlapping times (same 3 s offset, 1.5 s backend delay each). Fixtures conflict on both ids (A: ABC456 processing / MNP204 shipped Dec 3; B: MNP204 delivered Nov 9, no ABC456). The report checks that the two function.started -> tool.result.consumed windows overlapped.",
+   "require_fc_overlap": true,
+   "sessions": [
+    {
+     "sid": "p3A",
+     "source": "corpus_v1",
+     "item": "t02",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 1301,
+     "tool_delay_s": 1.5,
+     "leak_regex": "november (the )?(9(th)?|ninth)\\b|3316",
+     "user_leak_regex": "two zero four|\\b204\\b"
+    },
+    {
+     "sid": "p3B",
+     "source": "corpus_v1",
+     "item": "t04",
+     "tools": "orders,random",
+     "fixture": "mnp_delivered_no_abc",
+     "seed": 1302,
+     "tool_delay_s": 1.5,
+     "expect": {
+      "function": "get_order_status",
+      "order_id": "MNP204",
+      "found": true,
+      "status": "delivered",
+      "date": "November 9, 2026"
+     },
+     "leak_regex": "process|fifteenth|\\b15(th)?\\b|december|4402",
+     "user_leak_regex": "four five six|\\b456\\b"
+    }
+   ]
+  },
+  {
+   "id": "p4_no_tools_turn_taking",
+   "kind": "pair",
+   "doc": "No tools in either prompt: greeting, agent turn / EOS steps and self-talk/continuation turns only.",
+   "sessions": [
+    {
+     "sid": "p4A",
+     "source": "corpus_v1",
+     "item": "s05",
+     "tools": "",
+     "fixture": null,
+     "seed": 1401,
+     "tool_delay_s": 0.0,
+     "leak_regex": "jupiter|planet|solar",
+     "user_leak_regex": "planet|jupiter|solar"
+    },
+    {
+     "sid": "p4B",
+     "source": "corpus_v1",
+     "item": "q09",
+     "tools": "",
+     "fixture": null,
+     "seed": 1402,
+     "tool_delay_s": 0.0,
+     "leak_regex": "\\bjoke",
+     "user_leak_regex": "\\bjoke"
+    }
+   ]
+  },
+  {
+   "id": "j1_join_leave_rejoin",
+   "kind": "join_leave",
+   "doc": "Slot churn (batch_contract I3): {A+B} -> A leaves (detached, state kept), C joins -> {B+C} -> B ends, A rejoins -> {A+C}. A (t14) asks about WXY615, leaves between its two questions and asks for the tracking code AFTER rejoining: the answer must come from A's own fixture (8423) although B's fixture has the same id with tracking 1290 and C may have reused A's row. A detached session consumes no chunks, so its solo reference is the plain uninterrupted chunk sequence (frame-for-frame comparable).",
+   "sessions": [
+    {
+     "sid": "j1A",
+     "source": "corpus_v1",
+     "item": "t14",
+     "tools": "orders,random",
+     "fixture": "corpus_default",
+     "seed": 1501,
+     "tool_delay_s": 0.0,
+     "leak_regex": "twenty[- ]?eighth|\\b28(th)?\\b|1290|one two nine zero"
+    },
+    {
+     "sid": "j1B",
+     "source": "corpus_v1",
+     "item": "t10",
+     "tools": "orders,random",
+     "fixture": "wxy_processing",
+     "seed": 1502,
+     "tool_delay_s": 0.0,
+     "expect": {
+      "function": "get_order_status",
+      "order_id": "WXY615",
+      "found": true,
+      "status": "processing",
+      "date": "November 28, 2026"
+     },
+     "leak_regex": "fourteenth|\\b14(th)?\\b|8423|eight four two three"
+    },
+    {
+     "sid": "j1C",
+     "source": "corpus_v1",
+     "item": "t07",
+     "tools": "orders,random",
+     "fixture": "def_cancelled_no_wxy",
+     "seed": 1503,
+     "tool_delay_s": 0.0,
+     "expect": {
+      "function": "get_order_status",
+      "order_id": "DEF246",
+      "found": true,
+      "status": "cancelled",
+      "date": ""
+     },
+     "leak_regex": "\\bship|eighteenth|\\b18(th)?\\b|november|6650"
+    }
+   ],
+   "sequence": [
+    {
+     "tick": 0,
+     "join": "j1A"
+    },
+    {
+     "tick": 0,
+     "join": "j1B"
+    },
+    {
+     "tick": 95,
+     "leave": "j1A",
+     "defer_while": [
+      "fc_active",
+      "agent_speaking"
+     ]
+    },
+    {
+     "tick": 95,
+     "join": "j1C"
+    },
+    {
+     "after_done": "j1B",
+     "join": "j1A"
+    }
+   ],
+   "expected_compositions": [
+    [
+     "j1A",
+     "j1B"
+    ],
+    [
+     "j1B",
+     "j1C"
+    ],
+    [
+     "j1A",
+     "j1C"
+    ]
+   ]
+  },
+  {
+   "id": "p5_fc_vs_plain",
+   "kind": "pair",
+   "doc": "Interference: A makes a tool call (random number, reliable FC cycle), B is an ordinary no-tool session; B's per-chunk latency while A's FC cycle is open vs outside it.",
+   "sessions": [
+    {
+     "sid": "p5A",
+     "source": "corpus_v1",
+     "item": "r01",
+     "tools": "random",
+     "fixture": null,
+     "seed": 1501,
+     "tool_delay_s": 0.0,
+     "leak_regex": "jupiter|planet|solar"
+    },
+    {
+     "sid": "p5B",
+     "source": "corpus_v1",
+     "item": "q09",
+     "tools": "",
+     "fixture": null,
+     "seed": 1502,
+     "tool_delay_s": 0.0,
+     "leak_regex": "random|number between"
+    }
+   ]
+  }
+ ]
+}

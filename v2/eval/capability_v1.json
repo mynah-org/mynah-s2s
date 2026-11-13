@@ -1,0 +1,236 @@
+{
+ "name": "v2-capability-v1",
+ "lang": "en",
+ "tts": {
+  "engine": "qwen-tts==0.1.1",
+  "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+  "seed": 7,
+  "synthetic": true
+ },
+ "doc": "Capability mini-benchmark (instruction following + tool use) for precision/perf candidates: one-word / number-only / one-sentence answers, tool explicitly forbidden, missing order id (must ask, not invent), not-found and cancelled grounding, change of intent (random tool instead of the order lookup). Reuses corpus_v1 t13 (correction), t14 (follow-up tracking), r01 (random tool). Same orders fixture as corpus_v1. Never used for training.",
+ "reuse_from_corpus_v1": [
+  "t13",
+  "t14",
+  "r01"
+ ],
+ "orders": [
+  [
+   "XYZ123",
+   "shipped",
+   "November 12, 2026",
+   "7319"
+  ],
+  [
+   "ABC456",
+   "processing",
+   "November 15, 2026",
+   "4402"
+  ],
+  [
+   "JKL789",
+   "cancelled",
+   "",
+   ""
+  ],
+  [
+   "MNP204",
+   "shipped",
+   "December 3, 2026",
+   "5581"
+  ],
+  [
+   "QRS518",
+   "delivered",
+   "November 2, 2026",
+   "2207"
+  ],
+  [
+   "TUV930",
+   "processing",
+   "November 20, 2026",
+   "9134"
+  ],
+  [
+   "DEF246",
+   "shipped",
+   "November 18, 2026",
+   "6650"
+  ],
+  [
+   "GHK371",
+   "delivered",
+   "October 30, 2026",
+   "1876"
+  ],
+  [
+   "BCD802",
+   "processing",
+   "November 25, 2026",
+   "3049"
+  ],
+  [
+   "WXY615",
+   "shipped",
+   "November 14, 2026",
+   "8423"
+  ]
+ ],
+ "items": [
+  {
+   "id": "c01",
+   "category": "instruction",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Answer with just one word. What color is the sky on a clear day?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\bblue\\b",
+    "max_words": 3,
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "c02",
+   "category": "instruction",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Reply with only a number. How many days are there in a week?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b(seven|7)\\b",
+    "max_words": 3,
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "c03",
+   "category": "instruction",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "In one short sentence, what is the capital of France?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\bparis\\b",
+    "max_words": 15,
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "c04",
+   "category": "tool_forbidden",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Please don't look anything up. In general, how long does standard shipping usually take?"
+    }
+   ],
+   "tail_s": 16.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "c05",
+   "category": "tool_forbidden",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Don't use any tool for this. Just say any number between one and ten yourself."
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "no_tool_call": true,
+    "answer_regex": "\\b(one|two|three|four|five|six|seven|eight|nine|ten|[1-9]|10)\\b"
+   }
+  },
+  {
+   "id": "c06",
+   "category": "tool_missing_args",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you check the status of my order?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "no_tool_call": true,
+    "ask_regex": "order (id|number|code)|which order|order's (id|number)|(id|number) of (your|the) order",
+    "must_not_regex": "\\b(shipped|delivered|processing|cancelled)\\b"
+   }
+  },
+  {
+   "id": "c07",
+   "category": "tool_orders",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Where is my order Q Q Q nine nine nine?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "QQQ999",
+    "found": false,
+    "must_not_regex": "\\b(shipped|delivered|processing|on its way)\\b|november|december"
+   }
+  },
+  {
+   "id": "c08",
+   "category": "tool_orders",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What's the status of order J K L seven eight nine?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "JKL789",
+    "found": true,
+    "status": "cancelled",
+    "date": ""
+   }
+  },
+  {
+   "id": "c09",
+   "category": "tool_random",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "I was going to ask about an order, but never mind. Give me a random number between one and five instead."
+    }
+   ],
+   "tail_s": 16.0,
+   "expect": {
+    "function": "generate_random_number",
+    "min": 1,
+    "max": 5,
+    "forbid_function": "get_order_status",
+    "must_not_regex": "\\b(shipped|delivered|processing|cancelled)\\b"
+   }
+  }
+ ]
+}

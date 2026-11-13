@@ -1,0 +1,762 @@
+{
+ "name": "v2-golden-corpus-v1",
+ "lang": "en",
+ "tts": {
+  "engine": "qwen-tts==0.1.1",
+  "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+  "seed": 7,
+  "synthetic": true
+ },
+ "doc": "Fixed regression corpus for V2 precision/perf gates: tool arguments (orders, NVIDIA random-number tool), corrections, follow-up grounding, short reasoning with checkable answers, small talk. Offsets: first absolute, later from the end of the previous utterance. Never used for training.",
+ "orders": [
+  [
+   "XYZ123",
+   "shipped",
+   "November 12, 2026",
+   "7319"
+  ],
+  [
+   "ABC456",
+   "processing",
+   "November 15, 2026",
+   "4402"
+  ],
+  [
+   "JKL789",
+   "cancelled",
+   "",
+   ""
+  ],
+  [
+   "MNP204",
+   "shipped",
+   "December 3, 2026",
+   "5581"
+  ],
+  [
+   "QRS518",
+   "delivered",
+   "November 2, 2026",
+   "2207"
+  ],
+  [
+   "TUV930",
+   "processing",
+   "November 20, 2026",
+   "9134"
+  ],
+  [
+   "DEF246",
+   "shipped",
+   "November 18, 2026",
+   "6650"
+  ],
+  [
+   "GHK371",
+   "delivered",
+   "October 30, 2026",
+   "1876"
+  ],
+  [
+   "BCD802",
+   "processing",
+   "November 25, 2026",
+   "3049"
+  ],
+  [
+   "WXY615",
+   "shipped",
+   "November 14, 2026",
+   "8423"
+  ]
+ ],
+ "items": [
+  {
+   "id": "t01",
+   "category": "tool_orders",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hi, I'd like to know where my order is. The order number is X Y Z one two three."
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "XYZ123",
+    "found": true,
+    "status": "shipped",
+    "date": "November 12, 2026"
+   }
+  },
+  {
+   "id": "t02",
+   "category": "tool_orders",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you look up order A B C four five six for me?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "ABC456",
+    "found": true,
+    "status": "processing",
+    "date": "November 15, 2026"
+   }
+  },
+  {
+   "id": "t03",
+   "category": "tool_orders",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What's the status of my order J K L seven eight nine?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "JKL789",
+    "found": true,
+    "status": "cancelled",
+    "date": ""
+   }
+  },
+  {
+   "id": "t04",
+   "category": "tool_orders",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "My order number is M N P two zero four. When will it arrive?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "MNP204",
+    "found": true,
+    "status": "shipped",
+    "date": "December 3, 2026"
+   }
+  },
+  {
+   "id": "t05",
+   "category": "tool_orders",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hello, could you check order Q R S five one eight please?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "QRS518",
+    "found": true,
+    "status": "delivered",
+    "date": "November 2, 2026"
+   }
+  },
+  {
+   "id": "t06",
+   "category": "tool_orders",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "I'm calling about order T U V nine three zero."
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "TUV930",
+    "found": true,
+    "status": "processing",
+    "date": "November 20, 2026"
+   }
+  },
+  {
+   "id": "t07",
+   "category": "tool_orders",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Where is my package? It's order D E F two four six."
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "DEF246",
+    "found": true,
+    "status": "shipped",
+    "date": "November 18, 2026"
+   }
+  },
+  {
+   "id": "t08",
+   "category": "tool_orders",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Has order G H K three seven one been delivered yet?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "GHK371",
+    "found": true,
+    "status": "delivered",
+    "date": "October 30, 2026"
+   }
+  },
+  {
+   "id": "t09",
+   "category": "tool_orders",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you tell me when order B C D eight zero two will ship?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "BCD802",
+    "found": true,
+    "status": "processing",
+    "date": "November 25, 2026"
+   }
+  },
+  {
+   "id": "t10",
+   "category": "tool_orders",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hi, I need an update on order W X Y six one five."
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "WXY615",
+    "found": true,
+    "status": "shipped",
+    "date": "November 14, 2026"
+   }
+  },
+  {
+   "id": "t11",
+   "category": "tool_orders",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hello, where is my order Q Q Q nine nine nine?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "QQQ999",
+    "found": false,
+    "status": null,
+    "date": null
+   }
+  },
+  {
+   "id": "t12",
+   "category": "tool_orders",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you check order Z Z T four zero four?"
+    }
+   ],
+   "tail_s": 20.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "ZZT404",
+    "found": false,
+    "status": null,
+    "date": null
+   }
+  },
+  {
+   "id": "t13",
+   "category": "tool_orders_correction",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hi, where is my order X Y Z one two three?"
+    },
+    {
+     "offset": 2.0,
+     "text": "Sorry, I made a mistake. The order number is D E F two four six."
+    }
+   ],
+   "tail_s": 22.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "DEF246",
+    "found": true,
+    "status": "shipped",
+    "date": "November 18, 2026",
+    "first_order_id": "XYZ123"
+   }
+  },
+  {
+   "id": "t14",
+   "category": "tool_orders_followup",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hi, can you check order W X Y six one five?"
+    },
+    {
+     "offset": 12.0,
+     "text": "Great, and what's the tracking code?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "function": "get_order_status",
+    "order_id": "WXY615",
+    "found": true,
+    "status": "shipped",
+    "date": "November 14, 2026",
+    "tracking": "8423"
+   }
+  },
+  {
+   "id": "r01",
+   "category": "tool_random",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Give me a random number between one and ten."
+    }
+   ],
+   "tail_s": 16.0,
+   "expect": {
+    "function": "generate_random_number",
+    "min": 1,
+    "max": 10
+   }
+  },
+  {
+   "id": "r02",
+   "category": "tool_random",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you pick a random number from fifty to one hundred?"
+    }
+   ],
+   "tail_s": 16.0,
+   "expect": {
+    "function": "generate_random_number",
+    "min": 50,
+    "max": 100
+   }
+  },
+  {
+   "id": "r03",
+   "category": "tool_random",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Generate a random number between zero and one thousand please."
+    }
+   ],
+   "tail_s": 16.0,
+   "expect": {
+    "function": "generate_random_number",
+    "min": 0,
+    "max": 1000
+   }
+  },
+  {
+   "id": "r04",
+   "category": "tool_random",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "I need a random number between seven and seventy seven."
+    }
+   ],
+   "tail_s": 16.0,
+   "expect": {
+    "function": "generate_random_number",
+    "min": 7,
+    "max": 77
+   }
+  },
+  {
+   "id": "q01",
+   "category": "reasoning",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What is twelve times seven?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b84\\b|eighty[- ]four",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q02",
+   "category": "reasoning",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "If I have three apples and buy five more, how many apples do I have?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b8\\b|\\beight\\b",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q03",
+   "category": "reasoning",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What is the capital of France?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "paris",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q04",
+   "category": "reasoning",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "How many days are there in a week?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b7\\b|\\bseven\\b",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q05",
+   "category": "reasoning",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What day comes after Tuesday?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "wednesday",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q06",
+   "category": "reasoning",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What is one hundred minus thirty five?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b65\\b|sixty[- ]five",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q07",
+   "category": "reasoning",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Which is heavier, a kilogram of feathers or a kilogram of steel?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "same|equal|neither|both",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q08",
+   "category": "reasoning",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "How many minutes are there in two hours?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b120\\b|hundred (and )?twenty",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q09",
+   "category": "reasoning",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What is the largest planet in our solar system?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "jupiter",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q10",
+   "category": "reasoning",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "If a train leaves at three PM and the trip takes two hours, what time does it arrive?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b5\\b|\\bfive\\b",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q11",
+   "category": "reasoning",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What is the square root of eighty one?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b9\\b|\\bnine\\b",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "q12",
+   "category": "reasoning",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "How many legs does a spider have?"
+    }
+   ],
+   "tail_s": 14.0,
+   "expect": {
+    "answer_regex": "\\b8\\b|\\beight\\b",
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s01",
+   "category": "smalltalk",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Hi there, how are you doing today?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s02",
+   "category": "smalltalk",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you tell me a fun fact about octopuses?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s03",
+   "category": "smalltalk",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "I'm planning a trip to Italy. Do you have any tips?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s04",
+   "category": "smalltalk",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What's a good way to relax after a long day at work?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s05",
+   "category": "smalltalk",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Tell me a short joke."
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s06",
+   "category": "smalltalk",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What do you think about rainy days?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s07",
+   "category": "smalltalk",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "Can you recommend a good book to read?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s08",
+   "category": "smalltalk",
+   "speaker": "ryan",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "I just got a new puppy!"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s09",
+   "category": "smalltalk",
+   "speaker": "aiden",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "How do I make a good cup of tea?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  },
+  {
+   "id": "s10",
+   "category": "smalltalk",
+   "speaker": "vivian",
+   "utterances": [
+    {
+     "offset": 3.0,
+     "text": "What's your favorite season and why?"
+    }
+   ],
+   "tail_s": 18.0,
+   "expect": {
+    "no_tool_call": true
+   }
+  }
+ ]
+}
