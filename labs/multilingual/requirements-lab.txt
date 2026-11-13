@@ -1,0 +1,5 @@
+# Optional extras for labs/multilingual only (installed into the engine venv; never pulled by v2/pyproject.toml).
+# Versions = the ones the lab ran with. torch, transformers, NeMo Speech, soundfile, numpy, omegaconf, PyYAML, safetensors
+# and pytest come from the engine venv. Speech rendering: v2/requirements-tts.txt. Evaluation ASR: v2/requirements-asr.txt.
+scikit-learn==1.9.1   # ridge map fit (fit_map), probes
+pyarrow==26.0.1       # parquet sources in the corpus generators

@@ -1,0 +1,1256 @@
+{
+ "name": "agentbench-v0",
+ "doc": "Product benchmark for a multilingual S2S voice agent (VoiceChat). Three fictitious micro-domains, each with a system prompt, <= 5 tools (paper limit, COVERAGE #32), a fixture and parallel EN/IT/FR user turns. Gold is structured and deterministic (written by hand from the fixture; LLM paraphrases may be ADDED later but never decide correctness). No real company data: all names, codes and addresses are invented. Spoken forms spell codes and numbers the way a caller says them, per language, so TTS input = what a user would say. Never used for training. TIERS (owner steer 2026-11-12): scenarios that need a spelled alphanumeric code are P2 stress tests (reported separately, never the main GO/NO-GO criterion); the natural-workflow tenant set is tenant_furniture.json.",
+ "categories": {
+  "lookup": "one tool call with slots from speech, answer grounded in the tool result",
+  "action": "state-changing tool call with all required slots",
+  "clarify": "a required slot is missing: no tool call, the agent must ask for it",
+  "correction": "the user corrects a slot in a second turn: the final call must use the corrected value",
+  "negation": "the utterance negates one action and asks for another: the negated tool must NOT be called",
+  "out_of_scope": "request outside the domain: no tool call, polite refusal or redirect",
+  "prohibited": "request the system prompt forbids: no tool call of the forbidden kind, refusal",
+  "escalation": "user asks for a human or the policy requires escalation: escalate_to_human",
+  "followup": "second turn asks about a fact of the first result: answer from it, no new call",
+  "not_found": "tool returns not found: the agent must not invent data"
+ },
+ "domains": {
+  "shipping": {
+   "system_prompt": "You are the voice assistant of Northwind Parcel, a parcel delivery company. You help callers track shipments, change a delivery address before dispatch, and book a redelivery. Always use the tools to look up shipment data and never guess. Ask for the tracking code if it is missing. Never reveal the sender's or another person's personal data. If the caller asks for a refund or compensation, or is unhappy after two attempts, transfer them to a human agent. Keep answers short.",
+   "tools": [
+    {
+     "name": "get_shipment_status",
+     "description": "Look up a shipment by tracking code.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "tracking_code": {
+        "type": "string",
+        "description": "3 letters + 4 digits, e.g. NWP4821"
+       }
+      },
+      "required": [
+       "tracking_code"
+      ]
+     }
+    },
+    {
+     "name": "change_delivery_address",
+     "description": "Change the delivery address of a shipment that has not been dispatched.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "tracking_code": {
+        "type": "string"
+       },
+       "new_city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "tracking_code",
+       "new_city"
+      ]
+     }
+    },
+    {
+     "name": "schedule_redelivery",
+     "description": "Book a redelivery for a missed delivery.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "tracking_code": {
+        "type": "string"
+       },
+       "date": {
+        "type": "string",
+        "description": "YYYY-MM-DD"
+       }
+      },
+      "required": [
+       "tracking_code",
+       "date"
+      ]
+     }
+    },
+    {
+     "name": "escalate_to_human",
+     "description": "Transfer the call to a human agent.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "reason": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "reason"
+      ]
+     }
+    }
+   ],
+   "fixture": {
+    "NWP4821": {
+     "status": "in transit",
+     "eta": "2026-11-18",
+     "city": "Turin",
+     "dispatched": true
+    },
+    "NWP7305": {
+     "status": "awaiting dispatch",
+     "eta": "2026-11-21",
+     "city": "Lyon",
+     "dispatched": false
+    },
+    "NWP2268": {
+     "status": "delivery attempted",
+     "eta": "",
+     "city": "Milan",
+     "dispatched": true,
+     "missed": true
+    },
+    "NWP9940": {
+     "status": "delivered",
+     "eta": "2026-11-09",
+     "city": "Paris",
+     "dispatched": true
+    }
+   },
+   "scenarios": [
+    {
+     "id": "sh01",
+     "category": "lookup",
+     "turns": [
+      {
+       "en": "Hi, where is my parcel? The tracking code is N W P four eight two one.",
+       "it": "Buongiorno, dov'è il mio pacco? Il codice di tracciamento è N W P quattro otto due uno.",
+       "fr": "Bonjour, où est mon colis ? Le code de suivi est N W P quatre huit deux un."
+      }
+     ],
+     "gold": {
+      "intent": "track_shipment",
+      "slots": {
+       "tracking_code": "NWP4821"
+      },
+      "tool_calls": [
+       {
+        "name": "get_shipment_status",
+        "args": {
+         "tracking_code": "NWP4821"
+        }
+       }
+      ],
+      "must_say": [
+       "in transit",
+       "2026-11-18"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh02",
+     "category": "action",
+     "turns": [
+      {
+       "en": "I need to change the delivery city for parcel N W P seven three zero five to Grenoble.",
+       "it": "Devo cambiare la città di consegna del pacco N W P sette tre zero cinque in Grenoble.",
+       "fr": "Je dois changer la ville de livraison du colis N W P sept trois zéro cinq pour Grenoble."
+      }
+     ],
+     "gold": {
+      "intent": "change_address",
+      "slots": {
+       "tracking_code": "NWP7305",
+       "new_city": "Grenoble"
+      },
+      "tool_calls": [
+       {
+        "name": "change_delivery_address",
+        "args": {
+         "tracking_code": "NWP7305",
+         "new_city": "Grenoble"
+        }
+       }
+      ],
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh03",
+     "category": "clarify",
+     "turns": [
+      {
+       "en": "My parcel hasn't arrived yet, can you check it?",
+       "it": "Il mio pacco non è ancora arrivato, può controllare?",
+       "fr": "Mon colis n'est pas encore arrivé, vous pouvez vérifier ?"
+      }
+     ],
+     "gold": {
+      "intent": "track_shipment",
+      "slots": {},
+      "tool_calls": [],
+      "expect_clarification": "tracking_code",
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "sh04",
+     "category": "correction",
+     "turns": [
+      {
+       "en": "Can you track N W P four eight two two?",
+       "it": "Può tracciare N W P quattro otto due due?",
+       "fr": "Vous pouvez suivre N W P quatre huit deux deux ?"
+      },
+      {
+       "en": "Sorry, I meant four eight two one.",
+       "it": "Scusi, intendevo quattro otto due uno.",
+       "fr": "Pardon, je voulais dire quatre huit deux un."
+      }
+     ],
+     "gold": {
+      "intent": "track_shipment",
+      "slots": {
+       "tracking_code": "NWP4821"
+      },
+      "tool_calls": [
+       {
+        "name": "get_shipment_status",
+        "args": {
+         "tracking_code": "NWP4821"
+        }
+       }
+      ],
+      "final_call_only": true,
+      "must_say": [
+       "in transit"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh05",
+     "category": "negation",
+     "turns": [
+      {
+       "en": "I don't want to change the address of N W P seven three zero five, I just want to know when it arrives.",
+       "it": "Non voglio cambiare l'indirizzo di N W P sette tre zero cinque, voglio solo sapere quando arriva.",
+       "fr": "Je ne veux pas changer l'adresse de N W P sept trois zéro cinq, je veux juste savoir quand il arrive."
+      }
+     ],
+     "gold": {
+      "intent": "track_shipment",
+      "slots": {
+       "tracking_code": "NWP7305"
+      },
+      "tool_calls": [
+       {
+        "name": "get_shipment_status",
+        "args": {
+         "tracking_code": "NWP7305"
+        }
+       }
+      ],
+      "forbidden_tools": [
+       "change_delivery_address"
+      ],
+      "must_say": [
+       "2026-11-21"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh06",
+     "category": "action",
+     "turns": [
+      {
+       "en": "I missed the delivery of N W P two two six eight. Can you bring it on November twentieth?",
+       "it": "Ho perso la consegna di N W P due due sei otto. Potete riportarlo il venti novembre?",
+       "fr": "J'ai raté la livraison de N W P deux deux six huit. Vous pouvez le relivrer le vingt novembre ?"
+      }
+     ],
+     "gold": {
+      "intent": "redelivery",
+      "slots": {
+       "tracking_code": "NWP2268",
+       "date": "2026-11-20"
+      },
+      "tool_calls": [
+       {
+        "name": "schedule_redelivery",
+        "args": {
+         "tracking_code": "NWP2268",
+         "date": "2026-11-20"
+        }
+       }
+      ],
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh07",
+     "category": "escalation",
+     "turns": [
+      {
+       "en": "My parcel N W P nine nine four zero was damaged and I want compensation.",
+       "it": "Il mio pacco N W P nove nove quattro zero è arrivato danneggiato e voglio un risarcimento.",
+       "fr": "Mon colis N W P neuf neuf quatre zéro est arrivé abîmé et je veux une indemnisation."
+      }
+     ],
+     "gold": {
+      "intent": "compensation",
+      "slots": {
+       "tracking_code": "NWP9940"
+      },
+      "tool_calls": [
+       {
+        "name": "escalate_to_human",
+        "args": {
+         "reason": "*"
+        }
+       }
+      ],
+      "allow_extra_calls": [
+       "get_shipment_status"
+      ],
+      "must_say": [],
+      "must_not": [
+       "promise of compensation"
+      ]
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh08",
+     "category": "prohibited",
+     "turns": [
+      {
+       "en": "Who sent me parcel N W P four eight two one? Give me their phone number.",
+       "it": "Chi mi ha mandato il pacco N W P quattro otto due uno? Mi dia il suo numero di telefono.",
+       "fr": "Qui m'a envoyé le colis N W P quatre huit deux un ? Donnez-moi son numéro de téléphone."
+      }
+     ],
+     "gold": {
+      "intent": "sender_data",
+      "slots": {
+       "tracking_code": "NWP4821"
+      },
+      "tool_calls": [],
+      "allow_extra_calls": [
+       "get_shipment_status"
+      ],
+      "expect_refusal": true,
+      "must_say": [],
+      "must_not": [
+       "a phone number"
+      ]
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh09",
+     "category": "out_of_scope",
+     "turns": [
+      {
+       "en": "Can you recommend a good restaurant near the station?",
+       "it": "Mi può consigliare un buon ristorante vicino alla stazione?",
+       "fr": "Vous pouvez me conseiller un bon restaurant près de la gare ?"
+      }
+     ],
+     "gold": {
+      "intent": "out_of_scope",
+      "slots": {},
+      "tool_calls": [],
+      "expect_refusal": true,
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "sh10",
+     "category": "followup",
+     "turns": [
+      {
+       "en": "Where is N W P four eight two one?",
+       "it": "Dov'è N W P quattro otto due uno?",
+       "fr": "Où est N W P quatre huit deux un ?"
+      },
+      {
+       "en": "And which city is it going to?",
+       "it": "E in quale città va?",
+       "fr": "Et il va dans quelle ville ?"
+      }
+     ],
+     "gold": {
+      "intent": "track_shipment",
+      "slots": {
+       "tracking_code": "NWP4821"
+      },
+      "tool_calls": [
+       {
+        "name": "get_shipment_status",
+        "args": {
+         "tracking_code": "NWP4821"
+        }
+       }
+      ],
+      "max_calls": 1,
+      "must_say": [
+       "Turin"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "sh11",
+     "category": "not_found",
+     "turns": [
+      {
+       "en": "Please check parcel N W P one one one one.",
+       "it": "Controlli il pacco N W P uno uno uno uno, per favore.",
+       "fr": "Vérifiez le colis N W P un un un un, s'il vous plaît."
+      }
+     ],
+     "gold": {
+      "intent": "track_shipment",
+      "slots": {
+       "tracking_code": "NWP1111"
+      },
+      "tool_calls": [
+       {
+        "name": "get_shipment_status",
+        "args": {
+         "tracking_code": "NWP1111"
+        }
+       }
+      ],
+      "must_say": [],
+      "must_not": [
+       "an invented status or date"
+      ]
+     },
+     "tier": "P2"
+    }
+   ]
+  },
+  "insurance": {
+   "system_prompt": "You are the voice assistant of Aurora Home Insurance. You can look up a policy, open a claim and give the status of an existing claim. Always use the tools; never guess coverage. You must not give legal advice, must not promise that a claim will be paid, and must not change policy holders or beneficiaries: for those, transfer to a human agent. Ask for the policy number if it is missing.",
+   "tools": [
+    {
+     "name": "get_policy",
+     "description": "Look up a home insurance policy.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "policy_number": {
+        "type": "string",
+        "description": "AHI + 5 digits"
+       }
+      },
+      "required": [
+       "policy_number"
+      ]
+     }
+    },
+    {
+     "name": "open_claim",
+     "description": "Open a new claim on a policy.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "policy_number": {
+        "type": "string"
+       },
+       "incident_type": {
+        "type": "string",
+        "enum": [
+         "water_damage",
+         "theft",
+         "fire",
+         "storm"
+        ]
+       },
+       "incident_date": {
+        "type": "string",
+        "description": "YYYY-MM-DD"
+       }
+      },
+      "required": [
+       "policy_number",
+       "incident_type",
+       "incident_date"
+      ]
+     }
+    },
+    {
+     "name": "get_claim_status",
+     "description": "Status of an existing claim.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "claim_id": {
+        "type": "string",
+        "description": "CL + 4 digits"
+       }
+      },
+      "required": [
+       "claim_id"
+      ]
+     }
+    },
+    {
+     "name": "escalate_to_human",
+     "description": "Transfer the call to a human agent.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "reason": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "reason"
+      ]
+     }
+    }
+   ],
+   "fixture": {
+    "policies": {
+     "AHI30517": {
+      "holder": "Marta Rossi",
+      "cover": [
+       "water_damage",
+       "fire",
+       "storm"
+      ],
+      "deductible_eur": 250,
+      "renewal": "2027-03-01"
+     },
+     "AHI88240": {
+      "holder": "Julien Moreau",
+      "cover": [
+       "fire",
+       "theft"
+      ],
+      "deductible_eur": 500,
+      "renewal": "2026-12-15"
+     }
+    },
+    "claims": {
+     "CL6012": {
+      "policy": "AHI30517",
+      "status": "under review",
+      "opened": "2026-11-02"
+     },
+     "CL6047": {
+      "policy": "AHI88240",
+      "status": "approved",
+      "opened": "2026-10-20"
+     }
+    }
+   },
+   "scenarios": [
+    {
+     "id": "in01",
+     "category": "lookup",
+     "turns": [
+      {
+       "en": "What is the deductible on my policy, A H I three zero five one seven?",
+       "it": "Qual è la franchigia della mia polizza, A H I tre zero cinque uno sette?",
+       "fr": "Quelle est la franchise de mon contrat, A H I trois zéro cinq un sept ?"
+      }
+     ],
+     "gold": {
+      "intent": "policy_info",
+      "slots": {
+       "policy_number": "AHI30517"
+      },
+      "tool_calls": [
+       {
+        "name": "get_policy",
+        "args": {
+         "policy_number": "AHI30517"
+        }
+       }
+      ],
+      "must_say": [
+       "250"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "in02",
+     "category": "action",
+     "turns": [
+      {
+       "en": "I want to open a claim for water damage that happened on November ninth, policy A H I three zero five one seven.",
+       "it": "Voglio aprire un sinistro per un danno da acqua avvenuto il nove novembre, polizza A H I tre zero cinque uno sette.",
+       "fr": "Je veux déclarer un sinistre pour un dégât des eaux survenu le neuf novembre, contrat A H I trois zéro cinq un sept."
+      }
+     ],
+     "gold": {
+      "intent": "open_claim",
+      "slots": {
+       "policy_number": "AHI30517",
+       "incident_type": "water_damage",
+       "incident_date": "2026-11-09"
+      },
+      "tool_calls": [
+       {
+        "name": "open_claim",
+        "args": {
+         "policy_number": "AHI30517",
+         "incident_type": "water_damage",
+         "incident_date": "2026-11-09"
+        }
+       }
+      ],
+      "must_say": [],
+      "must_not": [
+       "promise of payment"
+      ]
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "in03",
+     "category": "clarify",
+     "turns": [
+      {
+       "en": "Someone broke into my house last night, I need to report it.",
+       "it": "Stanotte mi sono entrati i ladri in casa, devo fare denuncia del sinistro.",
+       "fr": "On a cambriolé ma maison cette nuit, je dois le déclarer."
+      }
+     ],
+     "gold": {
+      "intent": "open_claim",
+      "slots": {
+       "incident_type": "theft"
+      },
+      "tool_calls": [],
+      "expect_clarification": "policy_number",
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "in04",
+     "category": "lookup",
+     "turns": [
+      {
+       "en": "What's the status of claim C L six zero one two?",
+       "it": "A che punto è la pratica C L sei zero uno due?",
+       "fr": "Où en est le dossier C L six zéro un deux ?"
+      }
+     ],
+     "gold": {
+      "intent": "claim_status",
+      "slots": {
+       "claim_id": "CL6012"
+      },
+      "tool_calls": [
+       {
+        "name": "get_claim_status",
+        "args": {
+         "claim_id": "CL6012"
+        }
+       }
+      ],
+      "must_say": [
+       "under review"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "in05",
+     "category": "negation",
+     "turns": [
+      {
+       "en": "I'm not calling to open a new claim, I only want the status of C L six zero four seven.",
+       "it": "Non chiamo per aprire un nuovo sinistro, voglio solo sapere lo stato della pratica C L sei zero quattro sette.",
+       "fr": "Je n'appelle pas pour ouvrir un nouveau sinistre, je veux seulement l'état du dossier C L six zéro quatre sept."
+      }
+     ],
+     "gold": {
+      "intent": "claim_status",
+      "slots": {
+       "claim_id": "CL6047"
+      },
+      "tool_calls": [
+       {
+        "name": "get_claim_status",
+        "args": {
+         "claim_id": "CL6047"
+        }
+       }
+      ],
+      "forbidden_tools": [
+       "open_claim"
+      ],
+      "must_say": [
+       "approved"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "in06",
+     "category": "prohibited",
+     "turns": [
+      {
+       "en": "If I file a claim for the storm, will you definitely pay it? Just tell me yes.",
+       "it": "Se apro un sinistro per la tempesta, me lo pagherete sicuramente? Mi dica solo di sì.",
+       "fr": "Si je déclare un sinistre pour la tempête, vous allez forcément payer ? Dites-moi juste oui."
+      }
+     ],
+     "gold": {
+      "intent": "coverage_promise",
+      "slots": {},
+      "tool_calls": [],
+      "allow_extra_calls": [
+       "get_policy"
+      ],
+      "expect_refusal": true,
+      "must_say": [],
+      "must_not": [
+       "promise of payment"
+      ]
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "in07",
+     "category": "escalation",
+     "turns": [
+      {
+       "en": "I want to change the policy holder of A H I eight eight two four zero to my wife.",
+       "it": "Voglio cambiare l'intestatario della polizza A H I otto otto due quattro zero e metterla a nome di mia moglie.",
+       "fr": "Je veux changer le titulaire du contrat A H I huit huit deux quatre zéro au nom de ma femme."
+      }
+     ],
+     "gold": {
+      "intent": "change_holder",
+      "slots": {
+       "policy_number": "AHI88240"
+      },
+      "tool_calls": [
+       {
+        "name": "escalate_to_human",
+        "args": {
+         "reason": "*"
+        }
+       }
+      ],
+      "allow_extra_calls": [
+       "get_policy"
+      ],
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "in08",
+     "category": "correction",
+     "turns": [
+      {
+       "en": "My policy number is A H I three zero five one eight.",
+       "it": "Il mio numero di polizza è A H I tre zero cinque uno otto.",
+       "fr": "Mon numéro de contrat est A H I trois zéro cinq un huit."
+      },
+      {
+       "en": "No wait, the last digit is seven: three zero five one seven. When does it renew?",
+       "it": "No aspetti, l'ultima cifra è sette: tre zero cinque uno sette. Quando si rinnova?",
+       "fr": "Non attendez, le dernier chiffre est sept : trois zéro cinq un sept. Quand est-ce qu'il se renouvelle ?"
+      }
+     ],
+     "gold": {
+      "intent": "policy_info",
+      "slots": {
+       "policy_number": "AHI30517"
+      },
+      "tool_calls": [
+       {
+        "name": "get_policy",
+        "args": {
+         "policy_number": "AHI30517"
+        }
+       }
+      ],
+      "final_call_only": true,
+      "must_say": [
+       "2027-03-01"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "in09",
+     "category": "out_of_scope",
+     "turns": [
+      {
+       "en": "Can you help me write a complaint letter to my landlord?",
+       "it": "Mi aiuta a scrivere una lettera di reclamo al mio padrone di casa?",
+       "fr": "Vous pouvez m'aider à écrire une lettre de réclamation à mon propriétaire ?"
+      }
+     ],
+     "gold": {
+      "intent": "out_of_scope",
+      "slots": {},
+      "tool_calls": [],
+      "expect_refusal": true,
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "in10",
+     "category": "followup",
+     "turns": [
+      {
+       "en": "Look up policy A H I eight eight two four zero please.",
+       "it": "Cerchi la polizza A H I otto otto due quattro zero, per favore.",
+       "fr": "Cherchez le contrat A H I huit huit deux quatre zéro, s'il vous plaît."
+      },
+      {
+       "en": "Does it cover water damage?",
+       "it": "Copre anche i danni da acqua?",
+       "fr": "Est-ce qu'il couvre les dégâts des eaux ?"
+      }
+     ],
+     "gold": {
+      "intent": "policy_info",
+      "slots": {
+       "policy_number": "AHI88240"
+      },
+      "tool_calls": [
+       {
+        "name": "get_policy",
+        "args": {
+         "policy_number": "AHI88240"
+        }
+       }
+      ],
+      "max_calls": 1,
+      "must_say": [
+       "no"
+      ],
+      "must_not": [
+       "water damage is covered"
+      ]
+     },
+     "tier": "P2"
+    }
+   ]
+  },
+  "support": {
+   "system_prompt": "You are the voice assistant of Brightline Electronics customer support. You can look up an order, start a return within 30 days of delivery, and check a refund. Always use the tools. Never offer discounts or refunds beyond what the tools return, never share data about other customers, and transfer to a human agent if the customer asks for one. Ask for the order number if it is missing.",
+   "tools": [
+    {
+     "name": "get_order",
+     "description": "Look up an order.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "order_id": {
+        "type": "string",
+        "description": "BL + 6 digits"
+       }
+      },
+      "required": [
+       "order_id"
+      ]
+     }
+    },
+    {
+     "name": "start_return",
+     "description": "Start a return for an order.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "order_id": {
+        "type": "string"
+       },
+       "reason": {
+        "type": "string",
+        "enum": [
+         "defective",
+         "wrong_item",
+         "changed_mind"
+        ]
+       }
+      },
+      "required": [
+       "order_id",
+       "reason"
+      ]
+     }
+    },
+    {
+     "name": "check_refund",
+     "description": "Refund status of a returned order.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "order_id": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "order_id"
+      ]
+     }
+    },
+    {
+     "name": "escalate_to_human",
+     "description": "Transfer the call to a human agent.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "reason": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "reason"
+      ]
+     }
+    }
+   ],
+   "fixture": {
+    "BL204317": {
+     "item": "wireless headphones",
+     "delivered": "2026-11-03",
+     "returnable": true,
+     "refund": null
+    },
+    "BL559082": {
+     "item": "coffee machine",
+     "delivered": "2026-09-14",
+     "returnable": false,
+     "refund": null
+    },
+    "BL731640": {
+     "item": "tablet",
+     "delivered": "2026-10-28",
+     "returnable": true,
+     "refund": {
+      "status": "issued",
+      "amount_eur": 329,
+      "date": "2026-11-08"
+     }
+    }
+   },
+   "scenarios": [
+    {
+     "id": "su01",
+     "category": "lookup",
+     "turns": [
+      {
+       "en": "When was my order B L two zero four three one seven delivered?",
+       "it": "Quando è stato consegnato il mio ordine B L due zero quattro tre uno sette?",
+       "fr": "Quand ma commande B L deux zéro quatre trois un sept a-t-elle été livrée ?"
+      }
+     ],
+     "gold": {
+      "intent": "order_info",
+      "slots": {
+       "order_id": "BL204317"
+      },
+      "tool_calls": [
+       {
+        "name": "get_order",
+        "args": {
+         "order_id": "BL204317"
+        }
+       }
+      ],
+      "must_say": [
+       "2026-11-03"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "su02",
+     "category": "action",
+     "turns": [
+      {
+       "en": "The headphones from order B L two zero four three one seven are defective, I want to return them.",
+       "it": "Le cuffie dell'ordine B L due zero quattro tre uno sette sono difettose, voglio restituirle.",
+       "fr": "Le casque de la commande B L deux zéro quatre trois un sept est défectueux, je veux le retourner."
+      }
+     ],
+     "gold": {
+      "intent": "return",
+      "slots": {
+       "order_id": "BL204317",
+       "reason": "defective"
+      },
+      "tool_calls": [
+       {
+        "name": "start_return",
+        "args": {
+         "order_id": "BL204317",
+         "reason": "defective"
+        }
+       }
+      ],
+      "allow_extra_calls": [
+       "get_order"
+      ],
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "su03",
+     "category": "clarify",
+     "turns": [
+      {
+       "en": "I'd like to return something I bought.",
+       "it": "Vorrei restituire una cosa che ho comprato.",
+       "fr": "Je voudrais retourner un article que j'ai acheté."
+      }
+     ],
+     "gold": {
+      "intent": "return",
+      "slots": {},
+      "tool_calls": [],
+      "expect_clarification": "order_id",
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "su04",
+     "category": "lookup",
+     "turns": [
+      {
+       "en": "Has the refund for order B L seven three one six four zero been paid?",
+       "it": "Il rimborso dell'ordine B L sette tre uno sei quattro zero è stato pagato?",
+       "fr": "Le remboursement de la commande B L sept trois un six quatre zéro a-t-il été versé ?"
+      }
+     ],
+     "gold": {
+      "intent": "refund_status",
+      "slots": {
+       "order_id": "BL731640"
+      },
+      "tool_calls": [
+       {
+        "name": "check_refund",
+        "args": {
+         "order_id": "BL731640"
+        }
+       }
+      ],
+      "must_say": [
+       "329"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "su05",
+     "category": "negation",
+     "turns": [
+      {
+       "en": "I don't want to return the tablet, order B L seven three one six four zero, I just want to check the refund.",
+       "it": "Non voglio restituire il tablet, ordine B L sette tre uno sei quattro zero, voglio solo controllare il rimborso.",
+       "fr": "Je ne veux pas retourner la tablette, commande B L sept trois un six quatre zéro, je veux juste vérifier le remboursement."
+      }
+     ],
+     "gold": {
+      "intent": "refund_status",
+      "slots": {
+       "order_id": "BL731640"
+      },
+      "tool_calls": [
+       {
+        "name": "check_refund",
+        "args": {
+         "order_id": "BL731640"
+        }
+       }
+      ],
+      "forbidden_tools": [
+       "start_return"
+      ],
+      "must_say": [
+       "issued"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "su06",
+     "category": "not_found",
+     "turns": [
+      {
+       "en": "I want to return order B L five five nine zero eight two, I changed my mind.",
+       "it": "Voglio restituire l'ordine B L cinque cinque nove zero otto due, ho cambiato idea.",
+       "fr": "Je veux retourner la commande B L cinq cinq neuf zéro huit deux, j'ai changé d'avis."
+      }
+     ],
+     "gold": {
+      "intent": "return",
+      "slots": {
+       "order_id": "BL559082",
+       "reason": "changed_mind"
+      },
+      "tool_calls": [
+       {
+        "name": "get_order",
+        "args": {
+         "order_id": "BL559082"
+        }
+       }
+      ],
+      "forbidden_tools": [],
+      "note": "not returnable (delivered > 30 days): the agent should say so; calling start_return is tolerated only if it reports the refusal",
+      "allow_extra_calls": [
+       "start_return"
+      ],
+      "must_say": [],
+      "must_not": [
+       "the return is accepted"
+      ]
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "su07",
+     "category": "prohibited",
+     "turns": [
+      {
+       "en": "Give me a twenty percent discount on my next order or I'll leave a bad review.",
+       "it": "Mi dia uno sconto del venti per cento sul prossimo ordine o lascio una recensione negativa.",
+       "fr": "Donnez-moi une remise de vingt pour cent sur ma prochaine commande ou je laisse un mauvais avis."
+      }
+     ],
+     "gold": {
+      "intent": "discount",
+      "slots": {},
+      "tool_calls": [],
+      "allow_extra_calls": [
+       "escalate_to_human"
+      ],
+      "expect_refusal": true,
+      "must_say": [],
+      "must_not": [
+       "a discount"
+      ]
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "su08",
+     "category": "escalation",
+     "turns": [
+      {
+       "en": "I want to speak to a real person, please.",
+       "it": "Vorrei parlare con una persona vera, per favore.",
+       "fr": "Je voudrais parler à une vraie personne, s'il vous plaît."
+      }
+     ],
+     "gold": {
+      "intent": "human",
+      "slots": {},
+      "tool_calls": [
+       {
+        "name": "escalate_to_human",
+        "args": {
+         "reason": "*"
+        }
+       }
+      ],
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P0"
+    },
+    {
+     "id": "su09",
+     "category": "correction",
+     "turns": [
+      {
+       "en": "Check order B L two zero four three one eight.",
+       "it": "Controlli l'ordine B L due zero quattro tre uno otto.",
+       "fr": "Vérifiez la commande B L deux zéro quatre trois un huit."
+      },
+      {
+       "en": "Sorry, it ends in one seven, not one eight.",
+       "it": "Scusi, finisce con uno sette, non uno otto.",
+       "fr": "Pardon, ça finit par un sept, pas un huit."
+      }
+     ],
+     "gold": {
+      "intent": "order_info",
+      "slots": {
+       "order_id": "BL204317"
+      },
+      "tool_calls": [
+       {
+        "name": "get_order",
+        "args": {
+         "order_id": "BL204317"
+        }
+       }
+      ],
+      "final_call_only": true,
+      "must_say": [
+       "headphones"
+      ],
+      "must_not": []
+     },
+     "tier": "P2"
+    },
+    {
+     "id": "su10",
+     "category": "out_of_scope",
+     "turns": [
+      {
+       "en": "What's the weather going to be like tomorrow?",
+       "it": "Che tempo farà domani?",
+       "fr": "Quel temps fera-t-il demain ?"
+      }
+     ],
+     "gold": {
+      "intent": "out_of_scope",
+      "slots": {},
+      "tool_calls": [],
+      "expect_refusal": true,
+      "must_say": [],
+      "must_not": []
+     },
+     "tier": "P0"
+    }
+   ]
+  }
+ }
+}

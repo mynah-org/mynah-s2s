@@ -1,0 +1,49 @@
+{
+ "about": "Manual review of the 27 SVAMP eval items of QA v2.1 (MKQA eval texts are human translations and are kept verbatim), by the assistant on 2026-11-11 ~22:40, text only (audio not heard). Qwen2.5 translations that passed the numeric check still contained Chinese text (sv882 FR), English leftovers ('dollarsleft'), wrong words ('lire', 'mazzi', 'hanno perso le foglie' for 'died') and dropped clauses; the listed strings replace them. Two items are excluded because the SVAMP problem itself has inconsistent premises.",
+ "exclude": {
+  "sv351": "inconsistent premise (3 trees grown, 13 died)",
+  "sv56": "inconsistent premise (picked 154 of 90 tomatoes)"
+ },
+ "it": {
+  "sv189": "Frank aveva 42 caramelle. Le ha divise in parti uguali in 2 sacchetti. Quante caramelle ci sono in ogni sacchetto?",
+  "sv193": "Hanno deciso di fare la festa in giardino. Hanno 4 set di tavoli e ogni set ha 3 sedie. Se alla festa parteciperanno 14 persone, quante sedie in più dovranno comprare?",
+  "sv275": "La mamma di Brenda ha preparato dei biscotti per 10 ospiti, ma 9 ospiti non sono venuti. Se ha preparato 18 biscotti e ogni ospite ne ha avuti lo stesso numero, quanti biscotti ha avuto ciascuno?",
+  "sv354": "Poi è andato a vedere la raccolta delle arance. Ha scoperto che raccolgono 66 sacchi al giorno. Quante arance raccolgono al giorno se ogni sacco contiene 28 arance?",
+  "sv43": "Luke ha giocato 177 turni di un quiz. Se ha guadagnato 46 punti in ogni turno, quanti punti ha totalizzato nel gioco?",
+  "sv457": "Paco aveva 28 biscotti. Ne ha mangiati alcuni e gliene sono rimasti 7. Quanti biscotti ha mangiato Paco?",
+  "sv504": "Bobby aveva 19 caramelle. Ne ha mangiate 2. Quante caramelle gli restano?",
+  "sv594": "Durante la partita tra Arkansas e Texas Tech, il negozio di magliette dei Razorback ha incassato 215 dollari vendendo 5 magliette. Quanto costa ogni maglietta?",
+  "sv626": "I capelli di Robin erano lunghi 14 pollici. Sono cresciuti di 8 pollici. Poi ne ha tagliati 20 pollici. Quanto sono lunghi ora i suoi capelli?",
+  "sv63": "Aveva anche 26 acquari per animali d'acqua salata. In totale c'erano 52 animali d'acqua salata e ogni acquario ne aveva lo stesso numero. Quanti animali d'acqua salata ci sono in ogni acquario?",
+  "sv630": "Dopo un tifone, 2 alberi nel giardino di Haley sono morti. Se all'inizio ne aveva piantati 12, quanti alberi le sono rimasti?",
+  "sv654": "Per il suo compleanno Gwen ha ricevuto dei soldi. Ha speso 8 dollari e le restano 6 dollari. Quanti soldi ha ricevuto Gwen per il suo compleanno?",
+  "sv671": "Julia ha giocato ad acchiapparello con 7 bambini lunedì e 13 bambini martedì. Ha giocato a carte con 20 bambini mercoledì. Con quanti bambini ha giocato ad acchiapparello in tutto?",
+  "sv674": "La ruota panoramica del parco Paradise ha 18 posti. Ogni posto può ospitare 15 persone. Se 10 posti sono rotti, quante persone possono salire sulla ruota panoramica contemporaneamente?",
+  "sv695": "Lui ha 9 mele in più di quante ne abbiano Adam e Jackie insieme. Adam e Jackie hanno 7 mele in tutto. Quante mele ha lui?",
+  "sv70": "Olivia ha speso 78 dollari al supermercato. Se le restano 33 dollari, quanti soldi aveva all'inizio?",
+  "sv810": "Adam ha 4 mele in più di Jackie. Insieme Adam e Jackie hanno 14 mele. Bob ha 6 mele in più di quante ne abbiano insieme Adam e Jackie. Quante mele ha Bob?",
+  "sv882": "Dopo aver preparato alcune torte, al cuoco sono rimaste 2 mele. All'inizio aveva 43 mele. Quante mele ha usato?",
+  "sv925": "Ci sono molti libri diversi nella serie 'crazy silly school'. Se hai letto 13 libri e devi ancora leggerne 8, quanti libri ci sono nella serie 'crazy silly school'?"
+ },
+ "fr": {
+  "sv189": "Frank avait 42 bonbons. Il les a répartis équitablement dans 2 sacs. Combien de bonbons y a-t-il dans chaque sac ?",
+  "sv193": "Ils ont décidé d'organiser la fête dans leur jardin. Ils ont 4 ensembles de tables et chaque ensemble a 3 chaises. Si 14 personnes viennent à la fête, combien de chaises supplémentaires devront-ils acheter ?",
+  "sv208": "Chaque jour, Ryan passe 2 heures à apprendre l'anglais, 5 heures à apprendre le chinois et 4 heures à apprendre l'espagnol. Combien d'heures de plus passe-t-il à apprendre le chinois que l'espagnol ?",
+  "sv275": "La mère de Brenda a préparé des cookies pour 10 invités, mais 9 invités ne sont pas venus. Si elle a préparé 18 cookies et que chaque invité en a eu le même nombre, combien en a eu chacun ?",
+  "sv346": "Haley a planté des arbres dans son jardin. Après un typhon, 5 sont morts. S'il en reste 12, combien d'arbres avait-elle plantés ?",
+  "sv365": "Rachel a cueilli 7 pommes mûres sur son arbre. Il reste maintenant 5 pommes sur l'arbre. Si 3 d'entre elles sont mûres et les autres ne le sont pas, combien de pommes pas mûres y a-t-il sur l'arbre ?",
+  "sv43": "Luke a joué 177 manches d'un jeu de quiz. S'il a gagné 46 points à chaque manche, combien de points a-t-il marqués au total ?",
+  "sv457": "Paco avait 28 cookies. Il en a mangé quelques-uns et il lui en reste 7. Combien de cookies Paco a-t-il mangés ?",
+  "sv504": "Bobby avait 19 bonbons. Il en a mangé 2. Combien de bonbons lui reste-t-il ?",
+  "sv591": "Lewis gagne 403 dollars chaque semaine pendant les 233 semaines de récolte. S'il doit payer 49 dollars de loyer chaque semaine, combien d'argent gagne-t-il pendant la saison de récolte ?",
+  "sv594": "Pendant le match entre l'Arkansas et Texas Tech, la boutique de t-shirts des Razorbacks a gagné 215 dollars en vendant 5 t-shirts. Quel est le prix de chaque t-shirt ?",
+  "sv626": "Les cheveux de Robin mesuraient 14 pouces. Ils ont poussé de 8 pouces. Puis il en a coupé 20 pouces. Combien mesurent ses cheveux maintenant ?",
+  "sv63": "Il avait aussi 26 aquariums pour animaux d'eau de mer. Il y avait 52 animaux d'eau de mer au total et chaque aquarium en contenait le même nombre. Combien d'animaux d'eau de mer y a-t-il dans chaque aquarium ?",
+  "sv654": "Pour son anniversaire, Gwen a reçu de l'argent. Elle a dépensé 8 dollars et il lui en reste 6. Combien d'argent Gwen a-t-elle reçu pour son anniversaire ?",
+  "sv671": "Julia a joué à chat avec 7 enfants le lundi et 13 enfants le mardi. Elle a joué aux cartes avec 20 enfants le mercredi. Avec combien d'enfants a-t-elle joué à chat en tout ?",
+  "sv674": "La grande roue du parc Paradise a 18 sièges. Chaque siège peut accueillir 15 personnes. Si 10 sièges sont cassés, combien de personnes peuvent monter sur la grande roue en même temps ?",
+  "sv70": "Olivia a dépensé 78 dollars dans un supermarché. S'il lui reste 33 dollars, combien d'argent avait-elle au début ?",
+  "sv882": "Après avoir fait quelques tartes, il restait 2 pommes au chef. Au début, il avait 43 pommes. Combien de pommes a-t-il utilisées ?",
+  "sv909": "Robin a coupé 20 pouces de ses cheveux. Si ses cheveux mesurent maintenant 10 pouces, combien mesuraient-ils avant la coupe ?"
+ }
+}
