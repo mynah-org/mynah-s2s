@@ -1,5 +1,27 @@
 # V2 architecture
 
+## The model: what is inside VoiceChat 11B
+
+One checkpoint (11.1 B parameters, stored in FP32) made of distinct networks that run one after the other every
+80 ms frame: user audio (16 kHz) → perception → Thinker → EarTTS → codec decoder (22.05 kHz). Parameter counts are
+summed from the released weights; module classes are read in NVIDIA NeMo Speech.
+
+| module | what it is | parameters |
+|---|---|---|
+| **Perception** | log-mel front end (128 bins, 10 ms hop) and a cache-aware streaming FastConformer (24 layers, width 1024, 8× subsampling, causal convolutions, limited left context): one embedding per 80 ms frame, projected to the LLM width | 0.61 B |
+| **Thinker** | NVIDIA Nemotron Nano 9B v2, hybrid Mamba-2 / Transformer (56 blocks: Mamba-2, MLP and 4 attention blocks), consuming the audio embeddings and its own text | 7.71 B blocks + 0.59 B input embeddings |
+| Thinker heads | **text head** (what the agent says, subword tokens), **function head** (tool-call JSON and tool responses, a separate channel), **RNN-T head** on the user side (turn-taking signals) | 0.59 B + 0.59 B + 0.01 B |
+| **EarTTS** | a separate streaming TTS decoder (`RVQEARTTSModel` in NeMo `speechlm2`, not Magpie TTS): reads the Thinker's text subwords and its own previous audio codes; Gemma-3-style transformer (28 layers, width 1152) plus a mixture-of-Gaussians head (1024 components, low rank 64); each frame is decoded into 31 residual-VQ codes in 8 masked refinement passes with classifier-free guidance; one fixed speaker ("Aria") | 0.59 B backbone + 0.16 B head + 0.04 B embeddings |
+| **Codec** | RVQ-VAE audio codec, 31 codebooks × 1024 codes, 1764 samples per frame (80 ms at 22.05 kHz); the decoder turns EarTTS codes into the waveform; frozen during VoiceChat training | 0.18 B + 0.02 B quantizer |
+
+Consequences used throughout this repository:
+- the agent's words exist as text *before* they are spoken (the Thinker writes them, EarTTS voices them): internal
+  text and spoken audio are separate evidences and can disagree, so the test suites check both;
+- tool calls live on their own channel and never reach EarTTS; the agent keeps talking ("just a moment") while a call
+  runs;
+- the Thinker holds most of the weights (its GPU time is bound by reading them), while EarTTS, with 8 refinement passes
+  per frame, issues most of the small GPU kernels; on an L40S both take a comparable share of a round.
+
 ## One session, one 160 ms chunk (two 80 ms frames)
 
 | stage | what runs | V2 execution |
