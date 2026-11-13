@@ -52,3 +52,30 @@ def test_c1_compare(tmp_path):
             M.compare(a)
         except SystemExit as e:
             assert e.code == ok
+
+
+def _write_c2(d, upd_norm=1.0, gnorm=2.0, loss=0.5):
+    d.mkdir(parents=True)
+    (d / "construction.json").write_text(json.dumps(rec()))
+    calls = [{"call": 0, "x": "h", "shape": [1, 2, 4]}, {"ce": 0, "inp": "i", "target": "t", "out": "o", "sum": 1.0},
+             {"clip": [[[2], "torch.float32", "v", "g", gnorm]]}, {"update": [["v2", upd_norm, "u"]]}]
+    (d / "calls.jsonl").write_text("".join(json.dumps(c) + "\n" for c in calls))
+    (d / "c2_train").mkdir()
+    (d / "c2_train" / "train_log.jsonl").write_text(json.dumps(
+        {"step": 1, "batch_ids": [["a|en"]], "loss": loss, "grad": {"g": gnorm}, "comp": {"text:text": loss}}) + "\n")
+
+
+def test_c2_compare(tmp_path):
+    _write_c2(tmp_path / "o")
+    cases = {"same": ({}, 0), "update": ({"upd_norm": 1.05}, 1), "grad": ({"gnorm": 2.1}, 1), "loss": ({"loss": 0.51}, 1),
+             "within": ({"upd_norm": 1.005, "gnorm": 2.01, "loss": 0.5004}, 0)}
+    for name, (kw, code) in cases.items():
+        _write_c2(tmp_path / name, **kw)
+        a = type("A", (), {"old": str(tmp_path / "o"), "new": str(tmp_path / name), "mode": "c2",
+                           "out": str(tmp_path / f"r_{name}.json")})
+        try:
+            M.compare(a)
+            got = 0
+        except SystemExit as e:
+            got = e.code
+        assert got == code, (name, json.load(open(tmp_path / f"r_{name}.json"))["c2"])

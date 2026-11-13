@@ -44,7 +44,9 @@ DECLARED_DIFF = ("fc_ctx_fix_info", "patches.S2SContextManager.__init__", "patch
 # C2 tolerances, declared before any run: identical inputs / targets / trainable values are required (sha);
 # loss components and total |rel| <= 1e-3; pre-clip gradient norm per tensor |rel| <= 1e-2. Grad sha equality is
 # reported, never required (bf16 backward reductions on GPU are not guaranteed bit-reproducible).
-C2_TOL = {"loss_rel": 1e-3, "grad_norm_rel": 1e-2}
+C2_TOL = {"loss_rel": 1e-3, "grad_norm_rel": 1e-2, "update_norm_rel": 1e-2}
+# Run 2 addition, declared before run 2: the optimizer update of every trainable tensor (value after step - value
+# before), per-tensor norm |rel| <= 1e-2; update sha equality reported, never required.
 
 
 def sha(t) -> str:
@@ -70,11 +72,7 @@ def construction(eng, prompt: str, lab_dir: str, light: bool = False) -> dict:
     for kind, it in (("param", m.named_parameters()), ("buffer", m.named_buffers())):
         for n, t in it:
             rec["tensors"][f"{kind}:{n}"] = [list(t.shape), str(t.dtype), str(t.device), None if light else sha(t)]
-    cfg = OmegaConf.to_container(eng.cfg, resolve=True)
-    if isinstance(cfg, dict):
-        cfg.get("s2s", {}).pop("output_dir", None)
-        cfg.pop("output_dir", None)
-    rec["cfg"] = cfg
+    rec["cfg"] = OmegaConf.to_container(eng.cfg, resolve=True)        # every key, nothing normalised (run 2)
     D = Duplex(eng, prompt)
     f = D.fusion
     rec["fusion"] = {"type": type(f).__name__, **{k: getattr(f, k) for k in dir(f) if k.endswith("_weight")
@@ -195,11 +193,25 @@ def run(mode: str, a, rest: list[str]):
             k["ce"] += 1
             return r
 
+        before = {}
+
         def clip(params, *x, **kw):
             ps = list(params)
             log({"clip": [[list(p.shape), str(p.dtype), sha(p), sha(p.grad) if p.grad is not None else None,
                            float(p.grad.float().norm()) if p.grad is not None else None] for p in ps]})
+            if not before:
+                before["ps"] = ps
+                before["v"] = [p.detach().clone() for p in ps]
             return clip0(ps, *x, **kw)
+
+        def post_step(opt, args, kwargs):
+            if before and "done" not in before:
+                before["done"] = True
+                log({"update": [[sha(p), float((p.detach().float() - v.float()).norm()), sha(p.detach() - v)]
+                                for p, v in zip(before["ps"], before["v"])]})
+
+        from torch.optim.optimizer import register_optimizer_step_post_hook
+        register_optimizer_step_post_hook(post_step)
 
         F.cross_entropy = ce
         torch.nn.utils.clip_grad_norm_ = clip
@@ -225,7 +237,8 @@ def compare(a):
     first = next((i for i, (x, y) in enumerate(zip(th_o, th_n)) if x != y), None)
     rep["thinker_calls"] = {"n": [len(th_o), len(th_n)], "identical": th_o == th_n, "first_diff": first}
     if a.mode == "c1":
-        rows = lambda p: {(r["arm"], r["set"], r["id"], r["lang"]): r for r in map(json.loads, open(p / "free_rows.jsonl"))  # noqa: E731
+        fr = lambda p: p / "glex" / "free_rows.jsonl" if (p / "glex" / "free_rows.jsonl").exists() else p / "free_rows.jsonl"  # noqa: E731
+        rows = lambda p: {(r["arm"], r["set"], r["id"], r["lang"]): r for r in map(json.loads, open(fr(p)))  # noqa: E731
                           if "score" in r}
         ro, rn = rows(o), rows(n)
         keys = sorted(set(ro) | set(rn))
@@ -243,6 +256,10 @@ def compare(a):
         gn = [(x[4], y[4]) for x, y in zip(cl_o, cl_n) if x[4] is not None and y[4] is not None]
         grel = max((abs(x - y) / max(abs(x), 1e-12) for x, y in gn), default=0.0)
         gsha = sum(x[3] == y[3] for x, y in zip(cl_o, cl_n))
+        up_o = next((r["update"] for r in co if "update" in r), [])
+        up_n = next((r["update"] for r in cn if "update" in r), [])
+        urel = max((abs(x[1] - y[1]) / max(abs(x[1]), 1e-12) for x, y in zip(up_o, up_n)), default=float("inf"))
+        usha = sum(x[2] == y[2] for x, y in zip(up_o, up_n))
         lo = [json.loads(x) for x in open(o / "c2_train" / "train_log.jsonl") if '"comp"' in x][0]
         ln = [json.loads(x) for x in open(n / "c2_train" / "train_log.jsonl") if '"comp"' in x][0]
         lrel = max([abs(lo["loss"] - ln["loss"]) / max(abs(lo["loss"]), 1e-12)] +
@@ -250,11 +267,13 @@ def compare(a):
         rep["c2"] = {"ce_calls": [len(ce_o), len(ce_n)], "ce_targets_identical": same_targets,
                      "ce_inputs_identical": same_inp, "trainable_values_identical": vals_same,
                      "n_trainable": [len(cl_o), len(cl_n)], "grad_sha_identical": f"{gsha}/{len(cl_o)}",
-                     "grad_norm_max_rel": grel, "loss_max_rel": lrel, "batch_ids_identical": lo["batch_ids"] == ln["batch_ids"],
+                     "grad_norm_max_rel": grel, "loss_max_rel": lrel, "n_updates": [len(up_o), len(up_n)],
+                     "update_norm_max_rel": urel, "update_sha_identical": f"{usha}/{len(up_o)}", "batch_ids_identical": lo["batch_ids"] == ln["batch_ids"],
                      "log_old": {k: lo[k] for k in ("loss", "grad", "comp")}, "log_new": {k: ln[k] for k in ("loss", "grad", "comp")},
                      "tolerances": C2_TOL}
         rep["pass"] = (rep["construction"]["pass"] and same_targets and vals_same and rep["c2"]["batch_ids_identical"]
-                       and len(cl_o) == len(cl_n) and lrel <= C2_TOL["loss_rel"] and grel <= C2_TOL["grad_norm_rel"])
+                       and len(cl_o) == len(cl_n) and lrel <= C2_TOL["loss_rel"] and grel <= C2_TOL["grad_norm_rel"]
+                       and len(up_o) == len(up_n) == len(cl_o) and urel <= C2_TOL["update_norm_rel"])
     Path(a.out).write_text(json.dumps(rep, indent=1))
     print(json.dumps({k: v for k, v in rep.items() if k != "construction"} | {"construction_pass": rep["construction"]["pass"]},
                      indent=1)[:4000])
