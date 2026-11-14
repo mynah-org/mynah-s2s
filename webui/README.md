@@ -46,15 +46,16 @@ It quantizes only the Gemma backbone linears. CAS/subword embeddings, MoG
 projections, RVQ, codec, and perception remain unchanged. The combined
 `--int4` path has passed a real DGX WebSocket turn with zero dropped audio.
 
-For repeatable startup, export the native packed weights once and pass the pack
+For repeatable startup, export the native packed weights once and pass the bundle
 instead:
 
 ```bash
-make int4-pack INT4_PACK=/path/to/voicechat-thinker-int4.safetensors
-make webui-gpu V2_SERVE_ARGS="--thinker-int4-pack /path/to/voicechat-thinker-int4.safetensors"
+make int4-pack INT4_PACK=/path/to/voicechat-int4.safetensors
+make webui-gpu V2_SERVE_ARGS="--int4-pack /path/to/voicechat-int4.safetensors"
 ```
 
-This writes `.safetensors` plus a sibling `.json` manifest. No INT4 option means
+This writes `.safetensors` plus a sibling `.json` manifest. The bundle includes
+the Thinker/output heads and native INT4 EarTTS backbone. No INT4 option means
 the normal BF16 server path.
 
 To open it from another device on the LAN, use `--host 0.0.0.0` and pass the

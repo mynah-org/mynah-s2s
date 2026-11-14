@@ -157,26 +157,31 @@ def main():
     ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: int4 weight-only Thinker (mynah_v2.model.quant); refused in REFERENCE mode")
     ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
-                    help="load an offline .safetensors + sibling .json native-int4 pack; implies --thinker-int4")
+                    help="legacy alias for --int4-pack")
+    ap.add_argument("--int4-pack", default=os.environ.get("MYNAH_INT4_PACK"),
+                    help="load one offline .safetensors + sibling .json INT4 bundle (Thinker + EarTTS)")
     ap.add_argument("--int4-heads", action="store_true", default=_env_flag("MYNAH_INT4_HEADS"),
                     help="also quantize the text/function output heads with --thinker-int4; keeps caches and embeddings unchanged")
     ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128])
     ap.add_argument("--int4-clip", action="store_true", help="per-group clipping search (MSE)")
     ap.add_argument("--eartts-int4", action="store_true", default=_env_flag("MYNAH_EARTTS_INT4"),
-                    help="EXPERIMENT: graph-safe Triton Q4 for the EarTTS Gemma backbone only; requires enhanced mode")
+                    help="EXPERIMENT: graph-safe native INT4 for the EarTTS Gemma backbone only; requires enhanced mode")
     a = ap.parse_args()
     preset_info = presets.fill(a, presets.SINGLE, a.preset)
     print("PRESET", a.preset, preset_info, flush=True)
+    if a.thinker_int4_pack and a.int4_pack:
+        ap.error("use only one of --int4-pack and --thinker-int4-pack")
+    if a.int4_pack is None:
+        a.int4_pack = a.thinker_int4_pack
     if a.int4:
         a.thinker_int4 = True
         a.int4_heads = True
         a.eartts_int4 = True
-    if a.thinker_int4_pack and a.thinker_int4:
-        ap.error("use either --thinker-int4 or --thinker-int4-pack, not both")
-    if a.thinker_int4_pack and a.int4_heads:
-        ap.error("an offline pack already declares whether output heads are included")
-    if a.thinker_int4_pack:
+    if a.int4_pack:
+        a.thinker_int4_pack = a.int4_pack
         a.thinker_int4 = True
+        a.int4_heads = False
+        a.eartts_int4 = False
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
@@ -232,8 +237,8 @@ def main():
     quant_info = None
     if a.thinker_int4:
         if a.thinker_int4_pack:
-            from mynah_v2.model.quant import load_thinker_int4_pack
-            quant_info = load_thinker_int4_pack(eng, a.thinker_int4_pack)
+            from mynah_v2.model.quant import load_int4_pack
+            quant_info = load_int4_pack(eng, a.thinker_int4_pack)
         else:
             from mynah_v2.model.quant import quantize_thinker_int4
             quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,

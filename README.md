@@ -114,16 +114,16 @@ separate LLM, function-head, perception, and TTS/codec artifacts; its README
 also says Q4 converts but the supported measurements are Q8. See the
 [reference layout](https://github.com/mkotyushev/nemotron-voicechat-realtime-gguf#why-gguf).
 
-To avoid quantizing at every server start, export a validated offline pack once:
+To avoid quantizing at every server start, export one validated offline bundle once:
 
 ```bash
-make int4-pack INT4_PACK=/path/to/voicechat-thinker-int4.safetensors
-make webui-gpu V2_SERVE_ARGS="--thinker-int4-pack /path/to/voicechat-thinker-int4.safetensors"
+make int4-pack INT4_PACK=/path/to/voicechat-int4.safetensors
+make webui-gpu V2_SERVE_ARGS="--int4-pack /path/to/voicechat-int4.safetensors"
 ```
 
 The exporter writes the sibling `.json` manifest. It records the native
-tinygemm packing, module shapes, group size, and explicitly excludes audio
-modules. The server validates the whole manifest before replacing any module;
+tinygemm packing, module shapes, group size, and explicitly lists audio modules
+that are still BF16. The server validates the whole manifest before replacing any module;
 the default remains BF16 when no INT4 flag or environment variable is set.
 
 The UI is in English and shows the User/Agent conversation, microphone and

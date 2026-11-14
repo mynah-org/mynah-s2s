@@ -53,9 +53,9 @@ custom: ## custom scenario + persona prompt (default: v2/eval/examples/furniture
 serve: ## realtime WebSocket server on :8765 (one session at a time); stop with Ctrl-C
 	ARGS="$(V2_SERVE_ARGS)" $(M) serve
 
-INT4_PACK ?= $(HOME)/mynah-s2s/artifacts/voicechat-thinker-int4.safetensors
+INT4_PACK ?= $(HOME)/mynah-s2s/artifacts/voicechat-int4.safetensors
 INT4_ARGS ?=
-int4-pack: ## export offline native INT4 Thinker pack + JSON manifest (INT4_ARGS=...)
+int4-pack: ## export offline native INT4 bundle + JSON manifest (INT4_ARGS=...)
 	ARGS="$(INT4_ARGS)" $(M) int4-pack "$(INT4_PACK)"
 
 WEBUI_ARGS ?=

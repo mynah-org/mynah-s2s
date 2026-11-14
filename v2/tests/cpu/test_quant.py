@@ -2,8 +2,9 @@
 
 import torch
 import torch.nn as nn
+import json
 
-from mynah_v2.model.quant import Int4Linear, TARGETS, _pick, dequantize_int4_reference
+from mynah_v2.model.quant import BUNDLE_FORMAT, Int4Linear, TARGETS, _pick, dequantize_int4_reference, load_int4_pack
 
 
 def test_group_and_tiles_fit_every_nemotron_k():
@@ -35,3 +36,47 @@ def test_offline_packed_linear_validates_layout_without_requantizing():
     assert q.packed.data_ptr() == packed.data_ptr()
     assert q.scales_zeros.data_ptr() == scales_zeros.data_ptr()
     assert q.bias is lin.bias
+
+
+def test_offline_bundle_loads_thinker_and_eartts_scopes_atomically(tmp_path):
+    class FakeStt(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(128, 4, dtype=torch.bfloat16)])
+
+    class FakeBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(128, 4, dtype=torch.bfloat16)])
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.stt_model = FakeStt()
+            self.tts_model = nn.Module()
+            self.tts_model.tts_model = nn.Module()
+            self.tts_model.tts_model.backbone = FakeBackbone()
+
+    class FakeEngine:
+        def __init__(self):
+            self.wrapper = type("Wrapper", (), {"model": FakeModel()})()
+
+    tensors = {}
+    modules = []
+    for root, name in (("stt_model", "layers.0"), ("eartts_backbone", "layers.0")):
+        prefix = f"{root}.{name}"
+        pk, sk = f"{prefix}.packed", f"{prefix}.scales_zeros"
+        tensors[pk] = torch.zeros(4, 64, dtype=torch.int32)
+        tensors[sk] = torch.zeros(1, 4, 2, dtype=torch.bfloat16)
+        modules.append({"root": root, "name": name, "in_features": 128, "out_features": 4,
+                        "group": 128, "tiles": 8, "packed_key": pk, "scales_zeros_key": sk})
+    from safetensors.torch import save_file
+    pack = tmp_path / "bundle.safetensors"
+    save_file(tensors, str(pack))
+    (tmp_path / "bundle.json").write_text(json.dumps({"format": BUNDLE_FORMAT, "modules": modules}))
+
+    engine = FakeEngine()
+    info = load_int4_pack(engine, pack)
+    assert info["modules"] == 2
+    assert isinstance(engine.wrapper.model.stt_model.layers[0], Int4Linear)
+    assert isinstance(engine.wrapper.model.tts_model.tts_model.backbone.layers[0], Int4Linear)
