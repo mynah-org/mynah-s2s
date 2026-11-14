@@ -42,7 +42,12 @@ def test_summarise_and_margin():
 
 
 def test_scenarios_declared():
-    assert set(F.SCEN) == {"m03_empty", "m08_vr", "m07_chain", "m02_nf"}
+    assert set(F.SCEN) == {"m03_empty", "m08_vr", "m07_chain", "m02_nf", "t14_nf", "t13_found"}
+    assert {k: v.get("live_outcome") for k, v in F.SCEN.items()} == {
+        "m03_empty": None, "m08_vr": None, "m07_chain": "chain", "m02_nf": "identical_recall",
+        "t14_nf": "identical_recall", "t13_found": "reply"}
+    assert F.SCEN["t14_nf"]["post_fc_zeros"] and F.SCEN["t13_found"]["post_fc_zeros"]
+    assert not F.SCEN["m02_nf"].get("post_fc_zeros")      # job 111 capture kept for the typed comparison
     m02 = F.SCEN["m02_nf"]
     assert m02["family"] == "engine" and m02["lead_s"] == 0.0 and m02["h5"][1] == "12/22"
     assert m02["expect_result"] == '{"order_id": "QGQ999", "found": false}' and m02["prompt_chars"] == 3366
@@ -129,3 +134,10 @@ def test_gate_rules():
     assert F.gate("m07_chain", _cell("new_call", pr, 293), "x")["chain_kept"]
     assert not F.gate("m07_chain", _cell("reply"), "x")["chain_kept"]
     assert not F.gate("m07_chain", _cell("new_call", pr.replace("C1002", "Mario"), 293), "x")["chain_kept"]
+
+
+def test_gate_reply_state():
+    call = '<TOOLCALL>[{"name": "get_order_status", "arguments": {"order_id": "XYZ123"}}]'
+    g = F.gate("t13_found", _cell("reply"), call)
+    assert g["reply"] and g["variant_pass"]
+    assert F.gate("t14_nf", _cell("new_call", call, 176), call)["identical_recall"]

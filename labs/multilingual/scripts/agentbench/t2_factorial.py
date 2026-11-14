@@ -46,7 +46,8 @@ from t1_probe import BOS, EOS, EOTC, PAD, SOTC, Thinker, fc_call, frame_tokens, 
 EOTR = 22
 CONTRACTS = "0/0,12/12,12/0,0/22,12/22,12/22s"
 # first-cell wall estimates for the budget guard (job 278: m08 41 s = 225 forced steps + 5 re-call decodes, ~85 ms/step)
-FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 55.0, "m03_empty": 40.0, "m02_nf": 35.0}
+FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 55.0, "m03_empty": 40.0, "m02_nf": 35.0, "t14_nf": 32.0,
+                "t13_found": 35.0}
 FX1 = MYNAH_HOME / "results/v2/fcfix/FX1-fix"
 RES = LAB_HOME / "results/agentbench"
 SCEN = {
@@ -69,8 +70,30 @@ SCEN = {
                "trace": FX1 / "m02/trace.jsonl", "trace_arm": "A", "family": "engine",
                "tool": "get_order_status", "args": {"order_id": "qgq999"}, "result_args": None,
                "orders_db": FX1 / "orders.sqlite", "expect_result": '{"order_id": "QGQ999", "found": false}',
-               "prompt_chars": 3366, "prompt_tokens": 789, "h5": ("A", "12/22", "get_order_status", 0)},
+               "prompt_chars": 3366, "prompt_tokens": 789, "h5": ("A", "12/22", "get_order_status", 0),
+               "live_outcome": "identical_recall"},
+    # engine FX1-fix t14: get_order_status(WXYY615) -> found=false, identical call re-opened at the first resume frame
+    # (9x live). The caller's follow-up was spoken DURING the FC: ENHANCED buffered it and fed the engine injected
+    # silence (Session.feed_chunk), so the post-call audio is silence (post_fc_zeros), not the clip.
+    "t14_nf": {"wav": MYNAH_HOME / "data/agent/corpus_v1/t14.wav", "lead_s": 0.0, "post_fc_zeros": True,
+               "trace": FX1 / "t14/trace.jsonl", "trace_arm": "A", "family": "engine",
+               "tool": "get_order_status", "args": {"order_id": "WXYY615"}, "result_args": None,
+               "orders_db": FX1 / "orders.sqlite", "expect_result": '{"order_id": "WXYY615", "found": false}',
+               "h5": None, "live_outcome": "identical_recall"},
+    # engine FX1-fix t13, FIRST call: get_order_status(XYZ123) -> found (productive); live: the model REPLIED (no
+    # re-call). The caller's correction was spoken during the FC (buffered, injected silence fed): post_fc_zeros.
+    # Control: b2 must not change a productive reply. (t13's DF246 loop is its SECOND call: not reachable here.)
+    "t13_found": {"wav": MYNAH_HOME / "data/agent/corpus_v1/t13.wav", "lead_s": 0.0, "post_fc_zeros": True,
+                  "trace": FX1 / "t13/trace.jsonl", "trace_arm": "A", "family": "engine",
+                  "tool": "get_order_status", "args": {"order_id": "XYZ123"}, "result_args": None,
+                  "orders_db": FX1 / "orders.sqlite", "expect_result": None, "h5": None, "live_outcome": "reply"},
 }
+# live_outcome = what the official model did live at this state, for the baseline-faithfulness gate. None = no live
+# reference for arm A: m08 teacher-forces D's live history (replay reference, job 278 A 12/22: +0.69 ->
+# find_customer(Lindvik, 1234)); m03_empty is a counterfactual (empty result substituted on A's m03 state).
+for _k in ("m03_empty", "m08_vr"):
+    SCEN[_k]["live_outcome"] = None
+SCEN["m07_chain"]["live_outcome"] = "chain"
 
 
 # ----------------------------------------------------------------------------------------------- P1 / P3 variants
@@ -153,7 +176,7 @@ def gate(sc: str, cell: dict, call_text: str, contract: str = "12/22") -> dict:
     o = cell["contracts"][contract]["outcome"]
     txt = o.get("new_call_text") or ""
     same = o.get("first") == "new_call" and "".join(txt.split()) == "".join(call_text.split())
-    if sc == "m02_nf":
+    if SCEN.get(sc, {}).get("live_outcome") in ("identical_recall", "reply") or sc == "m02_nf":
         return {"identical_recall": same, "reply": o.get("first") == "reply", "recall_at": o.get("new_call_sotc"),
                 "other_call": o.get("first") == "new_call" and not same, "variant_pass": o.get("first") == "reply"}
     if sc == "m07_chain":
@@ -244,6 +267,8 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--tail-s", type=float, default=4.0)
     ap.add_argument("--lead-s", type=float, default=7.0)
     ap.add_argument("--budget-s", type=float, default=265.0)
+    ap.add_argument("--stop-on-unfaithful", type=int, default=1, help="1: stop the run at an unfaithful baseline; "
+                    "0: mark it (its cells are not usable) and continue with the other states")
     ap.add_argument("--variants", default="base", help="comma list of " + "/".join(VARIANTS))
     ap.add_argument("--plan", default="", help="ordered 'scenario:arm[:variant],...' (priority order under the budget "
                                                "guard); default: every scenario x arm x variant, scenario-major")
@@ -405,6 +430,9 @@ def main():  # pragma: no cover - GPU
             if SCEN[sc].get("max_s"):
                 x = x[:int(SCEN[sc]["max_s"] * 16000)]
             lead, tail_s = SCEN[sc].get("lead_s", a.lead_s), SCEN[sc].get("tail_s", a.tail_s)
+            if SCEN[sc].get("post_fc_zeros"):     # what the live engine got after the call frame: injected silence
+                x = x[:(states[(sc, "orig")]["s"] + 1) * 1280]
+                tail_s = (a.n_free + 12) * 0.08
             wav = torch.cat([torch.zeros(int(lead * 16000)), x, torch.zeros(int(tail_s * 16000))])
             fx = []
 
@@ -467,7 +495,8 @@ def main():  # pragma: no cover - GPU
                          "call_match": fc1 == st["call"], "pass": not hm and main_pred[s][1] == SOTC and fc1 == st["call"]}
         tail = f[s + 1:s + 1 + a.n_free]        # continuation: the live main loop resumes on frame s+1 of the audio
         for pr in a.contracts.split(","):
-            ta, fa, silent = parse_pair(pr)
+            biased = pr.endswith("b")               # "12/22b" = the same contract + the b2 bias, same history/cache
+            ta, fa, silent = parse_pair(pr.rstrip("b"))
             bc, pre = th.clone(cache), None
             if silent:
                 tl0, fl0, bc = th.step(bc, sil, ta, fa)
@@ -479,7 +508,7 @@ def main():  # pragma: no cover - GPU
             for k in range(0 if (pre is not None and pre["func"] == SOTC) else a.n_free):
                 tl, fl, bc = th.step(bc, tail[k], ta, fa)
                 raw = None
-                if v == "b2":                         # decoding probe: post-result window only
+                if v == "b2" or biased:               # decoding probe: post-result window only
                     raw = frame_row(st["ff"] + k, tl, fl)["sotc_minus_pad"]
                     fl = fl.clone()
                     fl[SOTC] += SOTC_BIAS
@@ -523,15 +552,18 @@ def main():  # pragma: no cover - GPU
                        "pass": o.get("new_call_sotc") == states[(sc, "orig")]["ff"] + SCEN[sc]["h5"][3] and h5[2] in (o.get("new_call_text") or "")}
         rep["cells"].append(r)
         stop = None
-        if sc in ("m02_nf", "m07_chain") and "12/22" in r["contracts"]:
+        lo = SCEN[sc].get("live_outcome")
+        if "12/22" in r["contracts"] and (lo or sc in ("m02_nf", "m07_chain")):
             g = r["gate"] = gate(sc, r, rep["scenarios"][f"{sc}:orig"]["call_text"])
-            if v == "base":            # the baseline must reproduce the live behaviour, or nothing below is usable
+            if "12/22b" in r["contracts"]:
+                r["gate_b2"] = gate(sc, r, rep["scenarios"][f"{sc}:orig"]["call_text"], "12/22b")
+            if v == "base":            # the baseline must reproduce the live behaviour, or its cells are not usable
                 ff = states[(sc, "orig")]["ff"]
                 ok = bool(rep["scenarios"][f"{sc}:orig"]["V0"]["pass"]) and bool(r.get("V1", {}).get("pass"))
-                ok = ok and (g["identical_recall"] and g["recall_at"] in (ff, ff + 1) if sc == "m02_nf"
-                             else g["chain_kept"])
+                ok = ok and (g["identical_recall"] and g["recall_at"] in (ff, ff + 1) if lo == "identical_recall"
+                             else g["reply"] if lo == "reply" else g["chain_kept"])
                 r["baseline_faithful"] = ok
-                if not ok:
+                if not ok and a.stop_on_unfaithful:
                     stop = f"{sc} baseline does not reproduce the live behaviour"
             elif sc == "m07_chain" and not g["chain_kept"]:
                 stop = f"m07 lost prepare_return(C1002) under {v}"
