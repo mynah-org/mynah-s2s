@@ -60,14 +60,16 @@ def _tenant_results():
             "m02_nf": '{"order_id": "QGQ999", "found": false}'}
 
 
-def test_structure_result_keeps_fields_and_leaves_productive_results_identical():
+def test_structure_result_minimal_status_strings_only():
     import json
     res = _tenant_results()
-    for sc in ("m03_empty", "m08_vr", "m02_nf"):
+    for sc, st in (("m03_empty", "no_results"), ("m02_nf", "not_found")):
         orig, new = json.loads(res[sc]), json.loads(F.structure_result(res[sc]))
-        assert {k: new[k] for k in orig} == orig                       # meaning unchanged: every field kept
-        assert new["retry_same_call"] is False and new["next_action"] == "ask_caller"
-    assert F.structure_result(res["m07_chain"]) == res["m07_chain"]       # byte-identical: chain state untouched
+        assert {k: new[k] for k in orig} == orig and new["status"] == st          # every original field kept
+        added = {k: v for k, v in new.items() if k not in orig}
+        assert all(isinstance(v, str) and not any(ch.isdigit() for ch in v) for v in added.values())
+    assert F.structure_result(res["m08_vr"]) == res["m08_vr"]            # already has a string status
+    assert F.structure_result(res["m07_chain"]) == res["m07_chain"]      # productive: byte-identical
     assert F.structure_result("not json") == "not json"
 
 
@@ -75,8 +77,9 @@ def test_variant_prompt_and_plan():
     base = "You are the voice assistant."
     assert F.variant_prompt(base, "base") == base and F.variant_prompt(base, "p3") == base
     assert F.variant_prompt(base, "p1").endswith(F.P1_RULE) and F.variant_prompt(base, "p1p3") == F.variant_prompt(base, "p1")
-    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1"]
-    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3"]
+    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1", "orig"]
+    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3", "orig"]
+    assert "do not retry the tool call for the same request" in F.P1_RULE and F.SOTC_BIAS < 0
     assert F.parse_plan("m08_vr:A:p1,m07_chain:A", [], [], []) == [("m08_vr", "A", "p1"), ("m07_chain", "A", "base")]
     assert F.parse_plan("", ["m08_vr", "m07_chain"], ["A"], ["base", "p3"]) == [
         ("m08_vr", "A", "base"), ("m08_vr", "A", "p3"), ("m07_chain", "A", "base"), ("m07_chain", "A", "p3")]

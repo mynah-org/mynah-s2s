@@ -65,17 +65,24 @@ SCEN = {
 # ----------------------------------------------------------------------------------------------- P1 / P3 variants
 # (owner 2026-11-14, screen before any live A/B). A cell is (scenario, arm, variant):
 #   base: tenant prompt + the backend's own result string (= job 278);
-#   p1:   P1_RULE appended to the tenant system message. The prompt is prefilled from stream open and the whole
-#         history replayed in every cell (th.prefill() per cell, one Thinker per prompt): never a snapshot reuse;
-#   p3:   the result rewritten by structure_result (original fields kept, two fields appended) -> its tokens, the
-#         phase-2 length and the first free frame are recomputed; the state before the result is unchanged;
-#   p1p3: both.
+#   p1:   P1_RULE appended to the tenant system message: the two rules of NVIDIA's own default system message
+#         (offline_voicechat_fc_infer.DEFAULT_SYSTEM_MESSAGE, the most in-distribution wording we have). The prompt is
+#         prefilled from stream open and the whole history replayed in every cell (th.prefill() per cell, one Thinker
+#         per prompt): never a snapshot reuse;
+#   p3:   a negative / empty result without a string "status" gains one ("not_found" / "no_results"); every original
+#         field is kept. Strings only: the wrapper's number conversion turns a JSON bool into the string "False"
+#         (live FX1 m02: {"found": "False"}), so no bool / digit is added. Its tokens, the phase-2 length and the
+#         first free frame are recomputed; the state before the result is unchanged (prefix sha recorded);
+#   p1p3: both;
+#   b2:   decoding probe, no prompt / result change: SOTC_BIAS added to the function SOTC logit on the free frames
+#         after the result only (the post-result window), raw and biased margins both recorded. NeMo has no such knob
+#         (fc_sotc_boost is read and logged, never applied); this measures whether one would separate the cases.
 # The teacher-forced history was recorded under the original prompt: for p1 the cell measures the post-result
 # decision on that history, not whether the model would have reached it (own_text_mismatch_0_s reports that).
-VARIANTS = ("base", "p1", "p3", "p1p3")
-P1_RULE = ("You may call several tools in a row when the next call needs the result of the previous one. If a tool "
-           "result is negative, empty or asks for more information, do not call the same tool again with the same "
-           "arguments and never guess missing details: tell the caller what happened and ask them.")
+VARIANTS = ("base", "p1", "p3", "p1p3", "b2")
+P1_RULE = ("Tool-call arguments must be values the user spoke. If a required argument is missing, ask the user; never "
+           "guess. If a tool call fails or returns an error, do not retry the tool call for the same request.")
+SOTC_BIAS = -2.0
 NEGATIVE_STATUS = {"not_found", "no_results", "verification_required", "denied"}
 
 
@@ -89,15 +96,15 @@ def is_negative(r) -> bool:
 
 
 def structure_result(result: str) -> str:
-    """P3: a negative / empty / need-info result keeps every original field and gains two structured fields.
-    Productive results are returned unchanged (byte-identical), so the legitimate-chain state is not altered."""
+    """P3 (minimal): a negative / empty result with no string status gains one; every original field is kept.
+    Results that already carry a status, and productive results, are returned byte-identical."""
     try:
         r = json.loads(result)
     except (json.JSONDecodeError, TypeError):
         return result
-    if not is_negative(r):
+    if not is_negative(r) or isinstance(r.get("status"), str):
         return result
-    return json.dumps(dict(r, retry_same_call=False, next_action="ask_caller"))
+    return json.dumps(dict(r, status="no_results" if r.get("results") == [] else "not_found"))
 
 
 def result_variant(variant: str) -> str:
@@ -181,7 +188,7 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--scenarios", default="m08_vr,m03_empty,m07_chain")
     ap.add_argument("--arms", default="A,D-V2.1,C-ridge")
     ap.add_argument("--contracts", default=CONTRACTS)
-    ap.add_argument("--n-free", type=int, default=16)
+    ap.add_argument("--n-free", type=int, default=40)   # a late re-call must stay visible (16 was too short)
     ap.add_argument("--call-cap", type=int, default=48)
     ap.add_argument("--tail-s", type=float, default=4.0)
     ap.add_argument("--lead-s", type=float, default=7.0)
@@ -273,7 +280,13 @@ def main():  # pragma: no cover - GPU
                   o is not None and hist == o["hist"], "extra_result_tokens": len(resp) - (len(o["resp"]) if o else 0),
                   "unchanged_result": o is not None and resp == o["resp"]}
             v0["pass"] = v0["call_steps_equal_orig"] and v0["hist_equal_orig"]
-        states[(sc, rv)] = {"s": s, "call": call, "resp": resp, "hist": hist, "rec": rec, "sched": sched, "ff": ff,
+        prefix_sha = hashlib.sha256(json.dumps([[r["agent_in"], r["func_in"], r.get("forced_func"), r["audio"][0]]
+                                                for r in sched if r["kind"] in ("main", "fc1")]).encode()).hexdigest()[:12]
+        if rv != "orig":
+            v0["prefix_equal_orig"] = o is not None and prefix_sha == o["prefix_sha"]
+            v0["pass"] = v0["pass"] and v0["prefix_equal_orig"]
+        states[(sc, rv)] = {"prefix_sha": prefix_sha, "s": s, "call": call, "resp": resp, "hist": hist, "rec": rec,
+                            "sched": sched, "ff": ff,
                       "sha": hashlib.sha256(json.dumps([[r["agent_in"], r["func_in"], r.get("forced_func"),
                                                          r["audio"][0]] for r in sched]).encode()).hexdigest()[:12]}
         rep["scenarios"][f"{sc}:{rv}"] = {"s": s, "call_text": call_text, "result": result, "converted": conv,
@@ -389,7 +402,14 @@ def main():  # pragma: no cover - GPU
             # through real-audio main frames (decode the call on FC phase-1 inputs instead)
             for k in range(0 if (pre is not None and pre["func"] == SOTC) else a.n_free):
                 tl, fl, bc = th.step(bc, tail[k], ta, fa)
+                raw = None
+                if v == "b2":                         # decoding probe: post-result window only
+                    raw = frame_row(st["ff"] + k, tl, fl)["sotc_minus_pad"]
+                    fl = fl.clone()
+                    fl[SOTC] += SOTC_BIAS
                 rows.append(frame_row(st["ff"] + k, tl, fl))
+                if raw is not None:
+                    rows[-1]["raw_sotc_minus_pad"] = raw
                 ta, fa = rows[-1]["text"], rows[-1]["func"]
                 if fa == SOTC:
                     break
