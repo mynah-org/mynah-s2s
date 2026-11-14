@@ -45,3 +45,38 @@ def test_scenarios_declared():
     assert set(F.SCEN) == {"m03_empty", "m08_vr", "m07_chain"}
     assert F.SCEN["m08_vr"]["h5"][1] == "12/22" and F.SCEN["m07_chain"]["h5"][1] == "0/0"
     assert len(F.CONTRACTS.split(",")) == 6
+
+
+# ---------------------------------------------------------------- P1 / P3 variants (owner 2026-11-14)
+def _tenant_results():
+    import json
+    from tenant_backend import TenantBackend
+    spec = json.load(open(Path(__file__).resolve().parent / "tenant_furniture.json"))
+    be = TenantBackend(spec)
+    h = be.handlers()
+    return {"m03_empty": h["search_catalog"]({"query": "zzz qqq"}),
+            "m08_vr": TenantBackend(spec).handlers()["find_customer"]({"full_name": "Lindvik"}),
+            "m07_chain": TenantBackend(spec).handlers()["find_customer"]({"full_name": "Mario Rossi", "postcode": "20135"}),
+            "m02_nf": '{"order_id": "QGQ999", "found": false}'}
+
+
+def test_structure_result_keeps_fields_and_leaves_productive_results_identical():
+    import json
+    res = _tenant_results()
+    for sc in ("m03_empty", "m08_vr", "m02_nf"):
+        orig, new = json.loads(res[sc]), json.loads(F.structure_result(res[sc]))
+        assert {k: new[k] for k in orig} == orig                       # meaning unchanged: every field kept
+        assert new["retry_same_call"] is False and new["next_action"] == "ask_caller"
+    assert F.structure_result(res["m07_chain"]) == res["m07_chain"]       # byte-identical: chain state untouched
+    assert F.structure_result("not json") == "not json"
+
+
+def test_variant_prompt_and_plan():
+    base = "You are the voice assistant."
+    assert F.variant_prompt(base, "base") == base and F.variant_prompt(base, "p3") == base
+    assert F.variant_prompt(base, "p1").endswith(F.P1_RULE) and F.variant_prompt(base, "p1p3") == F.variant_prompt(base, "p1")
+    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1"]
+    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3"]
+    assert F.parse_plan("m08_vr:A:p1,m07_chain:A", [], [], []) == [("m08_vr", "A", "p1"), ("m07_chain", "A", "base")]
+    assert F.parse_plan("", ["m08_vr", "m07_chain"], ["A"], ["base", "p3"]) == [
+        ("m08_vr", "A", "base"), ("m08_vr", "A", "p3"), ("m07_chain", "A", "base"), ("m07_chain", "A", "p3")]

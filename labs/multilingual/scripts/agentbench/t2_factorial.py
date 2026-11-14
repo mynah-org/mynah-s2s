@@ -62,6 +62,63 @@ SCEN = {
 }
 
 
+# ----------------------------------------------------------------------------------------------- P1 / P3 variants
+# (owner 2026-11-14, screen before any live A/B). A cell is (scenario, arm, variant):
+#   base: tenant prompt + the backend's own result string (= job 278);
+#   p1:   P1_RULE appended to the tenant system message. The prompt is prefilled from stream open and the whole
+#         history replayed in every cell (th.prefill() per cell, one Thinker per prompt): never a snapshot reuse;
+#   p3:   the result rewritten by structure_result (original fields kept, two fields appended) -> its tokens, the
+#         phase-2 length and the first free frame are recomputed; the state before the result is unchanged;
+#   p1p3: both.
+# The teacher-forced history was recorded under the original prompt: for p1 the cell measures the post-result
+# decision on that history, not whether the model would have reached it (own_text_mismatch_0_s reports that).
+VARIANTS = ("base", "p1", "p3", "p1p3")
+P1_RULE = ("You may call several tools in a row when the next call needs the result of the previous one. If a tool "
+           "result is negative, empty or asks for more information, do not call the same tool again with the same "
+           "arguments and never guess missing details: tell the caller what happened and ask them.")
+NEGATIVE_STATUS = {"not_found", "no_results", "verification_required", "denied"}
+
+
+def variant_prompt(system_prompt: str, variant: str) -> str:
+    return system_prompt + " " + P1_RULE if variant in ("p1", "p1p3") else system_prompt
+
+
+def is_negative(r) -> bool:
+    return isinstance(r, dict) and ("error" in r or r.get("found") is False or r.get("results") == []
+                                    or str(r.get("status", "")).lower() in NEGATIVE_STATUS)
+
+
+def structure_result(result: str) -> str:
+    """P3: a negative / empty / need-info result keeps every original field and gains two structured fields.
+    Productive results are returned unchanged (byte-identical), so the legitimate-chain state is not altered."""
+    try:
+        r = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return result
+    if not is_negative(r):
+        return result
+    return json.dumps(dict(r, retry_same_call=False, next_action="ask_caller"))
+
+
+def result_variant(variant: str) -> str:
+    return "p3" if variant in ("p3", "p1p3") else "orig"
+
+
+def prompt_variant(variant: str) -> str:
+    return "p1" if variant in ("p1", "p1p3") else "orig"
+
+
+def parse_plan(plan: str, scenarios, arms, variants) -> list[tuple[str, str, str]]:
+    """'scenario:arm[:variant],...' (variant default base) or every scenario x arm x variant, scenario-major."""
+    if plan:
+        out = []
+        for c in plan.split(","):
+            p = c.split(":")
+            out.append((p[0], p[1], p[2] if len(p) > 2 else "base"))
+        return out
+    return [(sc, arm, v) for sc in scenarios for arm in arms for v in variants]
+
+
 # ----------------------------------------------------------------------------------------------- pure helpers
 def build_schedule(hist: list[int], s: int, call: list[int], resp: list[int]) -> list[dict]:
     """Same layout as t2_posttool.schedule (positions 0..s main, s+1.. FC phase 1, then phase 2 forced)."""
@@ -129,8 +186,9 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--tail-s", type=float, default=4.0)
     ap.add_argument("--lead-s", type=float, default=7.0)
     ap.add_argument("--budget-s", type=float, default=265.0)
-    ap.add_argument("--plan", default="", help="ordered 'scenario:arm,...' (priority order under the budget guard); "
-                                               "default: every scenario x every arm, scenario-major")
+    ap.add_argument("--variants", default="base", help="comma list of " + "/".join(VARIANTS))
+    ap.add_argument("--plan", default="", help="ordered 'scenario:arm[:variant],...' (priority order under the budget "
+                                               "guard); default: every scenario x arm x variant, scenario-major")
     a = ap.parse_args()
     T0 = time.monotonic()
     out = Path(a.out)
@@ -164,14 +222,23 @@ def main():  # pragma: no cover - GPU
     reg, be0 = ToolRegistry(), TenantBackend(spec)
     for tl in spec["tools"]:
         reg.register(tl["name"], be0.handlers()[tl["name"]], tl["description"], tl["parameters"])
-    prompt = render_prompt(reg.schemas, spec["system_prompt"])
-    assert len(prompt) == 2738, len(prompt)
-    th = Thinker(eng, prompt)
+    variants = a.variants.split(",")
+    assert all(v in VARIANTS for v in variants), variants
+    plan = parse_plan(a.plan, a.scenarios.split(","), a.arms.split(","), variants)
+    prompts, ths = {}, {}
+    for pv in sorted({prompt_variant(v) for _, _, v in plan} | {"orig"}):
+        prompts[pv] = render_prompt(reg.schemas, variant_prompt(spec["system_prompt"], "p1" if pv == "p1" else "base"))
+        ths[pv] = Thinker(eng, prompts[pv])           # own prefill embeddings; cache rebuilt per cell (prefill())
+    assert len(prompts["orig"]) == 2738, len(prompts["orig"])
+    rep["prompts"] = {pv: {"chars": len(p), "sha": hashlib.sha256(p.encode()).hexdigest()[:12],
+                           "tokens": ths[pv].P} for pv, p in prompts.items()}
+    th = ths["orig"]
     w = eng.wrapper
 
     # ---- scenario states (CPU-side: tokens, schedule, checks)
     states = {}
-    for sc in a.scenarios.split(","):
+    need_states = {(sc_, result_variant(v)) for sc_, _, v in plan} | {(sc_, "orig") for sc_, _, _ in plan}
+    for sc, rv in sorted(need_states, key=lambda x: (x[0], x[1] != "orig")):
         cfg = SCEN[sc]
         sess = trace_session(str(cfg["trace"]))
         rec, (s, fids) = frame_tokens(sess), fc_call(sess)
@@ -181,6 +248,8 @@ def main():  # pragma: no cover - GPU
         result = be.handlers()[cfg["tool"]](cfg["result_args"] or cfg["args"])
         if cfg["expect_result"] is not None:
             assert result == cfg["expect_result"], (sc, result)
+        if rv == "p3":
+            result = structure_result(result)
         wrapped = f"<TOOL_RESPONSE>[{result}]</TOOL_RESPONSE>"
         conv = w._convert_tool_response_nums_to_text(wrapped) if w._fc_convert_num_to_text else wrapped
         resp = list(w._build_fc_response_tokens(wrapped))
@@ -198,18 +267,26 @@ def main():  # pragma: no cover - GPU
         if sc != "m03_empty":
             v0["first_free_vs_trace"] = [ff, (tlen.get("consumed") or -2) + 1]
             v0["pass"] = v0["pass"] and ff == (tlen.get("consumed") or -2) + 1
-        states[sc] = {"s": s, "call": call, "resp": resp, "hist": hist, "rec": rec, "sched": sched, "ff": ff,
+        if rv != "orig":                       # lengths differ from the trace by design: check against the orig state
+            o = states[(sc, "orig")] if (sc, "orig") in states else None
+            v0 = {"call_steps_equal_orig": o is not None and call == o["call"], "hist_equal_orig":
+                  o is not None and hist == o["hist"], "extra_result_tokens": len(resp) - (len(o["resp"]) if o else 0),
+                  "unchanged_result": o is not None and resp == o["resp"]}
+            v0["pass"] = v0["call_steps_equal_orig"] and v0["hist_equal_orig"]
+        states[(sc, rv)] = {"s": s, "call": call, "resp": resp, "hist": hist, "rec": rec, "sched": sched, "ff": ff,
                       "sha": hashlib.sha256(json.dumps([[r["agent_in"], r["func_in"], r.get("forced_func"),
                                                          r["audio"][0]] for r in sched]).encode()).hexdigest()[:12]}
-        rep["scenarios"][sc] = {"s": s, "call_text": call_text, "result": result, "converted": conv,
-                                "n_resp": len(resp), "first_free": ff, "V0": v0, "schedule_sha": states[sc]["sha"],
+        rep["scenarios"][f"{sc}:{rv}"] = {"s": s, "call_text": call_text, "result": result, "converted": conv,
+                                "n_resp": len(resp), "first_free": ff, "V0": v0, "schedule_sha": states[(sc, rv)]["sha"],
                                 "trace": str(cfg["trace"])}
-        print("SCEN", sc, json.dumps(rep["scenarios"][sc]["V0"]), call_text[:80], flush=True)
+        print("SCEN", sc, rv, json.dumps(rep["scenarios"][f"{sc}:{rv}"]["V0"]), call_text[:80], flush=True)
     save()
 
-    plan = ([tuple(c.split(":")) for c in a.plan.split(",")] if a.plan
-            else [(sc, arm) for sc in states for arm in a.arms.split(",")])
-    assert all(sc in states for sc, _ in plan), plan
+    # p3 on a productive result is byte-identical to base (structure_result leaves it): run it once, as base
+    dup = [(sc, arm, v) for sc, arm, v in plan if result_variant(v) == "p3" and states[(sc, "p3")]["resp"] ==
+           states[(sc, "orig")]["resp"] and (sc, arm, "p1" if v == "p1p3" else "base") in plan]
+    rep["identical_by_construction"] = [list(p) for p in dup]
+    plan = [p for p in plan if p not in dup]
     rep["plan"] = [list(p) for p in plan]
     ARMS = {"A": "vc",
             "C-ridge": "enc=ml;att=56;rnnt=ml;ln=orig;map={R}/maps/ridge_ml_out.pt",
@@ -237,7 +314,7 @@ def main():  # pragma: no cover - GPU
             pad = torch.full((1,), PAD, dtype=torch.long, device=th.dev)
             return {"predicted_token": pad, "asr_predicted_token": pad, "function_predicted_token": pad,
                     "cache": kw.get("cache")}
-        for sc in [sc_ for sc_, arm_ in plan if arm_ == arm]:
+        for sc in sorted({sc_ for sc_, arm_, _ in plan if arm_ == arm}):
             x = load_16k(clip_path(sc))
             wav = torch.cat([torch.zeros(int(a.lead_s * 16000)), x, torch.zeros(int(a.tail_s * 16000))])
             fx = []
@@ -257,11 +334,11 @@ def main():  # pragma: no cover - GPU
             finally:
                 w.model_llm_interface, w.fusion_module.forward = orig_if, orig_fu
             feats[(arm, sc)] = torch.stack(fx)
-            need = states[sc]["s"] + 1 + a.n_free + 2
+            need = states[(sc, "orig")]["s"] + 1 + a.n_free + 2
             assert feats[(arm, sc)].shape[0] >= need, (arm, sc, feats[(arm, sc)].shape, need)
         rep["timing_s"].setdefault("capture", []).append([arm, round(time.monotonic() - t, 1)])
 
-    def decode_call(cache, sil):
+    def decode_call(th, cache, sil):
         prev, ids = SOTC, []
         for _ in range(a.call_cap):
             _, fl, cache = th.step(cache, sil, PAD, prev)
@@ -271,9 +348,10 @@ def main():  # pragma: no cover - GPU
                 break
         return ids, th.decode([i for i in ids if i != EOTC])
 
-    def run_cell(arm, sc):
+    def run_cell(arm, sc, v):
         t = time.monotonic()
-        st, f, sil = states[sc], feats[(arm, sc)], sils[arm]
+        th = ths[prompt_variant(v)]
+        st, f, sil = states[(sc, result_variant(v))], feats[(arm, sc)], sils[arm]
         s, sched = st["s"], st["sched"]
         cache = th.prefill()
         main_pred, fc1, agree, nat, lp_eotr = [], [], [], None, None
@@ -290,11 +368,12 @@ def main():  # pragma: no cover - GPU
                 lf = logp_rows(fl)
                 nat, lp_eotr = int(lf.argmax()), round(float(lf[EOTR]), 3)
         hm = [t_ for t_ in range(s + 1) if main_pred[t_][0] != st["rec"].get(t_, PAD)]
-        res = {"arm": arm, "scenario": sc, "schedule_sha": st["sha"], "nat_last": nat, "lp_EOTR_last": lp_eotr,
+        res = {"arm": arm, "scenario": sc, "variant": v, "prompt": rep["prompts"][prompt_variant(v)],
+               "n_resp": len(st["resp"]), "schedule_sha": st["sha"], "nat_last": nat, "lp_EOTR_last": lp_eotr,
                "own_sotc_at_s": main_pred[s][1] == SOTC, "own_func_pad_before_s": all(p[1] == PAD for p in main_pred[:s]),
                "own_text_mismatch_0_s": len(hm), "fc1_match": [sum(p == c for p, c in zip(fc1, st["call"])), len(st["call"])],
                "fc2_forced_agree": [sum(agree), len(agree)], "contracts": {}}
-        if SCEN[sc]["trace_arm"] == arm:
+        if SCEN[sc]["trace_arm"] == arm and v == "base":
             res["V1"] = {"text_mismatch": hm[:20], "sotc_at_s": main_pred[s][1] == SOTC,
                          "call_match": fc1 == st["call"], "pass": not hm and main_pred[s][1] == SOTC and fc1 == st["call"]}
         tail = f[s + 1:s + 1 + a.n_free]        # continuation: the live main loop resumes on frame s+1 of the audio
@@ -319,7 +398,7 @@ def main():  # pragma: no cover - GPU
             if pre is not None and pre["func"] == SOTC:
                 o["first"], o["new_call_sotc"] = "new_call", "silent_step"
             if o["first"] == "new_call":
-                o["new_call_ids"], o["new_call_text"] = decode_call(bc, sil)
+                o["new_call_ids"], o["new_call_text"] = decode_call(th, bc, sil)
             o["reply_text"] = th.decode(o.pop("reply_ids"))
             res["contracts"][pr] = {"silent_step": pre, "first_frame": rows[0] if rows else pre, "frames": rows[:6],
                                     "outcome": o}
@@ -327,9 +406,9 @@ def main():  # pragma: no cover - GPU
         return res
 
     costs = {}
-    for i, (sc, arm) in enumerate(plan):
+    for i, (sc, arm, v) in enumerate(plan):
         need_cap = arm not in sils
-        n_clips = len({sc_ for sc_, arm_ in plan if arm_ == arm})
+        n_clips = len({sc_ for sc_, arm_, _ in plan if arm_ == arm})
         est = costs.get(sc, FIRST_CELL_S.get(sc, 45.0)) * 1.1 + (8.0 * n_clips if need_cap else 0.0)
         if time.monotonic() - T0 + est > a.budget_s:
             rep["skipped"] = [list(p) for p in plan[i:]]
@@ -337,18 +416,18 @@ def main():  # pragma: no cover - GPU
             break
         if need_cap:
             capture(arm)
-        r = run_cell(arm, sc)
+        r = run_cell(arm, sc, v)
         costs[sc] = max(costs.get(sc, 0.0), r["s"])
         h5 = SCEN[sc]["h5"]
-        if h5 and h5[0] == arm:
+        if h5 and h5[0] == arm and v == "base":
             c = r["contracts"].get(h5[1], {})
             o = c.get("outcome", {})
-            r["H5"] = {"contract": h5[1], "new_call_sotc": o.get("new_call_sotc"), "expect_sotc": states[sc]["ff"] + SCEN[sc]["h5"][3],
+            r["H5"] = {"contract": h5[1], "new_call_sotc": o.get("new_call_sotc"), "expect_sotc": states[(sc, "orig")]["ff"] + SCEN[sc]["h5"][3],
                        "new_call_text": o.get("new_call_text"), "expect_tool": h5[2],
-                       "pass": o.get("new_call_sotc") == states[sc]["ff"] + SCEN[sc]["h5"][3] and h5[2] in (o.get("new_call_text") or "")}
+                       "pass": o.get("new_call_sotc") == states[(sc, "orig")]["ff"] + SCEN[sc]["h5"][3] and h5[2] in (o.get("new_call_text") or "")}
         rep["cells"].append(r)
         save()
-        print(f"{sc:10} {arm:8} V1={r.get('V1', {}).get('pass')} H5={r.get('H5', {}).get('pass')} ({r['s']}s)", flush=True)
+        print(f"{sc:10} {arm:8} {v:5} V1={r.get('V1', {}).get('pass')} H5={r.get('H5', {}).get('pass')} ({r['s']}s)", flush=True)
         for pr, c in r["contracts"].items():
             o = c["outcome"]
             print(f"   {pr:7} m0={c['first_frame']['sotc_margin']:+.2f} first={o['first']} sotc={o['new_call_sotc']} "
