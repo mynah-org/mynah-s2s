@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import collections
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -176,11 +177,93 @@ NEXT_STEP = {
 }
 
 
+# ------------------------------------------------------------------ ASR shadow (observe only, never acts)
+_DIG = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+        "seven": "7", "eight": "8", "nine": "9"}
+_STOP = {"a", "i", "is", "my", "the", "and", "it", "to", "of", "me", "you", "do", "be", "on", "at", "in", "an", "or",
+         "so", "we", "he", "she", "its", "can", "hi", "ok", "um", "uh"}
+_NEG = re.compile(r"\b(don'?t|do not|not|no|never|without|never mind)\b")
+_TRANSFER = re.compile(r"\b(operator|human|real person|a person|someone|an agent|representative)\b")
+_TRANSFER_VERB = re.compile(r"\b(speak|talk|transfer|connect|put me through)\b")
+
+
+def spoken_canon(s: str) -> str:
+    """Spoken id / number -> canonical form: digit words -> digits, single letters and short letter runs kept
+    ("Wxy six one five" -> WXY615); filler words dropped."""
+    out = []
+    for w in re.findall(r"[a-z]+|\d", str(s).lower()):
+        if w in _DIG:
+            out.append(_DIG[w])
+        elif w.isdigit():
+            out.append(w)
+        elif len(w) <= 3 and w not in _STOP:
+            out.append(w)
+    return "".join(out).upper()
+
+
+def id_like(v) -> bool:
+    """A value worth checking against the caller's speech: has a digit, or is a short code (no spaces)."""
+    v = str(v)
+    return bool(re.search(r"\d", v)) or (" " not in v.strip() and 3 <= len(v.strip()) <= 10 and v.strip().isalnum()
+                                          and not v.strip().isalpha())
+
+
+class AsrShadow:
+    """Caller ASR (the Thinker's ASR channel as the session traces it) kept per session, bounded, to compare with the
+    function head's decisions. OBSERVE ONLY: it annotates the guard's decisions and records intents; it never
+    refuses, executes or changes a call."""
+
+    def __init__(self, intent_tools: dict[str, str] | None = None, max_chars: int = 4000):
+        self.intent_tools = intent_tools or {}           # e.g. {"transfer": "escalate_to_human"}
+        self.max_chars = max_chars
+        self.segments: collections.deque[tuple[int | None, str]] = collections.deque()
+        self.n_chars = 0
+        self.intents: list[dict] = []
+
+    def add(self, text: str, model_step: int | None = None) -> None:
+        self.segments.append((model_step, text))
+        self.n_chars += len(text)
+        while self.n_chars > self.max_chars and self.segments:
+            self.n_chars -= len(self.segments.popleft()[1])
+        heard = self.text()
+        for sentence in re.split(r"[.?!]", heard)[-3:]:
+            t = sentence.lower()
+            m = _TRANSFER.search(t)
+            if m and _TRANSFER_VERB.search(t) and not any(i["intent"] == "transfer" and i["evidence"] == t.strip()
+                                                          for i in self.intents):
+                neg = bool(_NEG.search(t[:m.end()]))
+                self.intents.append({"intent": "transfer", "evidence": t.strip(), "negated": neg,
+                                     "model_step": model_step, "expected": self.intent_tools.get("transfer"),
+                                     "fulfilled": False if not neg else None})
+
+    def text(self) -> str:
+        return "".join(t for _, t in self.segments)
+
+    def slot_check(self, args: dict) -> dict:
+        heard = spoken_canon(self.text())
+        out = {}
+        for k, v in (args or {}).items():
+            if isinstance(v, str) and id_like(v):
+                cv = "".join(ch for ch in v if ch.isalnum()).upper()     # the call's value is a code, not speech
+                out[k] = "match" if cv and cv in heard else "mismatch" if heard else "absent"
+        return out
+
+    def on_call(self, name: str) -> None:
+        for i in self.intents:
+            if i.get("expected") == name and i["fulfilled"] is False:
+                i["fulfilled"] = True
+
+    def report(self) -> dict:
+        return {"asr_chars": self.n_chars, "intents": list(self.intents),
+                "unfulfilled": [i for i in self.intents if i["fulfilled"] is False]}
+
+
 class CallGuard:
     def __init__(self, schemas: list[dict] | dict | None = None, session_id: str = "", ledger=None,
                  classify: Callable[[str | None], str] = default_outcome, max_unproductive: int = 2,
                  max_active: int = 1, ttl_s: float = 120.0, max_entries: int = 64,
-                 side_effects: dict[str, str | None] | None = None, max_issued: int = 512, clock=time.monotonic_ns):
+                 side_effects: dict[str, str | None] | None = None, max_issued: int = 512, clock=time.monotonic_ns,
+                 asr_shadow: AsrShadow | None = None):
         """schemas: the registry's tool schemas (``ToolRegistry.schemas`` list, or {name: parameters}).
         side_effects: {tool: idempotency-key parameter or None} for tools that change state (never re-run blindly).
         ledger: the session's ToolLedger (optional) to link call ids and see timed-out backends still running."""
@@ -201,12 +284,15 @@ class CallGuard:
         self._neg, self._ref, self._budget_epoch = 0, 0, 0
         self.log: collections.deque[dict] = collections.deque(maxlen=max_entries * 4)
         self.closed = False
+        self.asr = asr_shadow                    # optional ASR shadow (observe only)
 
     # ---- inputs
-    def on_user_text(self, text: str) -> None:
+    def on_user_text(self, text: str, model_step: int | None = None) -> None:
         if text and any(ch.isalnum() for ch in text):
             with self.lock:
                 self.input_epoch += 1
+                if self.asr is not None:
+                    self.asr.add(text, model_step)
 
     def close(self) -> None:
         """Session close / teardown: free every entry. Open ledger calls are cancelled by the controller."""
@@ -248,6 +334,9 @@ class CallGuard:
                             and k in args]
             if caller_slots:
                 audit["caller_slots_unchecked"] = caller_slots
+            if self.asr is not None:              # shadow: annotate only, the decision below ignores it
+                audit["asr_slots"] = self.asr.slot_check(args)
+                self.asr.on_call(name)
             same_any = self.reg.find(name, canon, None, {PENDING, COMPLETED, TIMED_OUT})
             in_flight = same_any is not None and (same_any.state == PENDING or
                                                   (same_any.state == TIMED_OUT and self._backend_running(same_any)))
@@ -386,5 +475,10 @@ def summary(guard: CallGuard) -> dict:
     for r in log:
         if not r["allow"]:
             by_rule[r["rule"]] = by_rule.get(r["rule"], 0) + 1
-    return {"decisions": log, "admitted": sum(r["allow"] for r in log), "refused": by_rule,
-            "input_epoch": guard.input_epoch, "entries_left": len(guard.reg.entries())}
+    out = {"decisions": log, "admitted": sum(r["allow"] for r in log), "refused": by_rule,
+           "input_epoch": guard.input_epoch, "entries_left": len(guard.reg.entries())}
+    if guard.asr is not None:
+        out["asr_shadow"] = guard.asr.report()
+        out["asr_slot_mismatches"] = [{"tool": r["tool"], "args": r["args"], "asr_slots": r.get("asr_slots")}
+                                      for r in log if any(v == "mismatch" for v in (r.get("asr_slots") or {}).values())]
+    return out

@@ -113,7 +113,16 @@ SCEN["m07_chain"]["live_outcome"] = "chain"
 #         (fc_sotc_boost is read and logged, never applied); this measures whether one would separate the cases.
 # The teacher-forced history was recorded under the original prompt: for p1 the cell measures the post-result
 # decision on that history, not whether the model would have reached it (own_text_mismatch_0_s reports that).
-VARIANTS = ("base", "p1", "p3", "p1p3", "b2", "typed")
+VARIANTS = ("base", "p1", "p3", "p1p3", "b2", "typed", "app", "appnt")
+# explicit application contract for tools (owner 2026-11-14, configurability workstream B), appended to the tenant
+# system message or to NVIDIA's default message; "appnt" adds the text "/no_think" (a plain prompt string here: the
+# VoiceChat checkpoint has no reasoning mode, this only tests whether the string changes behaviour)
+APP_CONTRACT = ("Rules for tools: make at most one tool call at a time and wait for its result. You may call another "
+                "tool when it needs the result of the previous one, for example an id the previous tool returned. "
+                "Never repeat a call with the same arguments unless the caller gives new information. Never invent "
+                "ids or required details; if one is missing or unclear, ask the caller. If a tool finds nothing, tell "
+                "the caller and ask what to do next. Only help with the tasks your tools support; politely decline "
+                "anything else.")
 P1_RULE = ("Tool-call arguments must be values the user spoke. If a required argument is missing, ask the user; never "
            "guess. If a tool call fails or returns an error, do not retry the tool call for the same request.")
 SOTC_BIAS = -2.0
@@ -121,7 +130,11 @@ NEGATIVE_STATUS = {"not_found", "no_results", "verification_required", "denied"}
 
 
 def variant_prompt(system_prompt: str, variant: str) -> str:
-    return system_prompt + " " + P1_RULE if variant in ("p1", "p1p3") else system_prompt
+    if variant in ("p1", "p1p3"):
+        return system_prompt + " " + P1_RULE
+    if variant in ("app", "appnt"):
+        return system_prompt + "\n\n" + APP_CONTRACT + (" /no_think" if variant == "appnt" else "")
+    return system_prompt
 
 
 def is_negative(r) -> bool:
@@ -186,7 +199,7 @@ def gate(sc: str, cell: dict, call_text: str, contract: str = "12/22") -> dict:
 
 
 def prompt_variant(variant: str) -> str:
-    return "p1" if variant in ("p1", "p1p3") else "orig"
+    return "p1" if variant in ("p1", "p1p3") else variant if variant in ("app", "appnt") else "orig"
 
 
 def parse_plan(plan: str, scenarios, arms, variants) -> list[tuple[str, str, str]]:
@@ -319,10 +332,12 @@ def main():  # pragma: no cover - GPU
     reg_e.schemas += fcmod.DEFAULT_TOOLS
     prompts, ths = {}, {}
     for f_, pv in sorted({(fam(sc), prompt_variant(v)) for sc, _, v in plan} | {("tenant", "orig")}):
-        prompts[(f_, pv)] = (render_prompt(reg.schemas, variant_prompt(spec["system_prompt"], "p1" if pv == "p1" else "base"))
-                             if f_ == "tenant" else render_prompt(reg_e.schemas, fcmod.DEFAULT_SYSTEM_MESSAGE))
+        pvar = pv if pv in ("p1", "app", "appnt") else "base"
+        prompts[(f_, pv)] = (render_prompt(reg.schemas, variant_prompt(spec["system_prompt"], pvar)) if f_ == "tenant"
+                             else render_prompt(reg_e.schemas, variant_prompt(fcmod.DEFAULT_SYSTEM_MESSAGE, pvar)))
         ths[(f_, pv)] = Thinker(eng, prompts[(f_, pv)])   # own prefill embeddings; cache rebuilt per cell (prefill())
     assert len(prompts[("tenant", "orig")]) == 2738, len(prompts[("tenant", "orig")])
+    rep["prompt_text_tail"] = {f"{f_}:{pv}": p[-700:] for (f_, pv), p in prompts.items()}
     if ("engine", "orig") in prompts:                      # = the live FX1 prompt (session.opened / NeMo log)
         assert len(prompts[("engine", "orig")]) == 3366 and ths[("engine", "orig")].P == 789, (
             len(prompts[("engine", "orig")]), ths[("engine", "orig")].P)

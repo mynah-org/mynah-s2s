@@ -354,3 +354,55 @@ def test_install_wraps_and_restores_the_engine_executor():
     assert s["admitted"] == 1 and s["refused"] == {"repeat": 1}
     un()
     assert pipe._execute_tool_call is orig and g.closed
+
+
+# ------------------------------------------------------------------ ASR shadow (observe only), ASR text from the traces
+def _shadow_guard(**kw):
+    from mynah_v2.agent.call_guard import AsrShadow
+    return CallGuard(asr_shadow=AsrShadow(intent_tools={"transfer": "escalate_to_human"}), **kw)
+
+
+def test_asr_shadow_slot_checks_on_measured_sessions():
+    cases = [  # (caller ASR as traced, call args, expected per-slot verdict)        live truth
+        ("you check order Wxy six one five.", {"order_id": "WXYY615"}, "mismatch"),   # spoken WXY615: call wrong
+        ("you check order Wxy six one five.", {"order_id": "WXY615"}, "match"),
+        ("my name is Marco Ricci,postcode two zero one two one.", {"postcode": "20012-001"}, "mismatch"),  # call wrong
+        ("my name is Mario Rossi and my postcode is one hundred one two one.", {"postcode": "10121"}, "mismatch"),
+        ("I want to return the bookcase eyebought.Mario Rosie, postcode two zero one three five.",
+         {"postcode": "20135"}, "match"),
+    ]
+    for asr, args, want in cases:
+        g = _shadow_guard()
+        g.on_user_text(asr, model_step=100)
+        d = g.admit("get_order_status", args)
+        assert d.allow                                              # shadow never refuses
+        assert list(g.log[-1]["asr_slots"].values()) == [want], (asr, args)
+    g = _shadow_guard()
+    g.on_user_text("Mario Rossi")
+    g.admit("find_customer", {"full_name": "Mario Rossi"})
+    assert g.log[-1]["asr_slots"] == {}                             # names are not id-like: not checked
+
+
+def test_asr_shadow_transfer_intent_fulfilled_negated_and_absent():
+    from mynah_v2.agent.call_guard import summary
+    g = _shadow_guard()
+    g.on_user_text("I'd like to speak to an operator, please.", model_step=60)
+    r = summary(g)["asr_shadow"]
+    assert [i["intent"] for i in r["unfulfilled"]] == ["transfer"]          # m04: promised, never called
+    g.admit("escalate_to_human", {"reason": "operator"})
+    assert summary(g)["asr_shadow"]["unfulfilled"] == []
+    n = _shadow_guard()
+    n.on_user_text("I don't want to talk to an operator, just check my order.")
+    i = summary(n)["asr_shadow"]["intents"]
+    assert i and i[0]["negated"] and i[0]["fulfilled"] is None and not summary(n)["asr_shadow"]["unfulfilled"]
+    for text in ("I want to know where my order is, but I don't remember the order number",
+                 "I was going to ask about an order, but never mind. Give me a random number between one and five."):
+        o = _shadow_guard()
+        o.on_user_text(text)
+        assert summary(o)["asr_shadow"]["intents"] == []
+
+
+def test_asr_shadow_never_changes_a_decision():
+    seq = [("user", "where is my order? Q, Q, nine, nine, nine.")] + [("get_order_status", {"order_id": "qgq999"},
+                                                                       NF("qgq999"))] * 5
+    assert run(CallGuard(), seq) == run(_shadow_guard(), seq)

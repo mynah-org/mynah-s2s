@@ -252,6 +252,8 @@ def main():
                     help="force the post-FC runtime fix flags to 0 (lab default is already OFF since 2026-11-12 14:30)")
     ap.add_argument("--call-guard", action="store_true",
                     help="EXPERIMENT: engine call registry + admission control in front of the executor; default off")
+    ap.add_argument("--asr-shadow", action="store_true",
+                    help="EXPERIMENT (with --call-guard): compare call slots / intents with the caller ASR, observe only")
     ap.add_argument("--fc-resume-by-label", default="",
                     help="'label=pad_pad|label=pad_eotr|label=eotr_step|label=off': re-arm the engine fc_ctx_fix per plan label")
     ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
@@ -377,15 +379,17 @@ def main():
 
             guard = None
             if a.call_guard:                   # EXPERIMENT (engine call_guard), metadata outside the schemas
-                from mynah_v2.agent.call_guard import CallGuard
-                guard = CallGuard(TENANT_GUARD["schemas"], session_id=sid, side_effects=TENANT_GUARD["side_effects"])
+                from mynah_v2.agent.call_guard import AsrShadow, CallGuard
+                guard = CallGuard(TENANT_GUARD["schemas"], session_id=sid, side_effects=TENANT_GUARD["side_effects"],
+                                  asr_shadow=AsrShadow(intent_tools={"transfer": "escalate_to_human"})
+                                  if a.asr_shadow else None)
 
             def emit(ev, _emit=_emit, **kw):  # instance-level hook, no V2 code change
                 if ev == "asr.generated" and _re.search(r"[A-Za-z]", kw.get("text", "")):
                     act["n"] += 1
                     act["said"].append(kw.get("text", ""))
                 if ev == "asr.generated" and guard is not None:
-                    guard.on_user_text(kw.get("text", ""))
+                    guard.on_user_text(kw.get("text", ""), kw.get("model_step"))
                 if ev == "function.started":
                     act["fstart"].append(kw.get("model_step"))
                 return _emit(ev, **kw)

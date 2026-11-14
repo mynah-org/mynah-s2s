@@ -110,6 +110,8 @@ def main():
     ap.add_argument("--call-guard", action="store_true",
                     help="EXPERIMENT: per-session call registry + admission control in front of the executor "
                          "(mynah_v2.agent.call_guard); default off")
+    ap.add_argument("--asr-shadow", action="store_true",
+                    help="EXPERIMENT (with --call-guard): compare call slots with the caller ASR, observe only")
     ap.add_argument("--override", action="append", default=[], help="cfg key=value (OmegaConf dotlist)")
     presets.add_determinism_args(ap)
     ap.add_argument("--no-llm-cache", action="store_true",
@@ -258,13 +260,13 @@ def main():
             torch.cuda.manual_seed_all(a.seed)
         guard, guard_un = None, None
         if a.call_guard:                       # EXPERIMENT: refusals answer the model, the backend never sees them
-            from mynah_v2.agent.call_guard import CallGuard, install
-            guard = CallGuard(session_id=stem, ledger=led)
+            from mynah_v2.agent.call_guard import AsrShadow, CallGuard, install
+            guard = CallGuard(session_id=stem, ledger=led, asr_shadow=AsrShadow() if a.asr_shadow else None)
             _emit = tr.emit
 
             def _guard_emit(ev, _emit=_emit, _g=guard, **kw):   # caller speech (RNN-T user text) = new input epoch
                 if ev == "asr.generated":
-                    _g.on_user_text(kw.get("text", ""))
+                    _g.on_user_text(kw.get("text", ""), kw.get("model_step"))
                 return _emit(ev, **kw)
             tr.emit = _guard_emit
             guard_un = install(eng, guard, tracer=tr)
@@ -336,6 +338,13 @@ def main():
             "llm_cache": cache_info, "thinker_quant": quant_info, "perf_profile": perf_info,
             "preset": {"name": a.preset, **preset_info}, "determinism": det_info,
             "call_guard": cg,
+            "sampling": {k: (sorted(v) if isinstance(v, set) else v) for k, v in (
+                ("temperature", getattr(getattr(eng.wrapper, "model_llm_interface", None), "temperature", None)),
+                ("top_p", getattr(getattr(eng.wrapper, "model_llm_interface", None), "top_p", None)),
+                ("repetition_penalty", getattr(getattr(eng.wrapper, "model_llm_interface", None), "repetition_penalty",
+                                               None)),
+                ("special_token_ids", getattr(getattr(eng.wrapper, "model_llm_interface", None), "special_token_ids",
+                                              None)))},
         }
         summ["token_ids"] = {"text": list(sess.text_ids), "func": list(sess.func_ids)}
         if tt is not None:
