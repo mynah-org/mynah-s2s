@@ -112,3 +112,26 @@ def test_prefill_dispatch_is_thread_local_across_overlapping_sessions():
     assert seen["A_other_thread"] == {"real": True} and seen["B_other_thread"] == {"real": True}
     assert isinstance(e.wrapper.model_llm_interface, F._Dispatch)
     assert e.wrapper.model_llm_interface(torch.zeros(1, 1, 4), cache=1) == {"real": True}
+
+
+def test_min_rows_kernel_pins_one_autotune_key(monkeypatch):
+    """The FC continuation pins the W8 batched kernel at MP=16 for every chunk size (one Triton autotune key)."""
+    import torch
+    from mynah_v2.model import wo_gemv
+
+    seen = []
+
+    class _K:
+        def __getitem__(self, grid):
+            def launch(x, q, s, y, M, N, K, MP, FP8):
+                seen.append((M, MP))
+            return launch
+
+    monkeypatch.setattr(wo_gemv, "_KERNELS", {"w8": _K(), "cdiv": lambda a, b: -(-a // b)})
+    p = {"fmt": "w8", "q": torch.zeros(4, 8, dtype=torch.int8), "scale": torch.ones(4)}
+    wo_gemv.gemv(torch.zeros(1, 3, 8), p)
+    with wo_gemv.min_rows_kernel(16):
+        wo_gemv.gemv(torch.zeros(1, 3, 8), p)
+        wo_gemv.gemv(torch.zeros(1, 1, 8), p)
+    wo_gemv.gemv(torch.zeros(1, 1, 8), p)
+    assert seen == [(3, 4), (3, 16), (1, 16), (1, 1)]

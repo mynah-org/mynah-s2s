@@ -32,6 +32,8 @@ import threading
 
 import torch
 
+from . import wo_gemv
+
 
 # ------------------------------------------------------------------------------------------------ continuation forward
 def _mamba_continue(m, x: torch.Tensor, cache, mod) -> torch.Tensor:
@@ -84,8 +86,13 @@ def continuation_forward(llm, embeds: torch.Tensor, cache, chunk: int | None = 1
     if embeds.shape[0] != 1:
         raise ValueError("continuation_forward is B=1")
     if chunk is not None and embeds.shape[1] > chunk:
-        outs = [continuation_forward(llm, embeds[:, i:i + chunk], cache) for i in range(0, embeds.shape[1], chunk)]
+        outs = [continuation_forward(llm, embeds[:, i:i + chunk], cache, chunk=None) for i in range(0, embeds.shape[1], chunk)]
         return torch.cat(outs, 1)
+    with wo_gemv.min_rows_kernel(wo_gemv.MAX_BATCHED_M):     # one Triton autotune key (MP=16), warmed at enable
+        return _continuation_rows(llm, embeds, cache)
+
+
+def _continuation_rows(llm, embeds: torch.Tensor, cache) -> torch.Tensor:
     mod = sys.modules[type(llm).__module__]
     pos = int(getattr(cache, "_v2_pos", 0))
     if pos <= 0:
@@ -225,8 +232,15 @@ def enable(engine, chunk: int | None = 16) -> dict:
         if instrumented:
             engine._instrument_fc()
     w._v2_p2pre.__v2_on__ = True
+    warm = None
+    llm = getattr(getattr(getattr(w, "model", None), "stt_model", None), "llm", None)
+    if llm is not None and getattr(engine, "_v2_p2pre_warm", None) is None:
+        try:                        # W8/F8 batched kernel at MP=16: autotune now, not inside the first FC (~20 s/MP)
+            warm = engine._v2_p2pre_warm = wo_gemv.warm(llm, wo_gemv.MAX_BATCHED_M)
+        except Exception as e:      # noqa: BLE001  (no CUDA / no triton: the first continuation tunes instead)
+            warm = engine._v2_p2pre_warm = {"error": repr(e)[:200]}
     return {"note": "FC phase 2 as one Thinker continuation forward (deferred forced steps)", "chunk": chunk,
-            "stats": stats}
+            "warm": warm if warm is not None else getattr(engine, "_v2_p2pre_warm", None), "stats": stats}
 
 
 def disable(engine) -> None:

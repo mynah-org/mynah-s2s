@@ -15,6 +15,10 @@ Not used by REFERENCE; serving use only after the precision gate.
 
 from __future__ import annotations
 
+import contextlib
+import threading
+import time
+
 import torch
 
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -193,6 +197,40 @@ def _build():
 
 MAX_BATCHED_M = 16          # batched-decode rows per launch (B sessions); more rows (prompt prefill) → dequant matmul
 
+_TLS = threading.local()
+
+
+@contextlib.contextmanager
+def min_rows_kernel(mp: int = MAX_BATCHED_M):
+    """Within the block (this thread only), w8/f8 launches use at least ``mp`` rows of the batched kernel (masked).
+    Triton autotunes once per MP; a caller with a variable row count (the FC phase-2 continuation: 16-row chunks plus
+    a remainder) pins one MP so that only one autotune key is ever hit, and that one can be warmed at load."""
+    prev = getattr(_TLS, "min_mp", 1)
+    _TLS.min_mp = max(prev, mp)
+    try:
+        yield
+    finally:
+        _TLS.min_mp = prev
+
+
+def warm(module: torch.nn.Module, mp: int = MAX_BATCHED_M) -> dict:
+    """Run the batched kernel once per distinct (fmt, N, K, dtype) WOLinear under ``module`` with ``mp`` rows, so that
+    Triton's autotune for that MP happens now (load) and not on the first call that needs it."""
+    seen, t0 = set(), time.perf_counter()
+    for m in module.modules():
+        if not isinstance(m, WOLinear) or m.fmt not in ("w8", "f8"):
+            continue
+        key = (m.fmt, m.out_features, m.in_features, m.weight.dtype, m.weight.device)
+        if key in seen:
+            continue
+        seen.add(key)
+        x = torch.zeros(1, mp, m.in_features, dtype=m.weight.dtype, device=m.weight.device)
+        with torch.no_grad(), min_rows_kernel(mp):
+            m(x)
+    if seen and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return {"shapes": len(seen), "mp": mp, "warm_s": round(time.perf_counter() - t0, 2)}
+
 
 def gemv(x: torch.Tensor, p) -> torch.Tensor:
     """x: (..., K) on CUDA; returns (..., N) in x.dtype. w8/f8: true batched kernel for up to MAX_BATCHED_M rows per
@@ -213,6 +251,7 @@ def gemv(x: torch.Tensor, p) -> torch.Tensor:
         x2 = x2.contiguous()
         y = torch.empty(mrows, n, device=x.device, dtype=x.dtype)
         mp = 1 << (mrows - 1).bit_length()                # 1, 2, 4, 8, 16
+        mp = min(max(mp, getattr(_TLS, "min_mp", 1)), MAX_BATCHED_M)
         grid = lambda meta: (_KERNELS["cdiv"](n, meta["BN"]),)  # noqa: E731
         _KERNELS["w8"][grid](x2, p["q"], p["scale"], y, mrows, n, k, MP=mp, FP8=(f == "f8"))
         return y.reshape(*x.shape[:-1], n)
