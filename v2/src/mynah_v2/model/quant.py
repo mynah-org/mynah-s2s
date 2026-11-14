@@ -886,10 +886,13 @@ def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
     decoder = getattr(codec, "decoder", None) if codec is not None else None
     if decoder is not None:
         roots["codec_pointwise"] = decoder
-    device = str(next(model.parameters()).device)
+    device = next(model.parameters()).device
     from safetensors.torch import load_file
-    tensors = load_file(str(path), device=device)
-    missing, replacements = [], []
+    # Keep the 9.6 GB Q8 bundle on host memory while the live checkpoint is
+    # being replaced.  Loading all tensors directly to CUDA peaks above the
+    # GB10 unified-memory budget before the old BF16 modules can be released.
+    tensors = load_file(str(path), device="cpu")
+    missing, plan = [], []
     for spec in manifest.get("modules", []):
         root_name, name = spec.get("root"), spec.get("name", "")
         root = roots.get(root_name)
@@ -904,6 +907,8 @@ def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
         try:
             q = tensors[spec["q_key"]]
             scale = tensors[spec["scale_key"]]
+            if q.dtype != torch.int8 or scale.dtype != torch.float32:
+                raise ValueError("Q8 bundle tensor dtype mismatch")
             if spec.get("kind") == "pointwise_conv1d":
                 if not isinstance(current, torch.nn.Conv1d):
                     raise ValueError("not nn.Conv1d")
@@ -916,29 +921,47 @@ def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
                     lin.weight.copy_(current.weight[:, :, 0])
                     if current.bias is not None:
                         lin.bias.copy_(current.bias)
-                replacement = W8PointwiseConv1d.__new__(W8PointwiseConv1d)
-                torch.nn.Module.__init__(replacement)
-                replacement.linear = WOLinear.from_packed(lin, q, scale, fmt=spec.get("fmt", "w8"))
-                replacement.in_channels, replacement.out_channels = current.in_channels, current.out_channels
+                # Keep only the live Conv1d shape in the validation plan; the
+                # actual Q8 tensors are moved just before this module swaps.
+                plan.append((root, name, current, "pointwise", spec, None))
+                continue
             else:
                 if not isinstance(current, torch.nn.Linear):
                     raise ValueError("not nn.Linear")
                 if (current.in_features != spec["in_features"] or current.out_features != spec["out_features"]):
                     raise ValueError("linear shape mismatch")
-                replacement = WOLinear.from_packed(current, q, scale, fmt=spec.get("fmt", "w8"))
+                plan.append((root, name, current, "linear", spec, None))
+                continue
         except (KeyError, TypeError, ValueError) as exc:
             missing.append(f"{root_name}.{name} ({exc})")
             continue
-        replacements.append((root, name, replacement))
     if missing and strict:
         raise RuntimeError("w8 bundle validation failed: " + "; ".join(missing[:8]))
-    for root, name, replacement in replacements:
-        _replace_child(root, name, replacement)
-    if not replacements:
+    if not plan:
         raise RuntimeError("w8 bundle did not replace any module")
+    # All manifest/shape validation is complete.  Transfer and install one
+    # module at a time so releasing its BF16 parent can make room for its Q8
+    # replacement instead of creating a full-model CUDA peak.
+    for root, name, current, kind, spec, lin in plan:
+        q = tensors[spec["q_key"]].to(device)
+        scale = tensors[spec["scale_key"]].to(device)
+        if kind == "pointwise":
+            lin = torch.nn.Linear(current.in_channels, current.out_channels, bias=current.bias is not None,
+                                  device=current.weight.device, dtype=current.weight.dtype)
+            with torch.no_grad():
+                lin.weight.copy_(current.weight[:, :, 0])
+                if current.bias is not None:
+                    lin.bias.copy_(current.bias)
+            replacement = W8PointwiseConv1d.__new__(W8PointwiseConv1d)
+            torch.nn.Module.__init__(replacement)
+            replacement.linear = WOLinear.from_packed(lin, q, scale, fmt=spec.get("fmt", "w8"))
+            replacement.in_channels, replacement.out_channels = current.in_channels, current.out_channels
+        else:
+            replacement = WOLinear.from_packed(current, q, scale, fmt=spec.get("fmt", "w8"))
+        _replace_child(root, name, replacement)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return {"path": str(path), "modules": len(replacements), "skipped": missing,
+    return {"path": str(path), "modules": len(plan), "skipped": missing,
             "format": W8_BUNDLE_FORMAT, "weight_only": manifest.get("weight_only", False),
             "unsupported_scopes": manifest.get("unsupported_scopes", [])}
 # End of quantization helpers.

@@ -50,7 +50,11 @@ def _w8_lstm_kernel():
                         mask=valid[None, :, None] & mk[None, None, :], other=0).to(tl.float32)
             hv = tl.load(h + b * H + k, mask=mk, other=0.0).to(tl.float32)
             acc += tl.sum(w * hv[None, None, :], axis=2) * tl.load(shh + n, mask=valid[None, :], other=0.0).to(tl.float32)
-        gi, gf, gg, go = acc[0], acc[1], acc[2], acc[3]
+        gate_idx = tl.arange(0, 4)[:, None]
+        gi = tl.sum(tl.where(gate_idx == 0, acc, 0.0), axis=0)
+        gf = tl.sum(tl.where(gate_idx == 1, acc, 0.0), axis=0)
+        gg = tl.sum(tl.where(gate_idx == 2, acc, 0.0), axis=0)
+        go = tl.sum(tl.where(gate_idx == 3, acc, 0.0), axis=0)
         fi = 1.0 / (1.0 + tl.exp(-gi))
         ff = 1.0 / (1.0 + tl.exp(-gf))
         fo = 1.0 / (1.0 + tl.exp(-go))
