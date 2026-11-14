@@ -54,7 +54,7 @@ Parity methods (`scripts/parity_driver.py`, `scripts/cache_parity.py`, `tests/gp
 | 26 | TTS interruption embedding + fixed silence frame (§2.3) | codec silence codes substituted on EOS (ckpt `inference_force_speech_silence_on_eos: true`) and optionally on idle PAD (`inference_force_speech_silence_on_pad`, env-gated, off) | via engine; `set_tts_pad_silence` per session (ENHANCED opt-in) | cpu knob test; **gpu B8 + ASR**: knob ON cut the end of an answer ("how about you" lost); REFERENCE run without babble this time | — | **TESTED (1 run per arm)**: knob not adopted; babble rate not measured |
 | 27 | Causal codec with CUDA graphs, 22.05 kHz out (§2.3) | wrapper codec | via engine | gpu runs | see #24 (C1) | **PARITY VERIFIED (driver, seeded)** |
 | 28 | Client: 80 ms PCM chunks, resample to 16 kHz, 22.05 kHz out, chunk = k×80 ms (App. B) | Triton + FastAPI WebSocket (not in repo) | `transport.ws_server`: PCM16 in at 8-48 kHz (`input_rate`, streaming soxr to 16 kHz), 22.05 kHz out, 160 ms engine chunks | cpu `test_ws` (resampler tone/length, 48 kHz session, cancel on hang-up); gpu ws demo with cache (2 sessions, 16 kHz) | — | **TESTED**; engine chunk fixed at 160 ms (not configurable) |
-| 29 | Streaming latency: p95 118 ms per 160 ms chunk, 4 streams, H100 (App. C) | vLLM engine (+ CUDA graphs for TTS/codec in the paper runtime) | native + cache: p50 345 / p95 354 ms per chunk, 1 stream, GB10 (RTF 2.16) | gpu C2 profile per component: Thinker 147 (43 %), EarTTS 86-98 (26 %), codec 48 (14 %), perception 30, stt rest 27, glue 2 | — | **MISSING (performance)**: P1 targets in `.work` (quantize the Thinker, graphs for EarTTS/codec) |
+| 29 | Streaming latency: p95 118 ms per 160 ms chunk, 4 streams, H100 (App. C) | vLLM engine (+ CUDA graphs for TTS/codec in the paper runtime) | native + cache: p50 345 / p95 354 ms per chunk, 1 stream (RTF 2.16) | gpu C2 profile per component: Thinker 147 (43 %), EarTTS 86-98 (26 %), codec 48 (14 %), perception 30, stt rest 27, glue 2 | — | **MISSING (performance)**: P1 targets in `.work` (quantize the Thinker, graphs for EarTTS/codec) |
 | 30 | Precision: perception + LLM BF16, TTS FP32, Mamba cache FP32, "TF32" (App. C) | Y: compute bf16, TTS fp32, `matmul_precision: medium` (code) | same as reference; SSM state FP32 in our cache | gpu dtype test | — | **TESTED**. Paper says TF32, reference sets `medium`; we follow the reference |
 | 31 | ~2 min trained audio context (§7) | 6144 frames ≈ 8.2 min allowed (Y:175) | ENHANCED rehydration (controller facts + history summary → new model stream, fresh cache); replay hold keeps answers intact | cpu `test_controller` (+ turn markers stripped); **gpu E4/E5** (spliced s1 request → 30 s → "just tell me the delivery date"): refresh at 42.7 s, summary carries the verified XYZ123 row, follow-up answered "scheduled to arrive on November twelfth, twenty twenty six" with **no new tool call**, 0 grounding violations, ASR agrees | — | **TESTED (gpu, 3 evidences)**; summary history is fragmented (user/agent deltas interleave) |
 | 32 | ≤ 5 tools per session (§7) | not enforced | `ToolRegistry` warns above 5 | cpu `test_registry_warns_beyond_paper_tool_limit` | — | **TESTED** (warning, not a hard limit) |
@@ -74,13 +74,13 @@ Controller-owned items:
 Tested on CPU in `tests/cpu/test_tool_lifecycle.py` and `test_controller.py`. GPU scenarios are pending in the
 `.work` log.
 
-## Counts (2026-11-11 evening, after jobs B1-H on GB10; GPU suite 10/10, CPU suite 91/91)
+## Counts (2026-11-11 evening, after jobs B1-H; GPU suite 10/10, CPU suite 91/91)
 All 34 mechanisms are accounted for:
 - **PARITY VERIFIED: 11** (#1-8, #10, #24, #27). Identical to NVIDIA via the driver, seeded driver or cache
   methods: tokens on every channel, waveform within 1 PCM16 LSB.
 - **TESTED: 22**. Each has an automated test or GPU evidence (internal text + OmniASR + SQLite where facts are
   involved). #9 is checked against an independent NVIDIA oracle.
-- **MISSING: 1** (#29). Realtime on GB10 is a separate performance goal. Measured RTF: 2.16 BF16, 1.88 with
+- **MISSING: 1** (#29). Realtime on the target GPU is a separate performance goal. Measured RTF: 2.16 BF16, 1.88 with
   `cudnn.benchmark`, 1.31 with the experimental int4 Thinker.
 
 Limits that belong to the model or reference, and are therefore not runtime bugs:
