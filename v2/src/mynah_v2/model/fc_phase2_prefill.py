@@ -76,10 +76,11 @@ def _attention_continue(a, x: torch.Tensor, cache, mod) -> torch.Tensor:
     return a.o_proj(o)
 
 
-def continuation_forward(llm, embeds: torch.Tensor, cache, chunk: int | None = None) -> torch.Tensor:
+def continuation_forward(llm, embeds: torch.Tensor, cache, chunk: int | None = 16) -> torch.Tensor:
     """NemotronH backbone over ``embeds`` [1, T, H] continuing ``cache`` (position ``cache._v2_pos``). Updates the cache
     in place (conv / SSM states, appended K/V, ``_v2_pos += T``) and returns the final hidden states [1, T, H]
-    (after ``norm_f``), i.e. what T single-frame decode steps would have produced."""
+    (after ``norm_f``), i.e. what T single-frame decode steps would have produced. ``chunk`` (default 16) bounds the
+    rows per forward: W8's batched kernel covers <= 16 rows (wo_gemv), beyond it dequantizes the whole weight."""
     if embeds.shape[0] != 1:
         raise ValueError("continuation_forward is B=1")
     if chunk is not None and embeds.shape[1] > chunk:
@@ -113,7 +114,7 @@ def continuation_forward(llm, embeds: torch.Tensor, cache, chunk: int | None = N
 class DeferredPhase2:
     """Stands in for ``wrapper.model_llm_interface`` during one phase-2 call on one thread (see module doc)."""
 
-    def __init__(self, inner, stt, fc_state: dict, owner: int, stats: dict, chunk: int | None = None):
+    def __init__(self, inner, stt, fc_state: dict, owner: int, stats: dict, chunk: int | None = 16):
         self.inner, self.stt, self.fc_state, self.owner, self.stats, self.chunk = inner, stt, fc_state, owner, stats, chunk
         self.pending: list[torch.Tensor] = []
         self.cache = None
@@ -124,16 +125,23 @@ class DeferredPhase2:
     def _pad(self, like: torch.Tensor) -> torch.Tensor:
         return torch.full((like.shape[0],), self.stt.text_pad_id, dtype=torch.long, device=like.device)
 
-    def flush(self) -> torch.Tensor | None:
+    def flush(self, **kw):
+        """One call of the REAL interface with all recorded positions: the backbone wrapper (llm_cache) routes a marked
+        multi-position call to continuation_forward, so the call takes the normal path (multi-session: the rendezvous
+        coordinator serves it as a B=1 request; thinker_graph unconverts first; heads on the T rows)."""
         if not self.pending:
             return None
         x = torch.cat(self.pending, 1)
         self.pending = []
-        with torch.no_grad():
-            h = continuation_forward(self.stt.llm, x, self.cache, chunk=self.chunk)
+        self.cache._v2_continuation = True
+        self.cache._v2_continuation_chunk = self.chunk
+        try:
+            ans = self.inner(x, cache=self.cache, **kw)
+        finally:
+            self.cache._v2_continuation = False
         self.stats["prefill_calls"] = self.stats.get("prefill_calls", 0) + 1
         self.stats["prefill_positions"] = self.stats.get("prefill_positions", 0) + int(x.shape[1])
-        return h
+        return ans
 
     def __call__(self, input_embeds, cache=None, **kw):
         if threading.get_ident() != self.owner or cache is None or input_embeds.shape[1] != 1:
@@ -147,12 +155,10 @@ class DeferredPhase2:
             return self.inner(input_embeds, cache=cache, **kw)
         self.cache = cache
         self.pending.append(input_embeds.detach())
-        h = self.flush()
-        with torch.no_grad():
-            fl = self.stt.function_head(h[:, -1:])
+        ans = self.flush(**kw)
         pad = self._pad(input_embeds)
         return {"predicted_token": pad, "asr_predicted_token": pad,
-                "function_predicted_token": fl[:, -1].argmax(dim=-1), "cache": cache}
+                "function_predicted_token": ans["function_predicted_token"], "cache": ans.get("cache", cache)}
 
 
 def _wrap(inner_steps, engine, stats: dict, chunk: int | None):
@@ -162,7 +168,7 @@ def _wrap(inner_steps, engine, stats: dict, chunk: int | None):
         fs = kw.get("fc_state") or {}
         cache = kw.get("dynamic_cache")
         if (not getattr(run, "__v2_on__", True) or not kw.get("tool_response_text") or fs.get("active")
-                or cache is None or getattr(cache, "_v2_graph", None) is not None
+                or cache is None or not hasattr(cache, "conv_states")
                 or "causal_conv1d_update" not in vars(sys.modules[type(w.model.stt_model.llm).__module__])):
             stats["passthrough"] = stats.get("passthrough", 0) + 1
             return inner_steps(*a, **kw)
@@ -182,7 +188,7 @@ def _wrap(inner_steps, engine, stats: dict, chunk: int | None):
     return run
 
 
-def enable(engine, chunk: int | None = None) -> dict:
+def enable(engine, chunk: int | None = 16) -> dict:
     w = engine.wrapper
     stats = getattr(engine, "_v2_p2pre_stats", None)
     if stats is None:

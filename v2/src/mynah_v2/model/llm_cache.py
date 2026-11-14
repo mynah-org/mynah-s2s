@@ -102,6 +102,15 @@ def position_injecting_forward(orig: Callable[..., Any], holder=None) -> Callabl
             # shape[-2]); HF generate() always passes cache_position, so upstream never hits it.
             pos = int(getattr(cache, "_v2_pos", 0))
             if pos > 0 and t != 1:
+                if getattr(cache, "_v2_continuation", False) and holder is not None:
+                    # EXPERIMENT fc_phase2_prefill: T known positions consumed in one call (same final state as T
+                    # decode steps; see model/fc_phase2_prefill.py). Only when the caller marked the cache for it.
+                    from mynah_v2.model.fc_phase2_prefill import continuation_forward
+                    import sys as _sys
+                    h = continuation_forward(holder, emb, cache, chunk=getattr(cache, "_v2_continuation_chunk", 16))
+                    out_cls = getattr(_sys.modules[type(holder).__module__], "NemotronHOutput", None)
+                    return out_cls(last_hidden_state=h, cache_params=cache) if out_cls is not None else \
+                        {"last_hidden_state": h, "cache_params": cache}
                 raise ValueError(f"cached decode expects 1 frame per call after the prefill, got {t} at position {pos}")
             kw["cache_position"] = torch.arange(pos, pos + t, device=emb.device)
             if holder is not None:

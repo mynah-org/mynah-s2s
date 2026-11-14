@@ -186,6 +186,12 @@ class ThinkerGraph:
         if (cache is None or input_embeds.dim() != 3 or input_embeds.shape[1] != 1 or not input_embeds.is_cuda
                 or kw):
             self._why("not_decode" if cache is not None else "no_cache")
+            if cache is not None and getattr(cache, "_v2_graph", None) is self and input_embeds.dim() == 3 \
+                    and input_embeds.shape[1] > 1:
+                with self.lock:                 # a multi-position continuation (fc_phase2_prefill) on a converted
+                    self._unconvert(cache, int(getattr(cache, "_v2_pos", 0)))   # cache: back to the upstream
+                # layout (the next decode step converts it again)
+                self.stats["continuation_unconvert"] = self.stats.get("continuation_unconvert", 0) + 1
             return self._orig_forward(input_embeds, cache=cache, **kw)
         with self.lock:
             t = int(getattr(cache, "_v2_pos", 0))

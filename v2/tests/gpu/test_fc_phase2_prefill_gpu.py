@@ -114,3 +114,50 @@ def test_deferred_interface_returns_the_natural_prediction(nh):
     assert int(tok) == int(seq_tok)
     assert c_got._v2_pos == c_ref._v2_pos
     assert_state_equal(c_ref, c_got, stt)
+
+
+def _marked(stt, x, cache):
+    """A multi-position call through the NORMAL stt forward (llm_cache routes it to the continuation when marked)."""
+    cache._v2_continuation = True
+    try:
+        return stt(x, cache=cache)["function_logits"][0]
+    finally:
+        cache._v2_continuation = False
+
+
+@torch.inference_mode()
+def test_marked_stt_call_equals_sequential_and_unmarked_still_refused(nh):
+    eng, stt, new_cache = build(nh)
+    pre, steps = inputs(7, 35)
+    a, b = new_cache(), new_cache()
+    stt(pre, cache=a)
+    stt(pre, cache=b)
+    ref = _seq(stt, a, steps[:34])
+    got = _marked(stt, torch.cat(steps[:34], 1), b)
+    assert torch.allclose(got, ref, atol=1e-4, rtol=1e-4), float((got - ref).abs().max())
+    assert_state_equal(a, b, stt)
+    with pytest.raises(ValueError, match="1 frame per call"):
+        stt(torch.cat(steps[:2], 1), cache=b)                               # unmarked: the guard stays
+
+
+@torch.inference_mode()
+def test_continuation_on_a_thinker_graph_cache(nh):
+    """Decode steps run through the CUDA graph (converted static cache); a marked continuation unconverts, runs, and the
+    next decode step converts back: logits and state equal to plain eager decode throughout."""
+    from mynah_v2.model.thinker_graph import ThinkerGraph
+    eng, stt, new_cache = build(nh)
+    pre, steps = inputs(8, 50)
+    ref_c = new_cache()
+    stt(pre, cache=ref_c)
+    ref = _seq(stt, ref_c, steps)                                           # eager reference, 50 steps
+    tg = ThinkerGraph(eng, lmax=1024)
+    c = new_cache()
+    stt(pre, cache=c)
+    head = _seq(stt, c, steps[:8])                                          # graph decode (converted cache)
+    mid = _marked(stt, torch.cat(steps[8:42], 1), c)                        # continuation: unconvert + prefill
+    tail = _seq(stt, c, steps[42:])                                         # graph decode again (reconverted)
+    tg.remove()
+    got = torch.cat([head, mid, tail])
+    assert torch.allclose(got, ref, atol=1e-4, rtol=1e-4), float((got - ref).abs().max())
+    assert_state_equal(ref_c, c, stt)
+    assert tg.stats.get("continuation_unconvert") == 1, tg.stats
