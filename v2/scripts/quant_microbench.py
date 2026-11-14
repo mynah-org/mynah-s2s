@@ -68,17 +68,20 @@ def main():
             r["int8_wo_us"], r["int8_wo_err"] = timeit(lambda: torch._weight_int8pack_mm(x, wq, scb)), rel_err(y, ref)
         except Exception as e:  # noqa: BLE001
             r["int8_wo"] = f"unavailable: {type(e).__name__}: {str(e)[:120]}"
-        # int4 weight-only, tinygemm group 128
+        # int4 weight-only, tinygemm. Some Nemotron projections (notably MLP down)
+        # need group 64 because their K dimension is not divisible by 128.
         try:
-            g = 128
+            from mynah_v2.model.quant import _pick
+            g, tiles = _pick(k, 128)
             wf = w.float().reshape(n, k // g, g)
             mn, mx = wf.amin(-1), wf.amax(-1)
             scale = ((mx - mn).clamp_min(1e-8) / 15)
             zero = mn + scale * 8
             q = torch.round((wf - mn[..., None]) / scale[..., None]).clamp(0, 15).to(torch.int32).reshape(n, k)
-            packed = torch._convert_weight_to_int4pack(((q[:, ::2] << 4) | q[:, 1::2]).to(torch.uint8), 8)
+            packed = torch._convert_weight_to_int4pack(((q[:, ::2] << 4) | q[:, 1::2]).to(torch.uint8), tiles)
             sz = torch.stack([scale, zero], -1).transpose(0, 1).contiguous().to(torch.bfloat16)  # (k/g, n, 2)
             y = torch._weight_int4pack_mm(x, packed, g, sz)
+            r["int4_group"] = g
             r["int4_wo_us"], r["int4_wo_err"] = timeit(lambda: torch._weight_int4pack_mm(x, packed, g, sz)), rel_err(y, ref)
         except Exception as e:  # noqa: BLE001
             r["int4_wo"] = f"unavailable: {type(e).__name__}: {str(e)[:120]}"

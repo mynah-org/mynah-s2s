@@ -149,11 +149,15 @@ def main():
                     help="validated performance profile (mynah_v2.model.perf.PROFILES); ENHANCED only")
     ap.add_argument("--thinker-int4", action="store_true",
                     help="EXPERIMENT: int4 weight-only Thinker (mynah_v2.model.quant); refused in REFERENCE mode")
+    ap.add_argument("--int4-heads", action="store_true",
+                    help="also quantize the text/function output heads with --thinker-int4; keeps caches and embeddings unchanged")
     ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128])
     ap.add_argument("--int4-clip", action="store_true", help="per-group clipping search (MSE)")
     a = ap.parse_args()
     preset_info = presets.fill(a, presets.SINGLE, a.preset)
     print("PRESET", a.preset, preset_info, flush=True)
+    if a.int4_heads and not a.thinker_int4:
+        ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
         ap.error("--thinker-int4 is experimental and never allowed in REFERENCE mode")
     if a.pace == "fast" and a.tools:
@@ -205,7 +209,8 @@ def main():
     quant_info = None
     if a.thinker_int4:
         from mynah_v2.model.quant import quantize_thinker_int4
-        quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip)
+        quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
+                                           include_heads=a.int4_heads)
         print("THINKER_QUANT", quant_info, flush=True)
     perf_info = None
     if a.perf_profile or a.exp:

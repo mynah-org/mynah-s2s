@@ -92,14 +92,31 @@ class Int4Linear(nn.Module):
 
 
 def quantize_thinker_int4(engine, max_group: int = 128, clip: bool = False, skip_layers: set[int] | None = None,
-                          keep_original: bool = False):
-    """Replace the backbone linears of ``engine`` (ReferenceEngine) in place. Returns a summary for traces, and with
-    ``keep_original`` also the replaced modules so ``restore_thinker`` can undo it (A/B in one process)."""
-    llm = engine.wrapper.model.stt_model.llm
+                          keep_original: bool = False, include_heads: bool = False):
+    """Replace Thinker projections in place, optionally including text/function heads.
+
+    ``include_heads`` is deliberately separate from the backbone switch: these two
+    large vocab projections are read on every decode step, but the recurrent/KV
+    caches and all non-Linear audio state remain untouched. With ``keep_original``
+    the replaced modules are returned so ``restore_thinker`` can undo an A/B run.
+    """
+    stt = engine.wrapper.model.stt_model
+    llm = stt.llm
     before = after = 0
     n = 0
     originals = []
     skip_layers = skip_layers or set()
+    if include_heads:
+        for name in ("lm_head", "function_head"):
+            mod = getattr(stt, name, None)
+            if isinstance(mod, nn.Linear):
+                before += mod.weight.numel() * mod.weight.element_size()
+                q = Int4Linear(mod, max_group=max_group, clip=clip)
+                after += q.packed.numel() * q.packed.element_size() + q.scales_zeros.numel() * 2
+                setattr(stt, name, q)
+                if keep_original:
+                    originals.append((stt, name, mod))
+                n += 1
     for li, layer in enumerate(llm.layers):
         mixer = getattr(layer, "mixer", None)
         if mixer is None or li in skip_layers:
@@ -114,7 +131,8 @@ def quantize_thinker_int4(engine, max_group: int = 128, clip: bool = False, skip
                     originals.append((mixer, name, mod))
                 n += 1
     torch.cuda.empty_cache()
-    info = {"thinker_quant": "int4_tinygemm", "linears": n, "max_group": max_group, "clip_search": clip,
+    info = {"thinker_quant": "int4_tinygemm", "linears": n, "include_heads": include_heads,
+            "max_group": max_group, "clip_search": clip,
             "skip_layers": sorted(skip_layers), "bf16_GB": round(before / 2**30, 2), "int4_GB": round(after / 2**30, 2)}
     return (info, originals) if keep_original else info
 
@@ -123,3 +141,4 @@ def restore_thinker(originals) -> None:
     for mixer, name, mod in originals:
         setattr(mixer, name, mod)
     torch.cuda.empty_cache()
+# End of quantization helpers.

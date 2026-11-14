@@ -25,6 +25,18 @@ python v2/scripts/serve.py --trace-dir /tmp/mynah-traces --host 127.0.0.1
 uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session
 ```
 
+To try the experimental lower-latency V2 path, pass the server arguments through
+the Make target:
+
+```bash
+make webui-gpu V2_SERVE_ARGS="--thinker-int4 --int4-heads --int4-group 128 --int4-clip --cudnn-benchmark"
+```
+
+The INT4 mode quantizes Thinker projections plus the text/function heads; it
+keeps recurrent/KV caches and the ASR/RNNT, TTS, and codec components unchanged.
+Perception and EarTTS need a model-specific fused kernel before they can use
+the native INT4 path safely.
+
 To open it from another device on the LAN, use `--host 0.0.0.0` and pass the
 machine address so the bridge prints a copy/pasteable URL.
 

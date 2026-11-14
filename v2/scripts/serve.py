@@ -44,6 +44,8 @@ def main():
                     help="diagnostic: NVIDIA's shipped no-cache Thinker (default: V2 incremental Thinker)")
     ap.add_argument("--thinker-int4", action="store_true",
                     help="EXPERIMENT: replace Thinker backbone linears with native int4 tinygemm; lower memory and may improve GB10 decode speed")
+    ap.add_argument("--int4-heads", action="store_true",
+                    help="also quantize the text/function output heads with --thinker-int4; keeps caches and embeddings unchanged")
     ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128],
                     help="int4 weight group size for --thinker-int4 (smaller groups preserve more quality but use more metadata)")
     ap.add_argument("--int4-clip", action="store_true",
@@ -59,6 +61,8 @@ def main():
     presets.add_determinism_args(ap)
     a = ap.parse_args()
     print("PRESET", a.preset, presets.fill(a, presets.SINGLE, a.preset), flush=True)
+    if a.int4_heads and not a.thinker_int4:
+        ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
         ap.error("--thinker-int4 is experimental and requires --mode enhanced")
     if (a.perf_profile or a.exp) and a.mode == "reference":
@@ -78,7 +82,8 @@ def main():
     print("LLM_CACHE", eng.llm_cache_info, flush=True)
     if a.thinker_int4:
         from mynah_v2.model.quant import quantize_thinker_int4
-        quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip)
+        quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
+                                           include_heads=a.int4_heads)
         print("THINKER_QUANT", quant_info, flush=True)
     if a.perf_profile or a.exp:
         exp = a.exp

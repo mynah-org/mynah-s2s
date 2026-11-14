@@ -86,6 +86,17 @@ command, use:
 make webui-gpu
 ```
 
+For the GB10 realtime experiment, the lighter INT4 path is opt-in:
+
+```bash
+make webui-gpu V2_SERVE_ARGS="--thinker-int4 --int4-heads --int4-group 128 --int4-clip --cudnn-benchmark"
+```
+
+This quantizes the Thinker projections and text/function output heads with the native INT4 tinygemm path. The recurrent/KV caches, embeddings, ASR/RNNT, TTS, and codec stay in their original formats for compatibility. `--max-backlog 120` can be added when testing a slower-than-realtime build so input is not dropped while measuring it.
+
+Perception and EarTTS are deliberately not included in the native PyTorch
+INT4 switch: their CUDA-graph/Triton path needs a model-specific fused kernel.
+
 The UI is in English and shows the User/Agent conversation, microphone and
 speaker controls, model activity, tool calls, and an optional editable system
 prompt. More details are in [`webui/README.md`](webui/README.md).
