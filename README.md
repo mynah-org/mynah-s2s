@@ -30,11 +30,8 @@ See [`docs/research-summary.md`](docs/research-summary.md) (findings and ideas),
 
 **Work in progress.** What is measured today (details in `docs/benchmarks.md`):
 
-- **One session runs in real time** on an RTX 6000 Ada (BF16, RTF 0.71-0.74, including a tool call). One session on
-  an L40S has not been benchmarked separately.
-- **GB10 (128 GB unified memory) runs everything but is not real time**, even for one session (each 80 ms step
-  takes longer than 80 ms); use it to test and develop, not to judge latency. Its runs are not part of our
-  benchmarks.
+- **One session has a measured realtime profile** in BF16, including a tool call. Results vary by GPU and software
+  stack, so use the benchmark commands below for your target machine.
 - **Several concurrent sessions are not yet real time.** Four sessions on an L40S: round p95 173 ms without tool
   calls and 322 ms with two calls running (budget 160 ms per round). On an RTX 6000 Ada, four sessions without
   tools are close (throughput 25.9 session-chunks/s, lag ≤ 1.1 s) but still above the budget at p95.
@@ -48,12 +45,12 @@ See [`docs/research-summary.md`](docs/research-summary.md) (findings and ideas),
   Details in `docs/architecture.md` ("Function calls").
 - **Model limits** (NVIDIA's card and our tests): English only; spelled IDs and numbers are often misheard; no
   barge-in while a tool runs; about two minutes of trained context.
-- **All numbers come from specific GPUs and synthetic English test speech**; expect different results elsewhere.
+- **All numbers come from synthetic English test speech**; expect different results on other hardware and data.
 
 ## Requirements
 
-- Linux (x86_64 or aarch64), NVIDIA GPU with ≥ 46 GB memory for one VoiceChat instance (tested: RTX 6000 Ada 48 GB,
-  L40S 46 GB, GB10 128 GB unified memory). The 11B model in BF16 needs ~42 GB at peak for one session.
+- Linux (x86_64 or aarch64), NVIDIA GPU with ≥ 46 GB memory for one VoiceChat instance. The 11B model in BF16 needs
+  ~42 GB at peak for one session.
 - CUDA 13.x toolkit, Python 3.12, [uv](https://docs.astral.sh/uv/), git, `make`, ~70 GB of disk; `ffmpeg` is
   optional (silences an audio-library warning).
 - The evaluation ASR (spoken-output check) installs out of the box on x86_64 only; on aarch64 the suites run and
@@ -101,84 +98,15 @@ available explicitly (the equivalent environment variable is `MYNAH_INT4=1`):
 make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 ```
 
-For a measured BF16 EarTTS experiment, use
-`--perf-profile optimized-bf16`. It keeps the reference FP32 snapshot on the
-host for reversible A/B runs, converts the EarTTS backbone to BF16, and enables
-the fused backbone/MoG norms plus cached RVQ constants before graph capture.
-This is opt-in because the checkpoint's FP32 EarTTS path remains the quality
-reference.
-
-This quantizes all measured standard Linear paths: Thinker projections and
-heads, 218 perception Conformer linears, RNNT joint projections, the EarTTS
-Gemma backbone, and compatible CAS/fusion/MoG linears. Dense codec decoder
-`Conv1d(kernel=1)` projections reuse the same INT4 kernel. Recurrent/KV caches,
-temporal/grouped convolution weights, embeddings/codebooks, RNNT decoder LSTM,
-MoG `low_mat` by default, and the remaining codec paths stay BF16. The longer flags
-(`--thinker-int4`, `--int4-heads`, `--int4-group`, `--int4-clip`) remain
-available for experiments. `--max-backlog 120` can be added when testing a
-slower-than-realtime build so input is not dropped while measuring it.
-
-Dynamic `--int4` also enables the measured selected-MoG Q4 kernel and RVQ
-gather/sum Q4 kernel. The streaming codec's small depthwise ConvNeXt filters
-are available as an additional fused experiment with
-`--exp codec_depthwise_q4`. Set `MYNAH_INT4_SPECIALIZED=0` alongside
-`MYNAH_INT4=1` to keep only the standard INT4 paths. The second selected MoG
-matrix (`low_mat`) is available for experiments with `MYNAH_INT4_MOG_LOW=1`;
-the current GB10 measurement keeps it BF16 because its dequant launch adds
-overhead. The fused RVQ argmin encoder and RNNT LSTM are also opt-in safety
-experiments: use `MYNAH_INT4_RVQ_ENCODE=1` and `MYNAH_INT4_RNNT=1`
-respectively; they can change quantized RVQ codes and are not part of the
-default realtime path until a longer audio parity run validates them.
-The RNNT Q4 path is batch-safe for `B=1` and `B>1`; its optional fully fused
-gate/activation kernel can be profiled with `MYNAH_INT4_RNNT_FUSED=1`, but the
-measured GB10 path keeps the smaller two-launch kernels because they are faster.
-
-For coverage experiments, the corresponding Q8 preset is available with
-`--int8` or `MYNAH_INT8=1`. It replaces the same standard matrix scopes and also
-provides Q8 adapters for selected MoG, RVQ gather, codec depthwise, and RNNT
-prediction paths; `MYNAH_INT8_RVQ_ENCODE=1` additionally enables the Q8 RVQ
-argmin/update path. Q8 is intentionally not the default: the exact `t02`
-tool-call smoke completed correctly, but the full all-Q8 path measured `RTF
-10.38` on GB10 and is currently a parity/memory path rather than a realtime
-serving candidate.
-
-The standard Q8 scopes can also be exported once and loaded without
-requantizing at startup:
-
-```bash
-make w8-pack W8_PACK=/path/to/voicechat-w8.safetensors
-make webui-gpu V2_SERVE_ARGS="--int8-pack /path/to/voicechat-w8.safetensors"
-```
-
-The Q8 manifest records the runtime-only scopes that are still enabled from
-the checkpoint at startup. `MYNAH_INT8_RNNT_FUSED=1` enables the experimental
-single-launch Q8 RNNT gate/activation kernel; measure it on the target GPU
-before adopting it, since Q8 is not the default realtime path.
-
-The legacy `--eartts-int4` flag remains available when testing only the TTS
-backbone. It uses the native tinygemm path; the earlier custom Triton Q4 kernel
-is retained only as a kernel experiment.
-
-Compared with the external GGUF Q8 deployment, our coverage now includes the
-standard matrix paths, dense codec projections, and dedicated Q8 adapters for
-the remaining custom paths. Temporal/grouped convolution, codebooks, and
-stateful/custom-kernel paths still require their own validation. The reference project emits
-separate LLM, function-head, perception, and TTS/codec artifacts; its README
-also says Q4 converts but the supported measurements are Q8. See the
-[reference layout](https://github.com/mkotyushev/nemotron-voicechat-realtime-gguf#why-gguf).
-
-To avoid quantizing at every server start, export one validated offline bundle once:
+For quantization profiles, fusion coverage, offline bundles, and validation
+results, see [`docs/q8-quantization.md`](docs/q8-quantization.md).
+The short operational commands are:
 
 ```bash
 make int4-pack INT4_PACK=/path/to/voicechat-int4.safetensors
-make webui-gpu V2_SERVE_ARGS="--int4-pack /path/to/voicechat-int4.safetensors"
+make w8-pack W8_PACK=/path/to/voicechat-w8.safetensors
+make webui-gpu V2_SERVE_ARGS="--int8-pack /path/to/voicechat-w8.safetensors"
 ```
-
-The exporter writes the sibling `.json` manifest. It records the native
-tinygemm packing, module shapes, group size, and explicitly lists the custom
-audio runtime kernels that are not serialized in the bundle (selected MoG/RVQ
-adapters and temporal codec paths). The server validates the whole manifest before replacing any module;
-the default remains BF16 when no INT4 flag or environment variable is set.
 
 The UI is in English and shows the User/Agent conversation, microphone and
 speaker controls, model activity, tool calls, and an optional editable system

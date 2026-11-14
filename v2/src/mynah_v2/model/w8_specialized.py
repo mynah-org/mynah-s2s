@@ -17,6 +17,7 @@ from mynah_v2.model.wo_gemv import WOLinear, pack_w8
 
 
 _W8_LSTM_KERNEL = None
+_W8_CONVTRANSPOSE_KERNEL = None
 
 
 def _w8_lstm_kernel():
@@ -127,6 +128,34 @@ class Int8LSTM(nn.Module):
             bh = getattr(lstm, f"bias_hh_l{layer}").detach()
             self.bias.append(nn.Parameter((bi + bh).contiguous(), requires_grad=False))
 
+    @classmethod
+    def from_packed(cls, packed_layers, fused: bool = False) -> "Int8LSTM":
+        """Build the decoder from an offline Q8 bundle without requantizing."""
+        if not packed_layers:
+            raise ValueError("offline Q8 RNNT bundle has no layers")
+        out = cls.__new__(cls)
+        nn.Module.__init__(out)
+        out.input_size = int(packed_layers[0]["qih"].shape[1])
+        out.hidden_size = int(packed_layers[0]["qih"].shape[0] // 4)
+        out.num_layers = len(packed_layers)
+        out.fused = bool(fused)
+        out.ih, out.hh, out.bias = nn.ModuleList(), nn.ModuleList(), nn.ParameterList()
+        for li, p in enumerate(packed_layers):
+            qih, sih, qhh, shh, bias = (p[k] for k in ("qih", "sih", "qhh", "shh", "bias"))
+            hidden = out.hidden_size
+            in_size = out.input_size if li == 0 else hidden
+            if tuple(qih.shape) != (4 * hidden, in_size) or tuple(qhh.shape) != (4 * hidden, hidden):
+                raise ValueError("offline Q8 RNNT matrix shape mismatch")
+            if tuple(sih.shape) != (4 * hidden,) or tuple(shh.shape) != (4 * hidden,) \
+                    or tuple(bias.shape) != (4 * hidden,):
+                raise ValueError("offline Q8 RNNT scale/bias shape mismatch")
+            lin_i = nn.Linear(in_size, 4 * hidden, bias=False, device=qih.device, dtype=torch.bfloat16)
+            lin_h = nn.Linear(hidden, 4 * hidden, bias=False, device=qhh.device, dtype=torch.bfloat16)
+            out.ih.append(WOLinear.from_packed(lin_i, qih, sih, fmt="w8"))
+            out.hh.append(WOLinear.from_packed(lin_h, qhh, shh, fmt="w8"))
+            out.bias.append(nn.Parameter(bias.contiguous(), requires_grad=False))
+        return out
+
     def forward(self, x: torch.Tensor, state=None):
         if x.ndim != 3 or x.shape[-1] != self.input_size:
             raise ValueError(f"RNNT Q8 expects [T,B,{self.input_size}], got {tuple(x.shape)}")
@@ -211,6 +240,24 @@ class SelectedMoGW8(nn.Module):
         out.register_buffer("bias", torch.empty(0, device=weight.device), persistent=False)
         return out
 
+    @classmethod
+    def from_packed(cls, q: torch.Tensor, scale: torch.Tensor,
+                    bias: torch.Tensor | None = None) -> "SelectedMoGW8":
+        if q.ndim != 3 or scale.shape != q.shape[:2] or q.dtype != torch.int8 \
+                or scale.dtype != torch.float32:
+            raise ValueError("offline Q8 MoG tensors have invalid shape or dtype")
+        out = cls.__new__(cls)
+        nn.Module.__init__(out)
+        out.num_predictions, out.out_size, out.in_features = q.shape
+        out.register_buffer("q", q.contiguous())
+        out.register_buffer("scale", scale.contiguous())
+        if bias is None:
+            bias = torch.empty(0, device=q.device, dtype=torch.float32)
+        if bias.numel() and tuple(bias.shape) != tuple(q.shape[:2]):
+            raise ValueError("offline Q8 MoG bias shape mismatch")
+        out.register_buffer("bias", bias.contiguous(), persistent=False)
+        return out
+
     def selected(self, x: torch.Tensor, mixture_indices: torch.Tensor) -> torch.Tensor:
         shape = x.shape[:-1]
         x2 = x.reshape(-1, self.in_features).contiguous()
@@ -277,6 +324,20 @@ class DepthwiseConv1dW8(nn.Module):
         self.register_buffer("scale", scale.contiguous())
         self.bias = conv.bias
 
+    @classmethod
+    def from_packed(cls, q: torch.Tensor, scale: torch.Tensor,
+                    bias: torch.Tensor | None = None) -> "DepthwiseConv1dW8":
+        if q.ndim != 2 or scale.shape != (q.shape[0],) or q.dtype != torch.int8 \
+                or scale.dtype != torch.float32:
+            raise ValueError("offline Q8 depthwise tensors have invalid shape or dtype")
+        out = cls.__new__(cls)
+        nn.Module.__init__(out)
+        out.channels, out.kernel_size = q.shape
+        out.register_buffer("q", q.contiguous())
+        out.register_buffer("scale", scale.contiguous())
+        out.bias = bias
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3 or x.shape[1] != self.channels:
             raise RuntimeError(f"depthwise Q8 expected [B,{self.channels},T], got {tuple(x.shape)}")
@@ -322,6 +383,113 @@ class DepthwiseConv1dW8(nn.Module):
         return self.q.numel() * self.q.element_size() + self.scale.numel() * self.scale.element_size()
 
 
+def _w8_convtranspose_kernel():
+    """Build the small-K Q8 grouped ConvTranspose1d kernel lazily."""
+    global _W8_CONVTRANSPOSE_KERNEL
+    if _W8_CONVTRANSPOSE_KERNEL is not None:
+        return _W8_CONVTRANSPOSE_KERNEL
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(x, q, scale, bias, y, B, CIN, COUT, T, O, CIN_G, COUT_G,
+               K: tl.constexpr, STRIDE: tl.constexpr, PADDING: tl.constexpr,
+               DILATION: tl.constexpr, BLOCK_T: tl.constexpr, HAS_BIAS: tl.constexpr):
+        b = tl.program_id(0)
+        oc = tl.program_id(1)
+        ot = tl.program_id(2) * BLOCK_T + tl.arange(0, BLOCK_T)
+        valid_t = ot < O
+        group = oc // COUT_G
+        ocg = oc % COUT_G
+        acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        for icg in range(0, CIN_G):
+            for kk in range(0, K):
+                rem = ot + PADDING - kk * DILATION
+                valid = valid_t & (rem >= 0) & ((rem % STRIDE) == 0)
+                it = rem // STRIDE
+                valid = valid & (it < T)
+                xv = tl.load(x + (b * CIN + group * CIN_G + icg) * T + it,
+                             mask=valid, other=0.0).to(tl.float32)
+                wi = (((group * CIN_G + icg) * COUT_G + ocg) * K + kk)
+                w = tl.load(q + wi).to(tl.float32) * tl.load(scale + group * COUT_G + ocg).to(tl.float32)
+                acc += xv * w
+        if HAS_BIAS:
+            acc += tl.load(bias + oc).to(tl.float32)
+        tl.store(y + (b * COUT + oc) * O + ot, acc.to(y.dtype.element_ty), mask=valid_t)
+
+    _W8_CONVTRANSPOSE_KERNEL = (kernel, triton.cdiv)
+    return _W8_CONVTRANSPOSE_KERNEL
+
+
+class ConvTranspose1dW8(nn.Module):
+    """Per-output-channel Q8 grouped ConvTranspose1d for the codec upsampler."""
+
+    def __init__(self, conv: nn.ConvTranspose1d):
+        super().__init__()
+        if not isinstance(conv, nn.ConvTranspose1d):
+            raise TypeError("ConvTranspose1dW8 expects nn.ConvTranspose1d")
+        if conv.output_padding[0] >= conv.stride[0] or conv.padding[0] < 0:
+            raise ValueError("unsupported ConvTranspose1d output/padding")
+        g, cin_g, cout_g, k = conv.groups, conv.in_channels // conv.groups, conv.out_channels // conv.groups, conv.kernel_size[0]
+        w = conv.weight.detach().float().reshape(g, cin_g, cout_g, k)
+        scale = w.abs().amax(dim=(1, 3)).clamp_min(1e-8) / 127
+        q = torch.round(w / scale[:, None, :, None]).clamp(-127, 127).to(torch.int8)
+        self.in_channels, self.out_channels, self.groups = conv.in_channels, conv.out_channels, g
+        self.kernel_size, self.stride = k, conv.stride[0]
+        self.padding, self.output_padding, self.dilation = conv.padding[0], conv.output_padding[0], conv.dilation[0]
+        self.in_channels_per_group, self.out_channels_per_group = cin_g, cout_g
+        self.register_buffer("q", q.contiguous())
+        self.register_buffer("scale", scale.contiguous())
+        self.bias = conv.bias
+
+    @classmethod
+    def from_packed(cls, q: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None,
+                    in_channels: int, out_channels: int, groups: int, kernel_size: int,
+                    stride: int, padding: int, output_padding: int, dilation: int) -> "ConvTranspose1dW8":
+        if q.dtype != torch.int8 or scale.dtype != torch.float32 or q.ndim != 4:
+            raise ValueError("offline Q8 ConvTranspose tensors have invalid dtype/rank")
+        if q.shape[0] != groups or q.shape[1] * groups != in_channels or q.shape[2] * groups != out_channels \
+                or q.shape[3] != kernel_size or tuple(scale.shape) != (groups, q.shape[2]):
+            raise ValueError("offline Q8 ConvTranspose shape mismatch")
+        out = cls.__new__(cls)
+        nn.Module.__init__(out)
+        out.in_channels, out.out_channels, out.groups = in_channels, out_channels, groups
+        out.kernel_size, out.stride = kernel_size, stride
+        out.padding, out.output_padding, out.dilation = padding, output_padding, dilation
+        out.in_channels_per_group, out.out_channels_per_group = q.shape[1], q.shape[2]
+        out.register_buffer("q", q.contiguous())
+        out.register_buffer("scale", scale.contiguous())
+        out.bias = bias
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or x.shape[1] != self.in_channels:
+            raise RuntimeError(f"Q8 ConvTranspose expects [B,{self.in_channels},T], got {tuple(x.shape)}")
+        if x.device.type != "cuda":
+            w = (self.q.float() * self.scale[:, None, :, None]).reshape(
+                self.in_channels, self.out_channels_per_group, self.kernel_size
+            ).to(x.dtype)
+            return F.conv_transpose1d(x, w, self.bias, self.stride, self.padding,
+                                     self.output_padding, self.groups, self.dilation)
+        import triton
+        x = x.contiguous()
+        t = x.shape[-1]
+        out_len = (t - 1) * self.stride - 2 * self.padding + self.dilation * (self.kernel_size - 1) \
+            + self.output_padding + 1
+        y = torch.empty((x.shape[0], self.out_channels, out_len), dtype=x.dtype, device=x.device)
+        bias = self.bias if self.bias is not None else self.scale.reshape(-1)
+        kernel, cdiv = _w8_convtranspose_kernel()
+        kernel[(x.shape[0], self.out_channels, cdiv(out_len, 64))](
+            x, self.q, self.scale, bias, y, x.shape[0], self.in_channels, self.out_channels, t, out_len,
+            self.in_channels_per_group, self.out_channels_per_group, K=self.kernel_size, STRIDE=self.stride,
+            PADDING=self.padding, DILATION=self.dilation, BLOCK_T=64, HAS_BIAS=self.bias is not None,
+        )
+        return y
+
+    def nbytes(self) -> int:
+        return self.q.numel() * self.q.element_size() + self.scale.numel() * self.scale.element_size()
+
+
 class RVQInt8Embedding(nn.Module):
     """Q8 RVQ gather/sum with the same padded-code contract as the Q4 path."""
 
@@ -338,6 +506,20 @@ class RVQInt8Embedding(nn.Module):
         self.depth, self.vocab, self.hidden = d, v, h
         self.register_buffer("q", q.contiguous())
         self.register_buffer("scale", scale.contiguous())
+
+    @classmethod
+    def from_packed(cls, q: torch.Tensor, scale: torch.Tensor,
+                    depth: int, vocab: int, hidden: int) -> "RVQInt8Embedding":
+        if q.dtype != torch.int8 or scale.dtype != torch.float32 \
+                or tuple(q.shape) != (depth, vocab + 1, hidden) \
+                or tuple(scale.shape) != (depth, vocab + 1):
+            raise ValueError("offline Q8 RVQ tensors have invalid shape or dtype")
+        out = cls.__new__(cls)
+        nn.Module.__init__(out)
+        out.depth, out.vocab, out.hidden = depth, vocab, hidden
+        out.register_buffer("q", q.contiguous())
+        out.register_buffer("scale", scale.contiguous())
+        return out
 
     def forward(self, code: torch.Tensor) -> torch.Tensor:
         shape = code.shape[:-1]

@@ -187,9 +187,9 @@ def main():
     ap.add_argument("--int8", action="store_true", default=_env_flag("MYNAH_INT8"),
                     help="opt-in Q8 parity preset: Thinker, EarTTS, perception, RNNT joint, codec 1x1, and specialized Q8 paths")
     ap.add_argument("--int8-pack", default=os.environ.get("MYNAH_INT8_PACK"),
-                    help="load one offline .safetensors + sibling .json Q8 bundle; specialized Q8 paths remain runtime opt-ins")
+                    help="load one offline .safetensors + sibling .json Q8 bundle; confirmed specialized paths are included")
     ap.add_argument("--int8-specialized", action="store_true", default=_env_flag("MYNAH_INT8_SPECIALIZED"),
-                    help="enable Q8 selected-MoG, RVQ, depthwise codec, and RNNT prediction paths (implied by --int8)")
+                    help="legacy/internal alias; --int8 already enables all confirmed Q8 specialized paths")
     a = ap.parse_args()
     preset_info = presets.fill(a, presets.SINGLE, a.preset)
     print("PRESET", a.preset, preset_info, flush=True)

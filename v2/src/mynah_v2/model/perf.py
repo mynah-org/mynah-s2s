@@ -1164,33 +1164,42 @@ experiment("eartts_rvq_w8")((_rvq_w8_enable, _rvq_w8_disable))
 
 
 def _codec_depthwise_w8_enable(engine) -> dict:
-    from mynah_v2.model.w8_specialized import DepthwiseConv1dW8
+    from mynah_v2.model.w8_specialized import ConvTranspose1dW8, DepthwiseConv1dW8
 
     codec = engine.wrapper.model.tts_model.audio_codec
     if hasattr(codec, "_v2_depthwise_w8_originals"):
         return {"codec_depthwise_w8": "already_enabled"}
     originals = []
-    replaced = 0
+    replaced = transpose_replaced = 0
     bytes_w8 = 0
     for path, block in list(codec.named_modules()):
         dw = getattr(block, "dwconv", None)
-        if not isinstance(dw, torch.nn.Conv1d):
+        if isinstance(dw, torch.nn.Conv1d) and dw.in_channels == dw.out_channels == dw.groups \
+                and dw.kernel_size[0] <= 15 and dw.stride == (1,) and dw.dilation == (1,) \
+                and dw.padding == (0,):
+            q8 = DepthwiseConv1dW8(dw)
+            parent_path, child = path.rsplit(".", 1) if "." in path else ("", path)
+            parent = codec.get_submodule(parent_path) if parent_path else codec
+            originals.append((parent, child, dw))
+            setattr(parent, child, q8)
+            replaced += 1
+            bytes_w8 += q8.nbytes() + (dw.bias.numel() * dw.bias.element_size() if dw.bias is not None else 0)
+    for path, module in list(codec.named_modules()):
+        if not isinstance(module, torch.nn.ConvTranspose1d):
             continue
-        if not (dw.in_channels == dw.out_channels == dw.groups and dw.kernel_size[0] <= 15
-                and dw.stride == (1,) and dw.dilation == (1,) and dw.padding == (0,)):
-            continue
-        q8 = DepthwiseConv1dW8(dw)
+        q8 = ConvTranspose1dW8(module)
         parent_path, child = path.rsplit(".", 1) if "." in path else ("", path)
         parent = codec.get_submodule(parent_path) if parent_path else codec
-        originals.append((parent, child, dw))
+        originals.append((parent, child, module))
         setattr(parent, child, q8)
-        replaced += 1
-        bytes_w8 += q8.nbytes() + (dw.bias.numel() * dw.bias.element_size() if dw.bias is not None else 0)
-    if not replaced:
-        raise RuntimeError("no supported codec ConvNeXt depthwise convolutions found")
+        transpose_replaced += 1
+        bytes_w8 += q8.nbytes() + (module.bias.numel() * module.bias.element_size() if module.bias is not None else 0)
+    if not replaced and not transpose_replaced:
+        raise RuntimeError("no supported codec temporal/depthwise convolutions found")
     codec._v2_depthwise_w8_originals = originals
     torch.cuda.empty_cache()
-    return {"codec_depthwise_w8": True, "layers": replaced, "w8_bytes": bytes_w8}
+    return {"codec_depthwise_w8": True, "depthwise_layers": replaced,
+            "transpose_layers": transpose_replaced, "w8_bytes": bytes_w8}
 
 
 def _codec_depthwise_w8_disable(engine) -> None:
@@ -1213,7 +1222,7 @@ def _rnnt_w8_enable(engine) -> dict:
     rnn = decoder.prediction["dec_rnn"]
     if isinstance(rnn, Int8LSTM):
         return {"rnnt_decoder_w8": "already_enabled"}
-    fused = os.environ.get("MYNAH_INT8_RNNT_FUSED", "0") == "1"
+    fused = os.environ.get("MYNAH_INT8_RNNT_FUSED", "1") == "1"
     q8 = Int8LSTM(rnn, fused=fused)
     decoder.prediction["dec_rnn"] = q8
     decoder._v2_rnnt_w8_original = rnn
@@ -1238,13 +1247,17 @@ def _mog_w8_enable(engine) -> dict:
 
     m = _find_eartts(engine)
     head = m.mog_head
-    if not isinstance(head.proj_mus, torch.nn.Linear):
+    preloaded_proj = isinstance(head.proj_mus, SelectedMoGW8)
+    if preloaded_proj and "_v2_mog_w8_original" in head.__dict__:
+        return {"mog_w8": "already_enabled"}
+    if not preloaded_proj and not isinstance(head.proj_mus, torch.nn.Linear):
         raise RuntimeError("MoG proj_mus is not an ordinary Linear")
     original = head.proj_mus
-    head.proj_mus = SelectedMoGW8(original, head.num_predictions, head.low_rank or head.out_size)
-    low_q = None
+    if not preloaded_proj:
+        head.proj_mus = SelectedMoGW8(original, head.num_predictions, head.low_rank or head.out_size)
+    low_q = getattr(head, "_v2_mog_w8_low", None)
     low_state = None
-    if getattr(head, "low_rank", None) and os.environ.get("MYNAH_INT8_MOG_LOW", "1") == "1":
+    if low_q is None and getattr(head, "low_rank", None) and os.environ.get("MYNAH_INT8_MOG_LOW", "1") == "1":
         low = head.low_mat
         low_state = (low.detach().cpu(), low.device, low.dtype)
         low_q = SelectedMoGW8.from_tensor(low.detach())

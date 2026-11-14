@@ -5,12 +5,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mynah_v2.model.w8_specialized import (
+    ConvTranspose1dW8,
     DepthwiseConv1dW8,
     Int8LSTM,
     RVQInt8Embedding,
     SelectedMoGW8,
     W8PointwiseConv1d,
 )
+
+
+def _check_convtranspose_w8(conv):
+    q = ConvTranspose1dW8(conv)
+    x = torch.randn(2, conv.in_channels, 13, device="cuda", dtype=torch.bfloat16)
+    ref = conv(x)
+    got = q(x)
+    assert got.shape == ref.shape
+    assert torch.allclose(got.float(), ref.float(), atol=0.15, rtol=0.15)
+
+
+def test_w8_convtranspose_gpu_dense_and_grouped():
+    _check_convtranspose_w8(nn.ConvTranspose1d(
+        4, 5, kernel_size=3, stride=2, padding=1, device="cuda", dtype=torch.bfloat16
+    ))
+    _check_convtranspose_w8(nn.ConvTranspose1d(
+        4, 6, kernel_size=4, stride=2, padding=1, groups=2,
+        device="cuda", dtype=torch.bfloat16
+    ))
 
 
 def test_w8_pointwise_and_depthwise_gpu():

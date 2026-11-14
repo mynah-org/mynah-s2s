@@ -41,42 +41,14 @@ For an explicit BF16 EarTTS measurement, use
 backbone to BF16 and enables the fused norms and cached RVQ constants before
 graph capture; it is opt-in because FP32 EarTTS remains the quality reference.
 
-The INT4 mode quantizes all measured standard Linear paths: Thinker/head,
-perception Conformer, RNNT joint, EarTTS Gemma, CAS/fusion, and compatible MoG
-linears. Dense codec decoder `Conv1d(kernel=1)` projections use the same
-INT4 kernel; temporal/grouped convolution, codebooks, recurrent/KV caches,
-RNNT decoder LSTM, MoG `low_mat` by default, and remaining codec components stay BF16.
-Dynamic mode also enables the selected-MoG and RVQ gather/sum Q4 kernels;
-`MYNAH_INT4_SPECIALIZED=0` disables those two while keeping standard INT4.
-The codec depthwise ConvNeXt path is available explicitly with
-`--exp codec_depthwise_q4`. The fused RVQ argmin encoder and RNNT prediction
-LSTM are safety-gated experiments via `MYNAH_INT4_RVQ_ENCODE=1` and
-`MYNAH_INT4_RNNT=1`; they are not enabled by default because Q4 code choices
-and end-to-end latency still need longer target-GPU validation.
-The additional selected `low_mat` MoG kernel is available with
-`MYNAH_INT4_MOG_LOW=1`, but is not enabled by default because its current GB10
-measurement is slower than the BF16 path.
-
-The legacy TTS-only switch is still available for isolated tests:
+For INT4/Q8 profiles, fusion coverage, offline packs, and validation results,
+see [`docs/q8-quantization.md`](../docs/q8-quantization.md). The short startup
+forms are:
 
 ```bash
-make webui-gpu V2_SERVE_ARGS="--eartts-int4 --perf-profile optimized-graph"
+make w8-pack W8_PACK=/path/to/voicechat-w8.safetensors
+make webui-gpu V2_SERVE_ARGS="--int8-pack /path/to/voicechat-w8.safetensors"
 ```
-
-It quantizes only the Gemma backbone linears. CAS/subword embeddings, MoG
-direct projections, RVQ, codec, and perception remain unchanged. The combined
-`--int4` path has passed a real DGX WebSocket turn with zero dropped audio.
-
-For an explicit Q8 coverage run, use `--int8` (or `MYNAH_INT8=1`). This enables
-Q8 counterparts for the standard matrix paths plus selected MoG, RVQ, codec
-depthwise, and RNNT prediction paths. It is currently an experimental
-parity/memory mode, not the WebUI default: the full all-Q8 corpus smoke is
-semantically correct but measured `RTF 10.38` on GB10.
-
-Export the standard Q8 scopes once with `make w8-pack W8_PACK=/path/to/voicechat-w8.safetensors`,
-then start with `V2_SERVE_ARGS="--int8-pack /path/to/voicechat-w8.safetensors"`.
-The sibling JSON manifest is validated before replacement; selected MoG/RVQ,
-depthwise codec, and RNNT runtime adapters remain opt-in startup work.
 
 For repeatable startup, export the native packed weights once and pass the bundle
 instead:
@@ -86,10 +58,8 @@ make int4-pack INT4_PACK=/path/to/voicechat-int4.safetensors
 make webui-gpu V2_SERVE_ARGS="--int4-pack /path/to/voicechat-int4.safetensors"
 ```
 
-This writes `.safetensors` plus a sibling `.json` manifest. The bundle includes
-all measured standard Linear scopes and pointwise codec/Conformer adapters, and
-records the remaining runtime-only BF16/custom scopes. No INT4 option means
-the normal BF16 server path.
+Both commands write `.safetensors` plus a sibling `.json` manifest. No
+quantization option means the normal BF16 server path.
 
 To open it from another device on the LAN, use `--host 0.0.0.0` and pass the
 machine address so the bridge prints a copy/pasteable URL.

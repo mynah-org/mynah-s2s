@@ -17,6 +17,8 @@ supported: the training-only fused kernel reads ``out_proj.weight`` directly.
 from __future__ import annotations
 
 import json
+import os
+import types
 from pathlib import Path
 
 import torch
@@ -459,14 +461,106 @@ def _w8_pointwise_spec(root_name: str, name: str, mod, tensors: dict) -> dict:
     return spec
 
 
+def _w8_tensor(tensors: dict, prefix: str, q: torch.Tensor, scale: torch.Tensor,
+               bias: torch.Tensor | None = None) -> dict:
+    q_key, scale_key = f"{prefix}.q", f"{prefix}.scale"
+    tensors[q_key] = q.detach().cpu().contiguous()
+    tensors[scale_key] = scale.detach().cpu().contiguous()
+    out = {"q_key": q_key, "scale_key": scale_key}
+    if bias is not None:
+        bias_key = f"{prefix}.bias"
+        tensors[bias_key] = bias.detach().cpu().contiguous()
+        out["bias_key"] = bias_key
+    return out
+
+
+def _w8_custom_specs(engine, tensors: dict) -> list[dict]:
+    """Pack custom-indexed Q8 paths which cannot use the ordinary Linear loader."""
+    from mynah_v2.model.w8_specialized import ConvTranspose1dW8, DepthwiseConv1dW8, RVQInt8Embedding
+    from mynah_v2.model.wo_gemv import pack_w8
+    model = engine.wrapper.model
+    tts = model.tts_model.tts_model
+    specs = []
+    head = tts.mog_head
+    proj = head.proj_mus
+    if isinstance(proj, nn.Linear):
+        n, d, k = head.num_predictions, head.low_rank or head.out_size, proj.in_features
+        p = pack_w8(proj.weight.detach().reshape(n * d, k))
+        keys = _w8_tensor(tensors, "custom.mog.proj_mus", p["q"].reshape(n, d, k),
+                          p["scale"].reshape(n, d),
+                          proj.bias.detach().reshape(n, d) if proj.bias is not None else None)
+        spec = {"kind": "selected_mog", "num_predictions": n, "out_size": d, "in_features": k, **keys}
+        if getattr(head, "low_rank", None) and isinstance(head.low_mat, torch.Tensor):
+            lp = pack_w8(head.low_mat.detach().reshape(n * head.out_size, -1))
+            spec.update({"low_rank": head.low_rank, "low_out_size": head.out_size,
+                         **{"low_" + k: v for k, v in _w8_tensor(
+                             tensors, "custom.mog.low_mat", lp["q"].reshape(n, head.out_size, -1),
+                             lp["scale"].reshape(n, head.out_size)).items()}})
+        specs.append(spec)
+
+    rvq = RVQInt8Embedding(tts.rvq_embs)
+    specs.append({"kind": "rvq_embedding", "depth": rvq.depth, "vocab": rvq.vocab,
+                  "hidden": rvq.hidden, **_w8_tensor(tensors, "custom.rvq.embedding", rvq.q, rvq.scale)})
+
+    decoder = None
+    for name in ("rnnt_decoder", "_rnnt_decoder"):
+        candidate = getattr(model.stt_model, name, None)
+        if candidate is not None and hasattr(candidate, "prediction"):
+            decoder = candidate
+            break
+    if decoder is not None:
+        rnn = decoder.prediction["dec_rnn"]
+        lstm = getattr(rnn, "lstm", None)
+        if isinstance(lstm, nn.LSTM) and not lstm.proj_size and not lstm.bidirectional:
+            layers = []
+            for li in range(lstm.num_layers):
+                wi = getattr(lstm, f"weight_ih_l{li}").detach()
+                wh = getattr(lstm, f"weight_hh_l{li}").detach()
+                bi = getattr(lstm, f"bias_ih_l{li}").detach()
+                bh = getattr(lstm, f"bias_hh_l{li}").detach()
+                pi, ph = pack_w8(wi), pack_w8(wh)
+                prefix = f"custom.rnnt.layer{li}"
+                layers.append({"qih_key": f"{prefix}.qih", "sih_key": f"{prefix}.sih",
+                               "qhh_key": f"{prefix}.qhh", "shh_key": f"{prefix}.shh",
+                               "bias_key": f"{prefix}.bias"})
+                tensors[f"{prefix}.qih"] = pi["q"].cpu().contiguous()
+                tensors[f"{prefix}.sih"] = pi["scale"].cpu().contiguous()
+                tensors[f"{prefix}.qhh"] = ph["q"].cpu().contiguous()
+                tensors[f"{prefix}.shh"] = ph["scale"].cpu().contiguous()
+                tensors[f"{prefix}.bias"] = (bi + bh).cpu().contiguous()
+            specs.append({"kind": "rnnt_lstm", "layers": layers,
+                          "fused": os.environ.get("MYNAH_INT8_RNNT_FUSED", "1") == "1"})
+
+    codec = getattr(model.tts_model, "audio_codec", None)
+    codec_decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if codec_decoder is not None:
+        for name, module in codec_decoder.named_modules():
+            prefix = f"custom.codec.{name or 'root'}"
+            if isinstance(module, nn.Conv1d) and module.in_channels == module.out_channels == module.groups \
+                    and module.kernel_size[0] <= 15 and module.stride == (1,) and module.dilation == (1,) \
+                    and module.padding == (0,):
+                q = DepthwiseConv1dW8(module)
+                keys = _w8_tensor(tensors, prefix, q.q, q.scale, module.bias)
+                specs.append({"kind": "codec_depthwise", "name": name, "channels": q.channels,
+                              "kernel_size": q.kernel_size, **keys})
+            elif isinstance(module, nn.ConvTranspose1d):
+                q = ConvTranspose1dW8(module)
+                keys = _w8_tensor(tensors, prefix, q.q, q.scale, module.bias)
+                specs.append({"kind": "codec_transpose", "name": name, "in_channels": q.in_channels,
+                              "out_channels": q.out_channels, "groups": q.groups, "kernel_size": q.kernel_size,
+                              "stride": q.stride, "padding": q.padding, "output_padding": q.output_padding,
+                              "dilation": q.dilation, **keys})
+    return specs
+
+
 def save_w8_bundle(engine, path: str | Path, include_heads: bool = True,
-                   include_eartts: bool = True, include_extended: bool = True) -> dict:
+                   include_eartts: bool = True, include_extended: bool = True,
+                   include_custom: bool = True) -> dict:
     """Export the validated standard Q8 matrix paths for offline startup.
 
-    This intentionally mirrors the graph-safe INT4 bundle, but uses plain
-    per-output-channel int8 tensors (no custom selected-MoG/RVQ/temporal
-    codec state). Those specialized paths remain runtime experiments and can
-    still be enabled after loading this bundle.
+    This mirrors the graph-safe INT4 bundle and also serializes the custom
+    selected-MoG, RVQ, RNNT, depthwise and codec upsampler paths when enabled.
+    Embeddings/state/cache remain live runtime state by design.
     """
     from mynah_v2.model.wo_gemv import WOLinear
     from mynah_v2.model.w8_specialized import W8PointwiseConv1d
@@ -516,6 +610,7 @@ def save_w8_bundle(engine, path: str | Path, include_heads: bool = True,
                     modules.append(_w8_pointwise_spec("codec_pointwise", name, mod, tensors))
     if not modules:
         raise RuntimeError("no native Q8 modules were produced")
+    custom_modules = _w8_custom_specs(engine, tensors) if include_custom else []
     manifest = {
         "format": W8_BUNDLE_FORMAT,
         "backend": "mynah_triton_w8_gemv",
@@ -530,9 +625,9 @@ def save_w8_bundle(engine, path: str | Path, include_heads: bool = True,
             "eartts_aux": "CAS/fusion standard Linear layers",
             "codec_pointwise": "Dense 1x1 codec decoder projections",
         },
-        "unsupported_scopes": ["selected_mog", "rvq", "codec_depthwise", "codec_temporal_convolution",
-                               "rnnt_decoder_lstm", "embeddings", "state_and_cache"],
+        "unsupported_scopes": ["embeddings", "state_and_cache"],
         "modules": modules,
+        "custom_modules": custom_modules,
         "quant_info": {"thinker": thinker_info, "eartts": eartts_info, "extended": extended_info},
     }
     from safetensors.torch import save_file
@@ -542,7 +637,8 @@ def save_w8_bundle(engine, path: str | Path, include_heads: bool = True,
     tmp_pack.replace(path)
     tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp_manifest.replace(path.with_suffix(".json"))
-    return {"path": str(path), "manifest": str(path.with_suffix(".json")), "modules": len(modules),
+    return {"path": str(path), "manifest": str(path.with_suffix(".json")),
+            "modules": len(modules), "custom_modules": len(custom_modules),
             "format": W8_BUNDLE_FORMAT, "thinker": thinker_info, "eartts": eartts_info,
             "extended": extended_info}
 
@@ -868,7 +964,9 @@ def load_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
 
 def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
     """Validate and load an offline Q8 bundle atomically."""
-    from mynah_v2.model.w8_specialized import W8PointwiseConv1d
+    from mynah_v2.model.w8_specialized import (ConvTranspose1dW8, DepthwiseConv1dW8,
+                                                Int8LSTM, RVQInt8Embedding, SelectedMoGW8,
+                                                W8PointwiseConv1d)
     from mynah_v2.model.wo_gemv import WOLinear
 
     path = Path(path)
@@ -879,9 +977,10 @@ def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
     if manifest.get("format") != W8_BUNDLE_FORMAT:
         raise ValueError(f"unsupported w8 bundle format: {manifest.get('format')!r}")
     model = engine.wrapper.model
+    tts = model.tts_model.tts_model
     roots = {"stt_model": model.stt_model, "eartts_backbone": model.tts_model.tts_model.backbone,
              "perception": model.stt_model.perception, "rnnt_joint": model.stt_model.rnnt_joint,
-             "eartts_aux": model.tts_model.tts_model}
+             "eartts_aux": tts}
     codec = getattr(model.tts_model, "audio_codec", None)
     decoder = getattr(codec, "decoder", None) if codec is not None else None
     if decoder is not None:
@@ -892,7 +991,7 @@ def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
     # being replaced.  Loading all tensors directly to CUDA peaks above the
     # GB10 unified-memory budget before the old BF16 modules can be released.
     tensors = load_file(str(path), device="cpu")
-    missing, plan = [], []
+    missing, plan, custom_plan = [], [], []
     for spec in manifest.get("modules", []):
         root_name, name = spec.get("root"), spec.get("name", "")
         root = roots.get(root_name)
@@ -935,9 +1034,54 @@ def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
         except (KeyError, TypeError, ValueError) as exc:
             missing.append(f"{root_name}.{name} ({exc})")
             continue
+    custom_specs = manifest.get("custom_modules", [])
+    rnnt_decoder = None
+    for rnnt_name in ("rnnt_decoder", "_rnnt_decoder"):
+        candidate = getattr(model.stt_model, rnnt_name, None)
+        if candidate is not None and hasattr(candidate, "prediction"):
+            rnnt_decoder = candidate
+            break
+    for spec in custom_specs:
+        kind = spec.get("kind")
+        try:
+            if kind == "selected_mog":
+                current = tts.mog_head.proj_mus
+                if not isinstance(current, torch.nn.Linear):
+                    raise ValueError("MoG projection is not a Linear")
+                if tuple(current.weight.shape) != (spec["num_predictions"] * spec["out_size"], spec["in_features"]):
+                    raise ValueError("MoG projection shape mismatch")
+                for key in ("q_key", "scale_key"):
+                    if tensors[spec[key]].dtype not in (torch.int8, torch.float32):
+                        raise ValueError("invalid MoG tensor dtype")
+                custom_plan.append((spec, current))
+            elif kind == "rvq_embedding":
+                current = tts.rvq_embs
+                if tuple(current.shape) != (spec["depth"], spec["vocab"], spec["hidden"]):
+                    raise ValueError("RVQ table shape mismatch")
+                custom_plan.append((spec, current))
+            elif kind == "rnnt_lstm":
+                if rnnt_decoder is None or not isinstance(getattr(rnnt_decoder.prediction["dec_rnn"], "lstm", None), torch.nn.LSTM):
+                    raise ValueError("RNNT decoder LSTM is unavailable")
+                for layer in spec["layers"]:
+                    for key in ("qih_key", "sih_key", "qhh_key", "shh_key", "bias_key"):
+                        if layer[key] not in tensors:
+                            raise KeyError(layer[key])
+                custom_plan.append((spec, rnnt_decoder.prediction["dec_rnn"]))
+            elif kind in ("codec_depthwise", "codec_transpose"):
+                if decoder is None:
+                    raise ValueError("codec decoder is unavailable")
+                current = decoder.get_submodule(spec["name"])
+                expected = torch.nn.Conv1d if kind == "codec_depthwise" else torch.nn.ConvTranspose1d
+                if not isinstance(current, expected):
+                    raise ValueError(f"codec module is not {expected.__name__}")
+                custom_plan.append((spec, current))
+            else:
+                raise ValueError(f"unknown custom kind {kind!r}")
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            missing.append(f"custom.{kind} ({exc})")
     if missing and strict:
         raise RuntimeError("w8 bundle validation failed: " + "; ".join(missing[:8]))
-    if not plan:
+    if not plan and not custom_plan:
         raise RuntimeError("w8 bundle did not replace any module")
     # All manifest/shape validation is complete.  Transfer and install one
     # module at a time so releasing its BF16 parent can make room for its Q8
@@ -959,9 +1103,71 @@ def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
         else:
             replacement = WOLinear.from_packed(current, q, scale, fmt=spec.get("fmt", "w8"))
         _replace_child(root, name, replacement)
+    custom_loaded = 0
+    codec_originals = []
+    for spec, current in custom_plan:
+        kind = spec["kind"]
+        if kind == "selected_mog":
+            q = tensors[spec["q_key"]].to(device)
+            scale = tensors[spec["scale_key"]].to(device)
+            bias = tensors[spec["bias_key"]].to(device) if spec.get("bias_key") else None
+            replacement = SelectedMoGW8.from_packed(q, scale, bias)
+            _replace_child(tts.mog_head, "proj_mus", replacement)
+            low_q = None
+            if spec.get("low_q_key"):
+                low_q = SelectedMoGW8.from_packed(
+                    tensors[spec["low_q_key"]].to(device), tensors[spec["low_scale_key"]].to(device), None)
+                tts.mog_head._v2_mog_w8_low = low_q
+                tts.mog_head.low_mat = nn.Parameter(torch.empty(0, device=device, dtype=torch.bfloat16),
+                                                     requires_grad=False)
+            custom_loaded += 1
+        elif kind == "rvq_embedding":
+            q = tensors[spec["q_key"]].to(device)
+            scale = tensors[spec["scale_key"]].to(device)
+            rvq = RVQInt8Embedding.from_packed(q, scale, spec["depth"], spec["vocab"], spec["hidden"])
+            original = tts.__dict__.get("depthsum_embedding")
+            tts._v2_rvq_w8 = rvq
+            tts._v2_rvq_w8_original = original
+            tts.depthsum_embedding = types.MethodType(lambda self, code: self._v2_rvq_w8(code), tts)
+            custom_loaded += 1
+        elif kind == "rnnt_lstm":
+            layers = []
+            for layer in spec["layers"]:
+                layers.append({key: tensors[layer[key]].to(device) for key in ("qih_key", "sih_key", "qhh_key", "shh_key", "bias_key")})
+            packed_layers = [{"qih": p["qih_key"], "sih": p["sih_key"], "qhh": p["qhh_key"],
+                              "shh": p["shh_key"], "bias": p["bias_key"]} for p in layers]
+            replacement = Int8LSTM.from_packed(packed_layers, fused=spec.get("fused", True))
+            rnnt_decoder.prediction["dec_rnn"] = replacement
+            rnnt_decoder._v2_rnnt_w8_original = current
+            custom_loaded += 1
+        elif kind == "codec_depthwise":
+            replacement = DepthwiseConv1dW8.from_packed(
+                tensors[spec["q_key"]].to(device), tensors[spec["scale_key"]].to(device),
+                tensors[spec["bias_key"]].to(device) if spec.get("bias_key") else None)
+            parent_name, child = spec["name"].rsplit(".", 1) if "." in spec["name"] else ("", spec["name"])
+            parent = decoder.get_submodule(parent_name) if parent_name else decoder
+            codec_originals.append((parent, child, current))
+            setattr(parent, child, replacement)
+            custom_loaded += 1
+        elif kind == "codec_transpose":
+            replacement = ConvTranspose1dW8.from_packed(
+                tensors[spec["q_key"]].to(device), tensors[spec["scale_key"]].to(device),
+                tensors[spec["bias_key"]].to(device) if spec.get("bias_key") else None,
+                spec["in_channels"], spec["out_channels"], spec["groups"], spec["kernel_size"],
+                spec["stride"], spec["padding"], spec["output_padding"], spec["dilation"])
+            parent_name, child = spec["name"].rsplit(".", 1) if "." in spec["name"] else ("", spec["name"])
+            parent = decoder.get_submodule(parent_name) if parent_name else decoder
+            codec_originals.append((parent, child, current))
+            setattr(parent, child, replacement)
+            custom_loaded += 1
+    if codec_originals:
+        codec._v2_depthwise_w8_originals = codec_originals
+    if any(spec.get("kind") == "selected_mog" for spec, _ in custom_plan):
+        from mynah_v2.model.perf import _mog_w8_enable
+        _mog_w8_enable(engine)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return {"path": str(path), "modules": len(plan), "skipped": missing,
+    return {"path": str(path), "modules": len(plan), "custom_modules": custom_loaded, "skipped": missing,
             "format": W8_BUNDLE_FORMAT, "weight_only": manifest.get("weight_only", False),
             "unsupported_scopes": manifest.get("unsupported_scopes", [])}
 # End of quantization helpers.
