@@ -48,7 +48,9 @@ def main():
     ap.add_argument("--no-llm-cache", action="store_true",
                     help="diagnostic: NVIDIA's shipped no-cache Thinker (default: V2 incremental Thinker)")
     ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
-                    help="opt-in INT4 preset: all measured standard Linear paths; conv/LSTM/codebooks/codec stay BF16")
+                    help="opt-in INT4 preset: standard paths plus tested MoG/RVQ/codec pointwise kernels; temporal conv/LSTM stay BF16")
+    ap.add_argument("--int4-specialized", action="store_true", default=_env_flag("MYNAH_INT4_SPECIALIZED"),
+                    help="enable the measured selected-MoG and RVQ gather kernels (implied by --int4; dynamic mode only)")
     ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: replace Thinker backbone linears with native int4 tinygemm; lower memory and may improve GB10 decode speed")
     ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
@@ -85,6 +87,8 @@ def main():
         a.int4_heads = True
         a.eartts_int4 = True
         a.int4_extended = True
+        if os.environ.get("MYNAH_INT4_SPECIALIZED") != "0":
+            a.int4_specialized = True
     if a.int4_pack:
         # A bundle already contains both graph-safe families.  It is valid to
         # combine it with --int4 as a convenient preset, but never requantize
@@ -94,6 +98,11 @@ def main():
         a.int4_heads = False
         a.eartts_int4 = False
         a.int4_extended = False
+        a.int4_specialized = False
+    if a.int4_specialized:
+        extra = ["eartts_mog_q4", "eartts_rvq_q4"]
+        current = [x for x in (a.exp or "").split(",") if x]
+        a.exp = ",".join(current + [x for x in extra if x not in current])
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":

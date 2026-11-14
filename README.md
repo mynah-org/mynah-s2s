@@ -95,20 +95,28 @@ make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 
 This quantizes all measured standard Linear paths: Thinker projections and
 heads, 218 perception Conformer linears, RNNT joint projections, the EarTTS
-Gemma backbone, and compatible CAS/fusion/MoG linears. Recurrent/KV caches,
-convolution weights, embeddings/codebooks, RNNT decoder LSTM, MoG `proj_mus`,
-and codec stay BF16. The longer flags
+Gemma backbone, and compatible CAS/fusion/MoG linears. Dense codec decoder
+`Conv1d(kernel=1)` projections reuse the same INT4 kernel. Recurrent/KV caches,
+temporal/grouped convolution weights, embeddings/codebooks, RNNT decoder LSTM,
+MoG `low_mat` by default, and the remaining codec paths stay BF16. The longer flags
 (`--thinker-int4`, `--int4-heads`, `--int4-group`, `--int4-clip`) remain
 available for experiments. `--max-backlog 120` can be added when testing a
 slower-than-realtime build so input is not dropped while measuring it.
+
+Dynamic `--int4` also enables the measured selected-MoG Q4 kernel and RVQ
+gather/sum Q4 kernel. Set `MYNAH_INT4_SPECIALIZED=0` alongside
+`MYNAH_INT4=1` to keep only the standard INT4 paths. The second selected MoG
+matrix (`low_mat`) is available for experiments with `MYNAH_INT4_MOG_LOW=1`;
+the current GB10 measurement keeps it BF16 because its dequant launch adds
+overhead.
 
 The legacy `--eartts-int4` flag remains available when testing only the TTS
 backbone. It uses the native tinygemm path; the earlier custom Triton Q4 kernel
 is retained only as a kernel experiment.
 
 Compared with the external GGUF Q8 deployment, our coverage is now aligned on
-the standard matrix paths; the remaining pieces are convolution/codebook and
-stateful/custom-kernel paths. The reference project emits
+the standard matrix paths plus dense codec projections; the remaining pieces
+are temporal convolution/codebook and stateful/custom-kernel paths. The reference project emits
 separate LLM, function-head, perception, and TTS/codec artifacts; its README
 also says Q4 converts but the supported measurements are Q8. See the
 [reference layout](https://github.com/mkotyushev/nemotron-voicechat-realtime-gguf#why-gguf).
@@ -122,7 +130,8 @@ make webui-gpu V2_SERVE_ARGS="--int4-pack /path/to/voicechat-int4.safetensors"
 
 The exporter writes the sibling `.json` manifest. It records the native
 tinygemm packing, module shapes, group size, and explicitly lists the custom
-audio modules that are still BF16. The server validates the whole manifest before replacing any module;
+audio runtime kernels that are not serialized in the bundle (selected MoG/RVQ
+adapters and temporal codec paths). The server validates the whole manifest before replacing any module;
 the default remains BF16 when no INT4 flag or environment variable is set.
 
 The UI is in English and shows the User/Agent conversation, microphone and

@@ -126,6 +126,56 @@ class Int4Linear(nn.Module):
         return y.to(dt).reshape(*shp[:-1], self.out_features)
 
 
+class Int4PointwiseConv1d(nn.Module):
+    """Weight-only INT4 adapter for a dense 1x1 Conv1d.
+
+    Pointwise convolution is a Linear applied independently at every time
+    position. Temporal, grouped, and transposed convolutions deliberately do
+    not enter this adapter.
+    """
+
+    def __init__(self, conv: nn.Conv1d, max_group: int = 128):
+        if tuple(conv.kernel_size) != (1,) or tuple(conv.stride) != (1,) or tuple(conv.padding) != (0,):
+            raise ValueError("Int4PointwiseConv1d requires kernel_size=1, stride=1, padding=0")
+        if conv.groups != 1 or tuple(conv.dilation) != (1,):
+            raise ValueError("Int4PointwiseConv1d requires a dense non-dilated convolution")
+        super().__init__()
+        lin = nn.Linear(conv.in_channels, conv.out_channels, bias=conv.bias is not None,
+                        device=conv.weight.device, dtype=conv.weight.dtype)
+        with torch.no_grad():
+            lin.weight.copy_(conv.weight[:, :, 0])
+            if conv.bias is not None:
+                lin.bias.copy_(conv.bias)
+        self.linear = Int4Linear(lin, max_group=max_group)
+        self.in_channels = conv.in_channels
+        self.out_channels = conv.out_channels
+
+    @property
+    def packed(self):
+        return self.linear.packed
+
+    @property
+    def scales_zeros(self):
+        return self.linear.scales_zeros
+
+    @property
+    def group(self):
+        return self.linear.group
+
+    @property
+    def tiles(self):
+        return self.linear.tiles
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or x.shape[1] != self.in_channels:
+            raise RuntimeError(f"INT4 pointwise codec expects [B,{self.in_channels},T], got {tuple(x.shape)}")
+        y = self.linear(x.transpose(1, 2).contiguous())
+        return y.transpose(1, 2).contiguous()
+
+    def nbytes(self) -> int:
+        return self.packed.numel() * self.packed.element_size() + self.scales_zeros.numel() * 2
+
+
 def quantize_thinker_int4(engine, max_group: int = 128, clip: bool = False, skip_layers: set[int] | None = None,
                           keep_original: bool = False, include_heads: bool = False):
     """Replace Thinker projections in place, optionally including text/function heads.
@@ -208,18 +258,50 @@ def _quantize_linear_tree(root: nn.Module, max_group: int, scope: str,
             "bf16_bytes": before, "int4_bytes": after}
 
 
+def _quantize_pointwise_conv_tree(root: nn.Module, max_group: int, scope: str) -> dict:
+    """Quantize dense 1x1 Conv1d layers while leaving temporal kernels BF16."""
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Conv1d):
+            continue
+        if tuple(mod.kernel_size) != (1,) or tuple(mod.stride) != (1,) or tuple(mod.padding) != (0,) \
+                or mod.groups != 1 or tuple(mod.dilation) != (1,):
+            continue
+        if mod.out_channels % 8:
+            skipped.append({"name": name, "reason": f"out_channels={mod.out_channels} is not 8-aligned"})
+            continue
+        try:
+            before += mod.weight.numel() * mod.weight.element_size()
+            q = Int4PointwiseConv1d(mod, max_group=max_group)
+        except (StopIteration, ValueError) as exc:
+            skipped.append({"name": name, "reason": str(exc)})
+            continue
+        after += q.nbytes()
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "pointwise_conv1d": n, "skipped": skipped,
+            "max_group": max_group, "bf16_bytes": before, "int4_bytes": after}
+
+
 def quantize_extended_int4(engine, max_group: int = 128) -> dict:
     """Quantize the Q8-equivalent standard matrix paths with native tinygemm.
 
-    This intentionally excludes convolution weights, the RNNT decoder LSTM,
-    embeddings/codebooks, MoG ``proj_mus`` (read directly by a custom matmul),
-    and the codec. Those paths need distinct fused kernels/layouts.
+    This intentionally excludes temporal/grouped convolution weights, the RNNT
+    decoder LSTM, embeddings/codebooks, and MoG ``proj_mus`` (read directly by
+    a custom matmul). Dense codec 1x1 projections use the Linear kernel through
+    ``Int4PointwiseConv1d``; temporal codec kernels remain BF16.
     """
     model = engine.wrapper.model
     scopes = {
         "perception": _quantize_linear_tree(model.stt_model.perception, max_group, "perception"),
         "rnnt_joint": _quantize_linear_tree(model.stt_model.rnnt_joint, max_group, "rnnt_joint"),
     }
+    scopes["perception_pointwise"] = _quantize_pointwise_conv_tree(
+        model.stt_model.perception, max_group, "perception_pointwise"
+    )
     tts = model.tts_model.tts_model
     scopes["eartts_aux"] = _quantize_linear_tree(
         tts, max_group, "eartts_aux",
@@ -227,10 +309,14 @@ def quantize_extended_int4(engine, max_group: int = 128) -> dict:
             not name.startswith("backbone.") and name != "mog_head.proj_mus"
         ),
     )
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        scopes["codec_pointwise"] = _quantize_pointwise_conv_tree(decoder, max_group, "codec_pointwise")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return {"extended_int4": True, "scopes": scopes,
-            "linears": sum(v["linears"] for v in scopes.values()),
+            "linears": sum(v.get("linears", v.get("pointwise_conv1d", 0)) for v in scopes.values()),
             "skipped": sum(len(v["skipped"]) for v in scopes.values())}
 
 
@@ -310,6 +396,14 @@ def _bundle_module_spec(root_name: str, name: str, mod: Int4Linear, tensors: dic
             "packed_key": pk, "scales_zeros_key": sk, "has_bias": mod.bias is not None}
 
 
+def _bundle_pointwise_spec(root_name: str, name: str, mod: Int4PointwiseConv1d, tensors: dict) -> dict:
+    spec = _bundle_module_spec(root_name, name, mod.linear, tensors)
+    spec["kind"] = "pointwise_conv1d"
+    spec["in_channels"] = mod.in_channels
+    spec["out_channels"] = mod.out_channels
+    return spec
+
+
 def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool = False,
                      include_heads: bool = True, include_eartts: bool = True,
                      include_extended: bool = True) -> dict:
@@ -339,6 +433,11 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
     modules = []
     stt = model.stt_model
     for name, mod in stt.named_modules():
+        # Extended perception/RNNT modules are serialized under their own
+        # roots below. Excluding those subtrees here prevents duplicate specs
+        # (including the nested Linear inside each pointwise Conv1d wrapper).
+        if (name.startswith("perception.") or name.startswith("rnnt_joint.")):
+            continue
         if isinstance(mod, Int4Linear):
             modules.append(_bundle_module_spec("stt_model", name, mod, tensors))
     if include_eartts:
@@ -349,7 +448,9 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
     if include_extended:
         perception = model.stt_model.perception
         for name, mod in perception.named_modules():
-            if isinstance(mod, Int4Linear):
+            if isinstance(mod, Int4PointwiseConv1d):
+                modules.append(_bundle_pointwise_spec("perception", name, mod, tensors))
+            elif isinstance(mod, Int4Linear) and not name.endswith(".linear"):
                 modules.append(_bundle_module_spec("perception", name, mod, tensors))
         rnnt_joint = model.stt_model.rnnt_joint
         for name, mod in rnnt_joint.named_modules():
@@ -359,6 +460,12 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
         for name, mod in tts.named_modules():
             if isinstance(mod, Int4Linear) and not name.startswith("backbone."):
                 modules.append(_bundle_module_spec("eartts_aux", name, mod, tensors))
+        codec = getattr(model.tts_model, "audio_codec", None)
+        decoder = getattr(codec, "decoder", None) if codec is not None else None
+        if decoder is not None:
+            for name, mod in decoder.named_modules():
+                if isinstance(mod, Int4PointwiseConv1d):
+                    modules.append(_bundle_pointwise_spec("codec_pointwise", name, mod, tensors))
     if not modules:
         raise RuntimeError("no native INT4 modules were produced")
     manifest = {
@@ -370,12 +477,14 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
         "scopes": {
             "stt_model": "Thinker projections and optional text/function heads",
             "eartts_backbone": "EarTTS Gemma backbone linears",
-            "perception": "Perception Conformer Linear layers; convolution stays BF16",
+            "perception": "Perception Conformer Linear layers",
+            "perception_pointwise": "Dense 1x1 Conformer projections; temporal conv stays BF16",
             "rnnt_joint": "RNNT joint projections; decoder LSTM stays BF16",
             "eartts_aux": "CAS/fusion/MoG standard Linear layers",
+            "codec_pointwise": "Dense 1x1 codec decoder projections",
         },
         "unsupported_scopes": ["perception_convolution", "rnnt_decoder_lstm", "embeddings",
-                               "mog_proj_mus", "rvq", "codec"],
+                               "mog_proj_mus", "rvq", "codec_temporal_convolution"],
         "quantizer": "asymmetric_minmax_tinygemm",
         "max_group": max_group,
         "clip_search": clip,
@@ -467,6 +576,10 @@ def load_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
     if hasattr(model.stt_model, "rnnt_joint"):
         roots["rnnt_joint"] = model.stt_model.rnnt_joint
     roots["eartts_aux"] = model.tts_model.tts_model
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        roots["codec_pointwise"] = decoder
     device = str(next(model.parameters()).device)
     from safetensors.torch import load_file
     tensors = load_file(str(path), device=device)
@@ -482,6 +595,31 @@ def load_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
             current = root.get_submodule(name) if name else root
         except AttributeError:
             missing.append(f"{root_name}.{name}")
+            continue
+        if spec.get("kind") == "pointwise_conv1d":
+            if not isinstance(current, nn.Conv1d):
+                missing.append(f"{root_name}.{name} (not nn.Conv1d)")
+                continue
+            if current.in_channels != spec["in_channels"] or current.out_channels != spec["out_channels"]:
+                missing.append(f"{root_name}.{name} (channel shape mismatch)")
+                continue
+            try:
+                packed = tensors[spec["packed_key"]]
+                scales = tensors[spec["scales_zeros_key"]]
+                lin = nn.Linear(current.in_channels, current.out_channels, bias=current.bias is not None,
+                                device=current.weight.device, dtype=current.weight.dtype)
+                with torch.no_grad():
+                    lin.weight.copy_(current.weight[:, :, 0])
+                    if current.bias is not None:
+                        lin.bias.copy_(current.bias)
+                replacement = Int4PointwiseConv1d.__new__(Int4PointwiseConv1d)
+                nn.Module.__init__(replacement)
+                replacement.linear = Int4Linear.from_packed(lin, packed, scales, spec["group"], spec["tiles"])
+                replacement.in_channels, replacement.out_channels = current.in_channels, current.out_channels
+            except (KeyError, ValueError) as exc:
+                missing.append(f"{root_name}.{name} ({exc})")
+                continue
+            replacements.append((root, name, replacement))
             continue
         if not isinstance(current, nn.Linear):
             missing.append(f"{root_name}.{name} (not nn.Linear)")

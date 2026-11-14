@@ -34,8 +34,14 @@ make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 
 The INT4 mode quantizes all measured standard Linear paths: Thinker/head,
 perception Conformer, RNNT joint, EarTTS Gemma, CAS/fusion, and compatible MoG
-linears. It keeps recurrent/KV caches, convolution/codebooks, RNNT decoder
-LSTM, MoG `proj_mus`, and codec components in BF16.
+linears. Dense codec decoder `Conv1d(kernel=1)` projections use the same
+INT4 kernel; temporal/grouped convolution, codebooks, recurrent/KV caches,
+RNNT decoder LSTM, MoG `low_mat` by default, and remaining codec components stay BF16.
+Dynamic mode also enables the selected-MoG and RVQ gather/sum Q4 kernels;
+`MYNAH_INT4_SPECIALIZED=0` disables those two while keeping standard INT4.
+The additional selected `low_mat` MoG kernel is available with
+`MYNAH_INT4_MOG_LOW=1`, but is not enabled by default because its current GB10
+measurement is slower than the BF16 path.
 
 The legacy TTS-only switch is still available for isolated tests:
 
@@ -56,7 +62,8 @@ make webui-gpu V2_SERVE_ARGS="--int4-pack /path/to/voicechat-int4.safetensors"
 ```
 
 This writes `.safetensors` plus a sibling `.json` manifest. The bundle includes
-all measured standard Linear scopes and records the remaining BF16 scopes. No INT4 option means
+all measured standard Linear scopes and pointwise codec/Conformer adapters, and
+records the remaining runtime-only BF16/custom scopes. No INT4 option means
 the normal BF16 server path.
 
 To open it from another device on the LAN, use `--host 0.0.0.0` and pass the

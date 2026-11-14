@@ -153,7 +153,9 @@ def main():
     ap.add_argument("--perf-profile", default=None, choices=["optimized-exact", "optimized-graph"],
                     help="validated performance profile (mynah_v2.model.perf.PROFILES); ENHANCED only")
     ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
-                    help="opt-in INT4 preset: all measured standard Linear paths; conv/LSTM/codebooks/codec stay BF16")
+                    help="opt-in INT4 preset: standard paths plus tested MoG/RVQ/codec pointwise kernels; temporal conv/LSTM stay BF16")
+    ap.add_argument("--int4-specialized", action="store_true", default=_env_flag("MYNAH_INT4_SPECIALIZED"),
+                    help="enable the measured selected-MoG and RVQ gather kernels (implied by --int4; dynamic mode only)")
     ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: int4 weight-only Thinker (mynah_v2.model.quant); refused in REFERENCE mode")
     ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
@@ -180,12 +182,19 @@ def main():
         a.int4_heads = True
         a.eartts_int4 = True
         a.int4_extended = True
+        if os.environ.get("MYNAH_INT4_SPECIALIZED") != "0":
+            a.int4_specialized = True
     if a.int4_pack:
         a.thinker_int4_pack = a.int4_pack
         a.thinker_int4 = True
         a.int4_heads = False
         a.eartts_int4 = False
         a.int4_extended = False
+        a.int4_specialized = False
+    if a.int4_specialized:
+        extra = ["eartts_mog_q4", "eartts_rvq_q4"]
+        current = [x for x in (a.exp or "").split(",") if x]
+        a.exp = ",".join(current + [x for x in extra if x not in current])
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
