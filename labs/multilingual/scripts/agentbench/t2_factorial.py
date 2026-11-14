@@ -40,13 +40,14 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.append(str(Path(__file__).resolve().parent.parent / "multilingual"))   # labpaths (MYNAH_HOME / MYNAH_LAB_HOME)
-from labpaths import LAB_HOME  # noqa: E402
+from labpaths import LAB_HOME, MYNAH_HOME  # noqa: E402
 from t1_probe import BOS, EOS, EOTC, PAD, SOTC, Thinker, fc_call, frame_tokens, logp_rows, trace_session  # noqa: E402
 
 EOTR = 22
 CONTRACTS = "0/0,12/12,12/0,0/22,12/22,12/22s"
 # first-cell wall estimates for the budget guard (job 278: m08 41 s = 225 forced steps + 5 re-call decodes, ~85 ms/step)
-FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 55.0, "m03_empty": 40.0}
+FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 55.0, "m03_empty": 40.0, "m02_nf": 35.0}
+FX1 = MYNAH_HOME / "results/v2/fcfix/FX1-fix"
 RES = LAB_HOME / "results/agentbench"
 SCEN = {
     "m03_empty": {"clip": "m03_t0", "trace": RES / "m1-parity/vc_en_m03/trace.jsonl", "trace_arm": "A",
@@ -59,6 +60,16 @@ SCEN = {
     "m07_chain": {"clip": "m07_t0", "audio_root": "tts_m0_en", "trace": RES / "rb-en/vc_en_m07/trace.jsonl", "trace_arm": "A",
                   "tool": "find_customer", "args": {"full_name": "Mario Rossi", "postcode": "20135"},
                   "result_args": None, "expect_result": None, "h5": ("A", "0/0", "prepare_return", 0)},
+    # engine FX1-fix m02 (official, ENHANCED, (PAD, EOTR) resume, NVIDIA default system message + get_order_status +
+    # generate_random_number): get_order_status(qgq999) -> found=false, then the IDENTICAL call re-opened at the first
+    # resume frame (11x live). Model frame t <-> audio frame t (no lead). During the FC the incoming chunks were
+    # digital silence (rms 0) and were not buffered; the main loop resumed on silence, so the post-call audio equals
+    # the clip's own silence after the request (frames s+1.. of the clip).
+    "m02_nf": {"wav": MYNAH_HOME / "data/agent/fcmulti_v1/m02.wav", "lead_s": 0.0, "tail_s": 0.0, "max_s": 24.0,
+               "trace": FX1 / "m02/trace.jsonl", "trace_arm": "A", "family": "engine",
+               "tool": "get_order_status", "args": {"order_id": "qgq999"}, "result_args": None,
+               "orders_db": FX1 / "orders.sqlite", "expect_result": '{"order_id": "QGQ999", "found": false}',
+               "prompt_chars": 3366, "prompt_tokens": 789, "h5": ("A", "12/22", "get_order_status", 0)},
 }
 
 
@@ -79,7 +90,7 @@ SCEN = {
 #         (fc_sotc_boost is read and logged, never applied); this measures whether one would separate the cases.
 # The teacher-forced history was recorded under the original prompt: for p1 the cell measures the post-result
 # decision on that history, not whether the model would have reached it (own_text_mismatch_0_s reports that).
-VARIANTS = ("base", "p1", "p3", "p1p3", "b2")
+VARIANTS = ("base", "p1", "p3", "p1p3", "b2", "typed")
 P1_RULE = ("Tool-call arguments must be values the user spoke. If a required argument is missing, ask the user; never "
            "guess. If a tool call fails or returns an error, do not retry the tool call for the same request.")
 SOTC_BIAS = -2.0
@@ -108,7 +119,47 @@ def structure_result(result: str) -> str:
 
 
 def result_variant(variant: str) -> str:
-    return "p3" if variant in ("p3", "p1p3") else "orig"
+    return "p3" if variant in ("p3", "p1p3") else "typed" if variant == "typed" else "orig"
+
+
+def typed_convert(wrapped: str, conv) -> str:
+    """The wrapper's TOOL_RESPONSE number conversion (_convert_tool_response_nums_to_text: same tag regex, json.dumps
+    of the converted JSON) with ONE difference: JSON bools stay bools. The wrapper's _convert_nums_in_json treats a
+    bool as an int, inflect fails and it falls back to str(): {"found": false} reaches the model as "False" (bug,
+    live FX1 m02). ``conv`` = the wrapper's _convert_nums_in_json, applied to every non-bool leaf."""
+    import re
+
+    def walk(x):
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, dict):
+            return {k: walk(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        return conv(x)
+
+    def rep(m):
+        try:
+            return m.group(1) + json.dumps(walk(json.loads(m.group(2)))) + m.group(3)
+        except (json.JSONDecodeError, TypeError):
+            return m.group(0)
+    return re.compile(r'(<TOOL_RESPONSE>)(.*?)(</TOOL_RESPONSE>)', re.DOTALL).sub(rep, wrapped)
+
+
+def gate(sc: str, cell: dict, call_text: str, contract: str = "12/22") -> dict:
+    """Pre-registered per-cell decision (owner 2026-11-14). m02: the baseline must re-open the IDENTICAL call at the
+    first resume frame (live behaviour); a variant passes if it replies with no identical re-call in the window.
+    m07: every cell must keep the legitimate chained prepare_return(C1002)."""
+    o = cell["contracts"][contract]["outcome"]
+    txt = o.get("new_call_text") or ""
+    same = o.get("first") == "new_call" and "".join(txt.split()) == "".join(call_text.split())
+    if sc == "m02_nf":
+        return {"identical_recall": same, "reply": o.get("first") == "reply", "recall_at": o.get("new_call_sotc"),
+                "other_call": o.get("first") == "new_call" and not same, "variant_pass": o.get("first") == "reply"}
+    if sc == "m07_chain":
+        keep = o.get("first") == "new_call" and "prepare_return" in txt and "C1002" in txt
+        return {"chain_kept": keep, "variant_pass": keep}
+    return {}
 
 
 def prompt_variant(variant: str) -> str:
@@ -232,14 +283,27 @@ def main():  # pragma: no cover - GPU
     variants = a.variants.split(",")
     assert all(v in VARIANTS for v in variants), variants
     plan = parse_plan(a.plan, a.scenarios.split(","), a.arms.split(","), variants)
+    fam = lambda sc: SCEN[sc].get("family", "tenant")       # noqa: E731
+    assert not any(fam(sc) == "engine" and prompt_variant(v) == "p1" for sc, _, v in plan), \
+        "the engine prompt IS NVIDIA's default message (P1 rules already in it): no p1 on engine scenarios"
+    import offline_voicechat_fc_infer as fcmod
+    from mynah_v2.agent.tools import ORDERS_SCHEMA, orders_tool
+    reg_e = ToolRegistry()          # = run_stream --tools orders,random (FX1): same description, schema, builtin tool
+    reg_e.register("get_order_status", lambda a_: "", "Get the status, delivery date and tracking code of a customer "
+                   "order by its order id.", ORDERS_SCHEMA, ack_message="Let me check that order for you.")
+    reg_e.schemas += fcmod.DEFAULT_TOOLS
     prompts, ths = {}, {}
-    for pv in sorted({prompt_variant(v) for _, _, v in plan} | {"orig"}):
-        prompts[pv] = render_prompt(reg.schemas, variant_prompt(spec["system_prompt"], "p1" if pv == "p1" else "base"))
-        ths[pv] = Thinker(eng, prompts[pv])           # own prefill embeddings; cache rebuilt per cell (prefill())
-    assert len(prompts["orig"]) == 2738, len(prompts["orig"])
-    rep["prompts"] = {pv: {"chars": len(p), "sha": hashlib.sha256(p.encode()).hexdigest()[:12],
-                           "tokens": ths[pv].P} for pv, p in prompts.items()}
-    th = ths["orig"]
+    for f_, pv in sorted({(fam(sc), prompt_variant(v)) for sc, _, v in plan} | {("tenant", "orig")}):
+        prompts[(f_, pv)] = (render_prompt(reg.schemas, variant_prompt(spec["system_prompt"], "p1" if pv == "p1" else "base"))
+                             if f_ == "tenant" else render_prompt(reg_e.schemas, fcmod.DEFAULT_SYSTEM_MESSAGE))
+        ths[(f_, pv)] = Thinker(eng, prompts[(f_, pv)])   # own prefill embeddings; cache rebuilt per cell (prefill())
+    assert len(prompts[("tenant", "orig")]) == 2738, len(prompts[("tenant", "orig")])
+    if ("engine", "orig") in prompts:                      # = the live FX1 prompt (session.opened / NeMo log)
+        assert len(prompts[("engine", "orig")]) == 3366 and ths[("engine", "orig")].P == 789, (
+            len(prompts[("engine", "orig")]), ths[("engine", "orig")].P)
+    rep["prompts"] = {f"{f_}:{pv}": {"chars": len(p), "sha": hashlib.sha256(p.encode()).hexdigest()[:12],
+                                     "tokens": ths[(f_, pv)].P} for (f_, pv), p in prompts.items()}
+    th = ths[("tenant", "orig")]
     w = eng.wrapper
 
     # ---- scenario states (CPU-side: tokens, schedule, checks)
@@ -251,17 +315,24 @@ def main():  # pragma: no cover - GPU
         rec, (s, fids) = frame_tokens(sess), fc_call(sess)
         assert fids[0] == SOTC and fids[-1] == EOTC, sc
         call = fids[1:]
-        be = TenantBackend(spec)                      # fresh backend: no call budget carried between scenarios
-        result = be.handlers()[cfg["tool"]](cfg["result_args"] or cfg["args"])
+        if fam(sc) == "engine":
+            result = orders_tool(cfg["orders_db"])(cfg["result_args"] or cfg["args"])   # FX1's own db, read only
+        else:
+            be = TenantBackend(spec)                  # fresh backend: no call budget carried between scenarios
+            result = be.handlers()[cfg["tool"]](cfg["result_args"] or cfg["args"])
         if cfg["expect_result"] is not None:
             assert result == cfg["expect_result"], (sc, result)
         if rv == "p3":
             result = structure_result(result)
         wrapped = f"<TOOL_RESPONSE>[{result}]</TOOL_RESPONSE>"
         conv = w._convert_tool_response_nums_to_text(wrapped) if w._fc_convert_num_to_text else wrapped
-        resp = list(w._build_fc_response_tokens(wrapped))
+        if rv == "typed":                     # bool kept as a JSON bool (bug fix probe, NOT p3)
+            conv = typed_convert(wrapped, w._convert_nums_in_json)
+            resp = list(w.tokenizer.text_to_ids(conv))
+        else:
+            resp = list(w._build_fc_response_tokens(wrapped))
         tlen = trace_lengths(sess)
-        call_text = th.decode(call[:-1])
+        call_text = ths[(fam(sc), "orig")].decode(call[:-1])
         v0 = {"call_steps": [len(call), tlen.get("call_steps")], "result_steps": [len(resp) + 1, tlen.get("result_steps")],
               "result_chars": [len(conv), tlen.get("result_chars")],
               "call_has_args": all(str(v) in call_text for v in cfg["args"].values())}
@@ -310,6 +381,8 @@ def main():  # pragma: no cover - GPU
     ckpt = {"en": load_nemo_dir(LAB_HOME / "ckpt/asr-en"),
             "ml": load_nemo_dir(LAB_HOME / "ckpt/asr-ml")}
     def clip_path(sc):   # the audio root of the LIVE session each trace comes from (m07: tts_m0_en, others tts_m1)
+        if "wav" in SCEN[sc]:
+            return SCEN[sc]["wav"]
         root = Path(a.data_root) / SCEN[sc].get("audio_root", "tts_m1")
         man = {(r["id"], r["lang"], r["voice"]): r for r in map(json.loads, open(root / "manifest.jsonl"))}
         return root / man[(SCEN[sc]["clip"], "en", "vivian")]["path"]
@@ -329,7 +402,10 @@ def main():  # pragma: no cover - GPU
                     "cache": kw.get("cache")}
         for sc in sorted({sc_ for sc_, arm_, _ in plan if arm_ == arm}):
             x = load_16k(clip_path(sc))
-            wav = torch.cat([torch.zeros(int(a.lead_s * 16000)), x, torch.zeros(int(a.tail_s * 16000))])
+            if SCEN[sc].get("max_s"):
+                x = x[:int(SCEN[sc]["max_s"] * 16000)]
+            lead, tail_s = SCEN[sc].get("lead_s", a.lead_s), SCEN[sc].get("tail_s", a.tail_s)
+            wav = torch.cat([torch.zeros(int(lead * 16000)), x, torch.zeros(int(tail_s * 16000))])
             fx = []
 
             def fuse(*args, **kw):
@@ -363,7 +439,7 @@ def main():  # pragma: no cover - GPU
 
     def run_cell(arm, sc, v):
         t = time.monotonic()
-        th = ths[prompt_variant(v)]
+        th = ths[(fam(sc), prompt_variant(v))]
         st, f, sil = states[(sc, result_variant(v))], feats[(arm, sc)], sils[arm]
         s, sched = st["s"], st["sched"]
         cache = th.prefill()
@@ -381,7 +457,7 @@ def main():  # pragma: no cover - GPU
                 lf = logp_rows(fl)
                 nat, lp_eotr = int(lf.argmax()), round(float(lf[EOTR]), 3)
         hm = [t_ for t_ in range(s + 1) if main_pred[t_][0] != st["rec"].get(t_, PAD)]
-        res = {"arm": arm, "scenario": sc, "variant": v, "prompt": rep["prompts"][prompt_variant(v)],
+        res = {"arm": arm, "scenario": sc, "variant": v, "prompt": rep["prompts"][f"{fam(sc)}:{prompt_variant(v)}"],
                "n_resp": len(st["resp"]), "schedule_sha": st["sha"], "nat_last": nat, "lp_EOTR_last": lp_eotr,
                "own_sotc_at_s": main_pred[s][1] == SOTC, "own_func_pad_before_s": all(p[1] == PAD for p in main_pred[:s]),
                "own_text_mismatch_0_s": len(hm), "fc1_match": [sum(p == c for p, c in zip(fc1, st["call"])), len(st["call"])],
@@ -446,6 +522,25 @@ def main():  # pragma: no cover - GPU
                        "new_call_text": o.get("new_call_text"), "expect_tool": h5[2],
                        "pass": o.get("new_call_sotc") == states[(sc, "orig")]["ff"] + SCEN[sc]["h5"][3] and h5[2] in (o.get("new_call_text") or "")}
         rep["cells"].append(r)
+        stop = None
+        if sc in ("m02_nf", "m07_chain") and "12/22" in r["contracts"]:
+            g = r["gate"] = gate(sc, r, rep["scenarios"][f"{sc}:orig"]["call_text"])
+            if v == "base":            # the baseline must reproduce the live behaviour, or nothing below is usable
+                ff = states[(sc, "orig")]["ff"]
+                ok = bool(rep["scenarios"][f"{sc}:orig"]["V0"]["pass"]) and bool(r.get("V1", {}).get("pass"))
+                ok = ok and (g["identical_recall"] and g["recall_at"] in (ff, ff + 1) if sc == "m02_nf"
+                             else g["chain_kept"])
+                r["baseline_faithful"] = ok
+                if not ok:
+                    stop = f"{sc} baseline does not reproduce the live behaviour"
+            elif sc == "m07_chain" and not g["chain_kept"]:
+                stop = f"m07 lost prepare_return(C1002) under {v}"
+        if stop:
+            rep["stop"] = stop
+            rep["skipped"] = [list(p_) for p_ in plan[i + 1:]]
+            save()
+            print("STOP:", stop, flush=True)
+            break
         save()
         print(f"{sc:10} {arm:8} {v:5} V1={r.get('V1', {}).get('pass')} H5={r.get('H5', {}).get('pass')} ({r['s']}s)", flush=True)
         for pr, c in r["contracts"].items():

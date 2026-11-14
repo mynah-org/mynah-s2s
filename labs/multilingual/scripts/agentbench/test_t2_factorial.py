@@ -42,7 +42,10 @@ def test_summarise_and_margin():
 
 
 def test_scenarios_declared():
-    assert set(F.SCEN) == {"m03_empty", "m08_vr", "m07_chain"}
+    assert set(F.SCEN) == {"m03_empty", "m08_vr", "m07_chain", "m02_nf"}
+    m02 = F.SCEN["m02_nf"]
+    assert m02["family"] == "engine" and m02["lead_s"] == 0.0 and m02["h5"][1] == "12/22"
+    assert m02["expect_result"] == '{"order_id": "QGQ999", "found": false}' and m02["prompt_chars"] == 3366
     assert F.SCEN["m08_vr"]["h5"][1] == "12/22" and F.SCEN["m07_chain"]["h5"][1] == "0/0"
     assert len(F.CONTRACTS.split(",")) == 6
 
@@ -77,9 +80,52 @@ def test_variant_prompt_and_plan():
     base = "You are the voice assistant."
     assert F.variant_prompt(base, "base") == base and F.variant_prompt(base, "p3") == base
     assert F.variant_prompt(base, "p1").endswith(F.P1_RULE) and F.variant_prompt(base, "p1p3") == F.variant_prompt(base, "p1")
-    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1", "orig"]
-    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3", "orig"]
+    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1", "orig", "orig"]
+    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3", "orig", "typed"]
     assert "do not retry the tool call for the same request" in F.P1_RULE and F.SOTC_BIAS < 0
     assert F.parse_plan("m08_vr:A:p1,m07_chain:A", [], [], []) == [("m08_vr", "A", "p1"), ("m07_chain", "A", "base")]
     assert F.parse_plan("", ["m08_vr", "m07_chain"], ["A"], ["base", "p3"]) == [
         ("m08_vr", "A", "base"), ("m08_vr", "A", "p3"), ("m07_chain", "A", "base"), ("m07_chain", "A", "p3")]
+
+
+def _wrapper_like_conv(obj):
+    """Mimics the wrapper's _convert_nums_in_json leaf rule: bool is an int, inflect fails on it -> str()."""
+    if isinstance(obj, dict):
+        return {k: _wrapper_like_conv(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_wrapper_like_conv(v) for v in obj]
+    if isinstance(obj, bool):
+        return str(obj)
+    if isinstance(obj, int):
+        return {7319: "seven thousand three hundred and nineteen"}.get(obj, f"n{obj}")
+    return obj
+
+
+def test_typed_convert_keeps_bools_and_converts_numbers():
+    import json
+    import re
+    w = '<TOOL_RESPONSE>[{"order_id": "QGQ999", "found": false}]</TOOL_RESPONSE>'
+    m = re.match(r"(<TOOL_RESPONSE>)(.*?)(</TOOL_RESPONSE>)", w)
+    bug = m.group(1) + json.dumps(_wrapper_like_conv(json.loads(m.group(2)))) + m.group(3)
+    assert '"found": "False"' in bug and len(bug) == 73                          # = the live FX1 m02 response
+    typed = F.typed_convert(w, _wrapper_like_conv)
+    assert typed == '<TOOL_RESPONSE>[{"order_id": "QGQ999", "found": false}]</TOOL_RESPONSE>'
+    assert F.typed_convert('<TOOL_RESPONSE>[{"code": 7319, "ok": true}]</TOOL_RESPONSE>', _wrapper_like_conv) == \
+        '<TOOL_RESPONSE>[{"code": "seven thousand three hundred and nineteen", "ok": true}]</TOOL_RESPONSE>'
+
+
+def _cell(first, text=None, at=None):
+    return {"contracts": {"12/22": {"outcome": {"first": first, "new_call_text": text, "new_call_sotc": at}}}}
+
+
+def test_gate_rules():
+    call = '<TOOLCALL>[{"name": "get_order_status", "arguments": {"order_id": "qgq999"}}]'
+    g = F.gate("m02_nf", _cell("new_call", call.replace(" ", "  "), 192), call)
+    assert g["identical_recall"] and not g["variant_pass"] and g["recall_at"] == 192
+    assert F.gate("m02_nf", _cell("reply"), call)["variant_pass"]
+    other = F.gate("m02_nf", _cell("new_call", call.replace("qgq999", "qqq999"), 192), call)
+    assert other["other_call"] and not other["variant_pass"]                   # pass needs a reply
+    pr = '<TOOLCALL>[{"name": "prepare_return", "arguments": {"item": "Lysa bookcase", "customer_id": "C1002"}}]'
+    assert F.gate("m07_chain", _cell("new_call", pr, 293), "x")["chain_kept"]
+    assert not F.gate("m07_chain", _cell("reply"), "x")["chain_kept"]
+    assert not F.gate("m07_chain", _cell("new_call", pr.replace("C1002", "Mario"), 293), "x")["chain_kept"]
