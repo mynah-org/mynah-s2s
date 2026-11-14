@@ -121,8 +121,12 @@ def _build():
 
     configs = [triton.Config({"BN": bn, "BK": bk}, num_warps=nw) for bn in (4, 8, 16, 32) for bk in (128, 256, 512)
                for nw in (2, 4, 8)]
+    # the tuned config per key is kept in Triton's on-disk cache (TRITON_CACHE_DIR): a reload skips the benchmark of
+    # the 36 configs per key (decode MP=1 at every load, the FC continuation's MP=16 warm-up)
+    import inspect
+    at = {"cache_results": True} if "cache_results" in inspect.signature(triton.autotune).parameters else {}
 
-    @triton.autotune(configs=configs, key=["N", "K", "MP", "FP8"])
+    @triton.autotune(configs=configs, key=["N", "K", "MP", "FP8"], **at)
     @triton.jit
     def w8_kernel(x, q, s, y, M, N, K, MP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FP8: tl.constexpr):
         # batched GEMV: the [BN, BK] weight tile is loaded ONCE and used for all M (<= MP) activation rows
@@ -144,7 +148,7 @@ def _build():
         om = (rm[:, None] < M) & (rn[None, :] < N)
         tl.store(y + rm[:, None] * N + rn[None, :], (acc * sc[None, :]).to(y.dtype.element_ty), mask=om)
 
-    @triton.autotune(configs=[c for c in configs if c.kwargs["BK"] >= 128], key=["N", "K"])
+    @triton.autotune(configs=[c for c in configs if c.kwargs["BK"] >= 128], key=["N", "K"], **at)
     @triton.jit
     def w4_kernel(x, q, s, mn, y, N, K, G: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         pid = tl.program_id(0)
@@ -172,7 +176,7 @@ def _build():
         mag = tl.where(e == 0, mbit * 0.5, (1.0 + mbit * 0.5) * tl.exp2((e - 1).to(tl.float32)))
         return tl.where(c >= 8, -mag, mag)
 
-    @triton.autotune(configs=[c for c in configs if c.kwargs["BK"] >= 128], key=["N", "K"])
+    @triton.autotune(configs=[c for c in configs if c.kwargs["BK"] >= 128], key=["N", "K"], **at)
     @triton.jit
     def nvf4_kernel(x, q, bs, gs, y, N, K, BN: tl.constexpr, BK: tl.constexpr):
         pid = tl.program_id(0)

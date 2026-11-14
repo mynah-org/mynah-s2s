@@ -12,3 +12,21 @@ from pathlib import Path
 MYNAH_HOME = Path(os.environ.get("MYNAH_HOME") or Path.home() / "mynah-s2s")
 LAB_HOME = Path(os.environ.get("MYNAH_LAB_HOME") or MYNAH_HOME / "ml")
 HF_CACHE = MYNAH_HOME / "hf-cache"
+
+_HISTORICAL = "/mynah-s2s/ml/"
+
+
+def resolve(p) -> Path:
+    """A data path as stored in the lab's manifests / symlinks. Archived corpora reuse clips through ABSOLUTE symlinks
+    into the historical layout (``<home>/mynah-s2s/ml/...``); when that target does not exist (another machine, an
+    archive copy) the same file is looked up under ``LAB_HOME``. Existing paths are returned unchanged."""
+    p = Path(p)
+    if p.exists():
+        return p
+    target = os.readlink(p) if p.is_symlink() else str(p)
+    i = target.find(_HISTORICAL)
+    if i >= 0:
+        alt = LAB_HOME / target[i + len(_HISTORICAL):]
+        if alt.exists():
+            return alt
+    return p

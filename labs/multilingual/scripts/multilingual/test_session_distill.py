@@ -176,3 +176,24 @@ def test_regreet_quarantine_only_on_supervised_frames_after_lead():
     assert not S.regreet(ok, 8, decode)                 # the opener before the lead is never inspected
     assert S.regreet(bad, 8, decode)
     assert not S.regreet(padded, 8, decode)
+
+
+def test_labpaths_resolve_maps_historical_symlinks(tmp_path, monkeypatch):
+    """An archived clip is an ABSOLUTE symlink into <home>/mynah-s2s/ml/...; on another layout the same file is found
+    under LAB_HOME. Existing paths and unrelated broken links are returned unchanged."""
+    import importlib
+    lab = tmp_path / "archive" / "ml"
+    (lab / "data" / "v4" / "tts_full").mkdir(parents=True)
+    real = lab / "data" / "v4" / "tts_full" / "a.wav"
+    real.write_bytes(b"RIFF")
+    link = tmp_path / "train" / "a.wav"
+    link.parent.mkdir()
+    link.symlink_to("/nonexistent-home/mynah-s2s/ml/data/v4/tts_full/a.wav")
+    other = tmp_path / "train" / "b.wav"
+    other.symlink_to("/nowhere/b.wav")
+    monkeypatch.setenv("MYNAH_LAB_HOME", str(lab))
+    import labpaths
+    importlib.reload(labpaths)
+    assert labpaths.resolve(link) == real
+    assert labpaths.resolve(real) == real
+    assert labpaths.resolve(other) == other

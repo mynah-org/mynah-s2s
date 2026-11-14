@@ -26,6 +26,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from labpaths import resolve  # noqa: E402  (archived clips: absolute symlinks into the historical layout)
 from session_distill import PAD, session_wav  # noqa: E402
 
 BATCH3 = ["s4-0045", "s4-0107", "s4-0108", "s4-0124", "s4-0130", "s4-0158", "s4-0162", "s4-0166"]
@@ -130,7 +131,7 @@ def main():  # pragma: no cover - GPU
     div_frame, ref_tok = ref_nz[DIV_INDEX]
     enc, emb = {}, {}
     for i in BATCH3:
-        x = sf.read(Path(a.val_data) / rows[i]["path"], dtype="float32")[0]
+        x = sf.read(resolve(Path(a.val_data) / rows[i]["path"]), dtype="float32")[0]
         with torch.no_grad():
             f = se(torch.from_numpy(session_wav(x, cs, 5.0)))["out"]
             enc[i] = f[:cs].float()
