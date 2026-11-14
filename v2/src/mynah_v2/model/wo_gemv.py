@@ -120,7 +120,8 @@ def _build():
 
     @triton.autotune(configs=configs, key=["N", "K", "MP", "FP8"])
     @triton.jit
-    def w8_kernel(x, q, s, y, M, N, K, MP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FP8: tl.constexpr):
+    def w8_kernel(x, q, s, bias, y, M, N, K, MP: tl.constexpr, HAS_BIAS: tl.constexpr, BN: tl.constexpr,
+                  BK: tl.constexpr, FP8: tl.constexpr):
         # batched GEMV: the [BN, BK] weight tile is loaded ONCE and used for all M (<= MP) activation rows
         pid = tl.program_id(0)
         rn = pid * BN + tl.arange(0, BN)
@@ -138,7 +139,10 @@ def _build():
             acc += tl.sum(wq[None, :, :] * xv[:, None, :], 2)
         sc = tl.load(s + rn, mask=rn < N, other=0.0)
         om = (rm[:, None] < M) & (rn[None, :] < N)
-        tl.store(y + rm[:, None] * N + rn[None, :], (acc * sc[None, :]).to(y.dtype.element_ty), mask=om)
+        out = acc * sc[None, :]
+        if HAS_BIAS:
+            out += tl.load(bias + rn, mask=rn < N, other=0.0)[None, :]
+        tl.store(y + rm[:, None] * N + rn[None, :], out.to(y.dtype.element_ty), mask=om)
 
     @triton.autotune(configs=[c for c in configs if c.kwargs["BK"] >= 128], key=["N", "K"])
     @triton.jit
@@ -194,7 +198,7 @@ def _build():
 MAX_BATCHED_M = 16          # batched-decode rows per launch (B sessions); more rows (prompt prefill) → dequant matmul
 
 
-def gemv(x: torch.Tensor, p) -> torch.Tensor:
+def gemv(x: torch.Tensor, p, bias: torch.Tensor | None = None) -> torch.Tensor:
     """x: (..., K) on CUDA; returns (..., N) in x.dtype. w8/f8: true batched kernel for up to MAX_BATCHED_M rows per
     launch (weights read once; MP = next power of two ≥ rows: 1/2/4/8/16 — round 17: with MP capped at 4, B=8 fell back
     to a full dequant per call, 130 ms/step); more rows (e.g. a prompt prefill) go through a dequantized BF16 matmul. w4/nvf4: one launch per row
@@ -209,12 +213,15 @@ def gemv(x: torch.Tensor, p) -> torch.Tensor:
     if f in ("w8", "f8"):
         if mrows > MAX_BATCHED_M:
             w = dequant(p).to(x.dtype)
-            return torch.nn.functional.linear(x, w)
+            b = None if bias is None else bias.to(x.dtype)
+            return torch.nn.functional.linear(x, w, b)
         x2 = x2.contiguous()
         y = torch.empty(mrows, n, device=x.device, dtype=x.dtype)
         mp = 1 << (mrows - 1).bit_length()                # 1, 2, 4, 8, 16
         grid = lambda meta: (_KERNELS["cdiv"](n, meta["BN"]),)  # noqa: E731
-        _KERNELS["w8"][grid](x2, p["q"], p["scale"], y, mrows, n, k, MP=mp, FP8=(f == "f8"))
+        bias_ptr = bias if bias is not None else p["q"]
+        _KERNELS["w8"][grid](x2, p["q"], p["scale"], bias_ptr, y, mrows, n, k,
+                               MP=mp, HAS_BIAS=bias is not None, FP8=(f == "f8"))
         return y.reshape(*x.shape[:-1], n)
     outs = []
     for row in x2:
@@ -228,7 +235,8 @@ def gemv(x: torch.Tensor, p) -> torch.Tensor:
         else:
             raise ValueError(f)
         outs.append(y)
-    return torch.stack(outs).reshape(*x.shape[:-1], n)
+    y = torch.stack(outs).reshape(*x.shape[:-1], n)
+    return y if bias is None else y + bias.to(y.dtype)
 
 
 class WOLinear(torch.nn.Module):
@@ -250,8 +258,7 @@ class WOLinear(torch.nn.Module):
         return {**self._meta, **{k: getattr(self, "p_" + k) for k in self._keys}}
 
     def forward(self, x):
-        y = gemv(x, self.packed())
-        return y if self.bias is None else y + self.bias.to(y.dtype)
+        return gemv(x, self.packed(), self.bias)
 
     def nbytes(self):
         return nbytes(self.packed())
