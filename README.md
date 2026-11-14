@@ -86,16 +86,34 @@ command, use:
 make webui-gpu
 ```
 
-For the GB10 realtime experiment, the lighter INT4 path is opt-in:
+For the GB10 realtime experiment, the lighter INT4 path is opt-in. The short
+form is one switch (the equivalent environment variable is `MYNAH_INT4=1`):
 
 ```bash
-make webui-gpu V2_SERVE_ARGS="--thinker-int4 --int4-heads --int4-group 128 --int4-clip --cudnn-benchmark"
+make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 ```
 
-This quantizes the Thinker projections and text/function output heads with the native INT4 tinygemm path. The recurrent/KV caches, embeddings, ASR/RNNT, TTS, and codec stay in their original formats for compatibility. `--max-backlog 120` can be added when testing a slower-than-realtime build so input is not dropped while measuring it.
+This quantizes the Thinker projections and text/function output heads with the
+native INT4 tinygemm path. The recurrent/KV caches, embeddings, ASR/RNNT, TTS,
+and codec stay in their original formats for compatibility. The longer flags
+(`--thinker-int4`, `--int4-heads`, `--int4-group`, `--int4-clip`) remain
+available for experiments. `--max-backlog 120` can be added when testing a
+slower-than-realtime build so input is not dropped while measuring it.
 
 Perception and EarTTS are deliberately not included in the native PyTorch
 INT4 switch: their CUDA-graph/Triton path needs a model-specific fused kernel.
+
+To avoid quantizing at every server start, export a validated offline pack once:
+
+```bash
+make int4-pack INT4_PACK=/path/to/voicechat-thinker-int4.safetensors
+make webui-gpu V2_SERVE_ARGS="--thinker-int4-pack /path/to/voicechat-thinker-int4.safetensors"
+```
+
+The exporter writes the sibling `.json` manifest. It records the native
+tinygemm packing, module shapes, group size, and explicitly excludes audio
+modules. The server validates the whole manifest before replacing any module;
+the default remains BF16 when no INT4 flag or environment variable is set.
 
 The UI is in English and shows the User/Agent conversation, microphone and
 speaker controls, model activity, tool calls, and an optional editable system

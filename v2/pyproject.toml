@@ -12,6 +12,7 @@ dependencies = [
   "tokenizers==0.22.0",
   "lhotse==1.32.2",
   "huggingface-hub==0.34.4",
+  "safetensors",
   "jinja2",
   "einops",
   "nemo-toolkit",

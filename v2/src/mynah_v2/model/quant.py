@@ -15,6 +15,9 @@ supported: the training-only fused kernel reads ``out_proj.weight`` directly.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
@@ -81,6 +84,37 @@ class Int4Linear(nn.Module):
         self.register_buffer("weight", torch.empty(0, dtype=w.dtype, device=w.device), persistent=False)
         self.bias = lin.bias
 
+    @classmethod
+    def from_packed(cls, lin: nn.Linear, packed: torch.Tensor, scales_zeros: torch.Tensor,
+                    group: int, tiles: int):
+        """Build a tinygemm linear from an offline pack without re-quantizing the checkpoint.
+
+        The original bias is deliberately retained from ``lin``.  This keeps the pack
+        format weight-only and makes loading safe against accidentally changing the
+        model's non-quantized state (biases, caches, embeddings, and audio modules).
+        """
+        if packed.device != lin.weight.device or scales_zeros.device != lin.weight.device:
+            raise ValueError("offline int4 tensors must be loaded on the same device as the model")
+        # Torch's tinygemm pack dtype is device/version dependent: GB10 with
+        # torch 2.10 returns int32, while some builds expose uint8 storage.
+        if packed.dtype not in (torch.int32, torch.uint8):
+            raise ValueError(f"offline int4 packed weights must be int32 or uint8, got {packed.dtype}")
+        if scales_zeros.dtype != torch.bfloat16:
+            raise ValueError(f"offline int4 scales_zeros must be bfloat16, got {scales_zeros.dtype}")
+        expected = _pick(lin.in_features, max_group=group)
+        if expected != (group, tiles):
+            raise ValueError(f"invalid int4 layout for {lin.in_features=} expected {expected}, got {(group, tiles)}")
+        out = cls.__new__(cls)
+        nn.Module.__init__(out)
+        out.in_features, out.out_features = lin.in_features, lin.out_features
+        out.group, out.tiles = group, tiles
+        out.register_buffer("packed", packed.contiguous())
+        out.register_buffer("scales_zeros", scales_zeros.contiguous())
+        out.register_buffer("weight", torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device),
+                            persistent=False)
+        out.bias = lin.bias
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shp = x.shape
         x2 = x.reshape(-1, shp[-1])
@@ -141,4 +175,122 @@ def restore_thinker(originals) -> None:
     for mixer, name, mod in originals:
         setattr(mixer, name, mod)
     torch.cuda.empty_cache()
+
+
+PACK_FORMAT = "mynah.int4.tinygemm.v1"
+
+
+def _replace_child(root: nn.Module, name: str, replacement: nn.Module) -> None:
+    parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+    parent = root.get_submodule(parent_name) if parent_name else root
+    setattr(parent, child_name, replacement)
+
+
+def save_thinker_int4_pack(engine, path: str | Path, max_group: int = 128, clip: bool = False,
+                           include_heads: bool = True) -> dict:
+    """Quantize Thinker weights once and export a portable safetensors pack + manifest.
+
+    This is intentionally weight-only.  The manifest records every replaced module
+    and tinygemm layout; the runtime can validate it before swapping modules.  Audio
+    and recurrent state are not included because their CUDA-graph contracts are
+    model-specific and cannot be made safe by replacing arbitrary ``nn.Linear``
+    objects.
+    """
+    path = Path(path)
+    if path.suffix != ".safetensors":
+        raise ValueError("int4 pack path must end in .safetensors")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    info = quantize_thinker_int4(engine, max_group=max_group, clip=clip, include_heads=include_heads)
+    stt = engine.wrapper.model.stt_model
+    tensors = {}
+    modules = []
+    for name, mod in stt.named_modules():
+        if not isinstance(mod, Int4Linear):
+            continue
+        pk, sk = f"{name}.packed", f"{name}.scales_zeros"
+        tensors[pk] = mod.packed.detach().cpu().contiguous()
+        tensors[sk] = mod.scales_zeros.detach().cpu().contiguous()
+        modules.append({"name": name, "in_features": mod.in_features, "out_features": mod.out_features,
+                        "group": mod.group, "tiles": mod.tiles, "packed_dtype": str(mod.packed.dtype),
+                        "scales_dtype": str(mod.scales_zeros.dtype), "packed_key": pk, "scales_zeros_key": sk,
+                        "has_bias": mod.bias is not None})
+    if not modules:
+        raise RuntimeError("no Thinker int4 modules were produced")
+    manifest = {
+        "format": PACK_FORMAT,
+        "backend": "torch_native_weight_int4pack_mm",
+        "packing": "torch._convert_weight_to_int4pack",
+        "compute_dtype": "bfloat16",
+        "root": "stt_model",
+        "weight_only": True,
+        "audio_modules": "excluded_until_graph_safe_backend",
+        "quantizer": "asymmetric_minmax_tinygemm",
+        "max_group": max_group,
+        "clip_search": clip,
+        "modules": modules,
+        "quant_info": info,
+    }
+    from safetensors.torch import save_file
+    tmp_pack = path.with_name(path.name + ".tmp")
+    tmp_manifest = path.with_suffix(".json.tmp")
+    save_file(tensors, str(tmp_pack), metadata={"format": PACK_FORMAT})
+    tmp_pack.replace(path)
+    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_manifest.replace(path.with_suffix(".json"))
+    return {"path": str(path), "manifest": str(path.with_suffix(".json")), "modules": len(modules), **info}
+
+
+def load_thinker_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
+    """Load and validate an offline pack before replacing Thinker linears.
+
+    ``strict=True`` rejects missing/mismatched modules rather than silently running
+    a partially quantized model.  The caller can opt out only for an explicit A/B
+    experiment; the server uses strict loading.
+    """
+    path = Path(path)
+    manifest_path = path.with_suffix(".json")
+    if not path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(f"int4 pack requires {path} and {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != PACK_FORMAT:
+        raise ValueError(f"unsupported int4 pack format: {manifest.get('format')!r}")
+    stt = engine.wrapper.model.stt_model
+    device = str(next(stt.parameters()).device)
+    from safetensors.torch import load_file
+    tensors = load_file(str(path), device=device)
+    missing = []
+    replacements = []
+    for spec in manifest.get("modules", []):
+        name = spec["name"]
+        try:
+            current = stt.get_submodule(name)
+        except AttributeError:
+            missing.append(name)
+            continue
+        if not isinstance(current, nn.Linear):
+            missing.append(f"{name} (not nn.Linear)")
+            continue
+        shape = (current.out_features, current.in_features)
+        if shape != (spec["out_features"], spec["in_features"]):
+            missing.append(f"{name} (shape {shape} != manifest)")
+            continue
+        try:
+            packed = tensors[spec["packed_key"]]
+            scales = tensors[spec["scales_zeros_key"]]
+            replacement = Int4Linear.from_packed(current, packed, scales, spec["group"], spec["tiles"])
+        except (KeyError, ValueError) as exc:
+            missing.append(f"{name} ({exc})")
+            continue
+        replacements.append((name, replacement))
+    if missing and strict:
+        raise RuntimeError("int4 pack validation failed: " + "; ".join(missing[:8]))
+    for name, replacement in replacements:
+        _replace_child(stt, name, replacement)
+    loaded = len(replacements)
+    if loaded == 0:
+        raise RuntimeError("int4 pack did not replace any module")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"path": str(path), "modules": loaded, "skipped": missing, "format": PACK_FORMAT,
+            "weight_only": manifest.get("weight_only", False), "audio_modules": manifest.get("audio_modules")}
 # End of quantization helpers.

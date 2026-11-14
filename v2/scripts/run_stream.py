@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,10 @@ from mynah_v2.runtime.session import EnhancedOptions, Mode, Session, run_paced
 from mynah_v2.tracing.events import Tracer
 
 sys.path.insert(0, str(DEFAULT_NEMO / "examples/speechlm2"))
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_16k(path):
@@ -147,15 +152,28 @@ def main():
                     "after --perf-profile; non-exact ones (thinker_w8, heads_w8) change the model")
     ap.add_argument("--perf-profile", default=None, choices=["optimized-exact", "optimized-graph"],
                     help="validated performance profile (mynah_v2.model.perf.PROFILES); ENHANCED only")
-    ap.add_argument("--thinker-int4", action="store_true",
+    ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
+                    help="opt-in safe INT4 preset: Thinker projections plus text/function heads; graph-sensitive audio stays BF16")
+    ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: int4 weight-only Thinker (mynah_v2.model.quant); refused in REFERENCE mode")
-    ap.add_argument("--int4-heads", action="store_true",
+    ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
+                    help="load an offline .safetensors + sibling .json native-int4 pack; implies --thinker-int4")
+    ap.add_argument("--int4-heads", action="store_true", default=_env_flag("MYNAH_INT4_HEADS"),
                     help="also quantize the text/function output heads with --thinker-int4; keeps caches and embeddings unchanged")
     ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128])
     ap.add_argument("--int4-clip", action="store_true", help="per-group clipping search (MSE)")
     a = ap.parse_args()
     preset_info = presets.fill(a, presets.SINGLE, a.preset)
     print("PRESET", a.preset, preset_info, flush=True)
+    if a.int4:
+        a.thinker_int4 = True
+        a.int4_heads = True
+    if a.thinker_int4_pack and a.thinker_int4:
+        ap.error("use either --thinker-int4 or --thinker-int4-pack, not both")
+    if a.thinker_int4_pack and a.int4_heads:
+        ap.error("an offline pack already declares whether output heads are included")
+    if a.thinker_int4_pack:
+        a.thinker_int4 = True
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
@@ -208,9 +226,13 @@ def main():
     cache_info = eng.llm_cache_info
     quant_info = None
     if a.thinker_int4:
-        from mynah_v2.model.quant import quantize_thinker_int4
-        quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
-                                           include_heads=a.int4_heads)
+        if a.thinker_int4_pack:
+            from mynah_v2.model.quant import load_thinker_int4_pack
+            quant_info = load_thinker_int4_pack(eng, a.thinker_int4_pack)
+        else:
+            from mynah_v2.model.quant import quantize_thinker_int4
+            quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
+                                               include_heads=a.int4_heads)
         print("THINKER_QUANT", quant_info, flush=True)
     perf_info = None
     if a.perf_profile or a.exp:

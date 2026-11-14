@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,10 @@ from mynah_v2.transport.ws_server import ServerConfig, VoiceServer
 
 sys.path.insert(0, str(Path(__file__).parent))
 from run_stream import read_system_message, render_prompt  # noqa: E402
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def main():
@@ -42,9 +47,13 @@ def main():
                     help="if closing a session takes longer (stuck engine), refuse new sessions until restarted")
     ap.add_argument("--no-llm-cache", action="store_true",
                     help="diagnostic: NVIDIA's shipped no-cache Thinker (default: V2 incremental Thinker)")
-    ap.add_argument("--thinker-int4", action="store_true",
+    ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
+                    help="opt-in safe INT4 preset: Thinker projections plus text/function heads; all graph-sensitive audio stays BF16")
+    ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: replace Thinker backbone linears with native int4 tinygemm; lower memory and may improve GB10 decode speed")
-    ap.add_argument("--int4-heads", action="store_true",
+    ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
+                    help="load an offline .safetensors + sibling .json native-int4 pack; implies --thinker-int4")
+    ap.add_argument("--int4-heads", action="store_true", default=_env_flag("MYNAH_INT4_HEADS"),
                     help="also quantize the text/function output heads with --thinker-int4; keeps caches and embeddings unchanged")
     ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128],
                     help="int4 weight group size for --thinker-int4 (smaller groups preserve more quality but use more metadata)")
@@ -61,6 +70,15 @@ def main():
     presets.add_determinism_args(ap)
     a = ap.parse_args()
     print("PRESET", a.preset, presets.fill(a, presets.SINGLE, a.preset), flush=True)
+    if a.int4:
+        a.thinker_int4 = True
+        a.int4_heads = True
+    if a.thinker_int4_pack and a.thinker_int4:
+        ap.error("use either --thinker-int4 or --thinker-int4-pack, not both")
+    if a.thinker_int4_pack and a.int4_heads:
+        ap.error("an offline pack already declares whether output heads are included")
+    if a.thinker_int4_pack:
+        a.thinker_int4 = True
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
@@ -81,9 +99,13 @@ def main():
     presets.apply_determinism(a)
     print("LLM_CACHE", eng.llm_cache_info, flush=True)
     if a.thinker_int4:
-        from mynah_v2.model.quant import quantize_thinker_int4
-        quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
-                                           include_heads=a.int4_heads)
+        if a.thinker_int4_pack:
+            from mynah_v2.model.quant import load_thinker_int4_pack
+            quant_info = load_thinker_int4_pack(eng, a.thinker_int4_pack)
+        else:
+            from mynah_v2.model.quant import quantize_thinker_int4
+            quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
+                                               include_heads=a.int4_heads)
         print("THINKER_QUANT", quant_info, flush=True)
     if a.perf_profile or a.exp:
         exp = a.exp
