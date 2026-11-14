@@ -525,6 +525,7 @@ def main():  # pragma: no cover - GPU
                      "nat_last": int(lfp.argmax()), "lp_EOTR_last": round(float(lfp[EOTR]), 3),
                      "max_abs_dlogp_last": round(float((lfp - lfs).abs().max()), 4),
                      "same_nat": int(lfp.argmax()) == nat}
+        hm = [t_ for t_ in range(s + 1) if main_pred[t_][0] != st["rec"].get(t_, PAD)]
         res = {"arm": arm, "scenario": sc, "variant": v, "prompt": rep["prompts"][f"{fam(sc)}:{prompt_variant(v)}"],
                "n_resp": len(st["resp"]), "schedule_sha": st["sha"], "nat_last": nat, "lp_EOTR_last": lp_eotr,
                "own_sotc_at_s": main_pred[s][1] == SOTC, "own_func_pad_before_s": all(p[1] == PAD for p in main_pred[:s]),

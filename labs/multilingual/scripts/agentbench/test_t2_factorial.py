@@ -146,3 +146,15 @@ def test_gate_reply_state():
     g = F.gate("t13_found", _cell("reply"), call)
     assert g["reply"] and g["variant_pass"]
     assert F.gate("t14_nf", _cell("new_call", call, 176), call)["identical_recall"]
+
+
+def test_gpu_only_main_has_no_undefined_names():
+    """main() runs only on the GPU: a static check catches a broken edit before a GPU job does (job 129: NameError)."""
+    import pytest
+    api = pytest.importorskip("pyflakes.api")
+    from pyflakes import reporter
+    import io
+    out, err = io.StringIO(), io.StringIO()
+    api.checkPath(str(Path(__file__).resolve().parent / "t2_factorial.py"), reporter.Reporter(out, err))
+    bad = [l for l in out.getvalue().splitlines() if "undefined name" in l or "referenced before assignment" in l]
+    assert not bad, bad
