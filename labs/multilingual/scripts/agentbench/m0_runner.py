@@ -143,6 +143,13 @@ FC_RESUME = {  # the engine's own fc_ctx_fix, parameterised (no engine change); 
 }
 
 
+# Guard metadata for the tenant tools, kept OUT of the tool schemas: the FC template serialises the schemas into the
+# prompt, so an x-source key there would change the model's input. Ids the backend issues must come from a result.
+TENANT_GUARD = {"schemas": {"prepare_return": {"properties": {"customer_id": {"x-source": "result"}}},
+                            "commit_return": {"properties": {"pending_id": {"x-source": "result"}}}},
+                "side_effects": {"commit_return": "pending_id", "escalate_to_human": None}}
+
+
 def set_fc_resume(eng, contract: str) -> None:
     """Re-arm the engine's FC hand-back fix with the given resume contract before a session ('off' = upstream)."""
     from mynah_v2.model import fc_ctx_fix as FX
@@ -243,6 +250,8 @@ def main():
                     help="do not START a session if elapsed + the longest session so far would exceed this (0 = off)")
     ap.add_argument("--no-fc-fix", action="store_true",
                     help="force the post-FC runtime fix flags to 0 (lab default is already OFF since 2026-11-12 14:30)")
+    ap.add_argument("--call-guard", action="store_true",
+                    help="EXPERIMENT: engine call registry + admission control in front of the executor; default off")
     ap.add_argument("--fc-resume-by-label", default="",
                     help="'label=pad_pad|label=pad_eotr|label=eotr_step|label=off': re-arm the engine fc_ctx_fix per plan label")
     ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
@@ -366,15 +375,24 @@ def main():
             tr = Tracer(od / "trace.jsonl", session_id=sid)
             _emit = tr.emit
 
+            guard = None
+            if a.call_guard:                   # EXPERIMENT (engine call_guard), metadata outside the schemas
+                from mynah_v2.agent.call_guard import CallGuard
+                guard = CallGuard(TENANT_GUARD["schemas"], session_id=sid, side_effects=TENANT_GUARD["side_effects"])
+
             def emit(ev, _emit=_emit, **kw):  # instance-level hook, no V2 code change
                 if ev == "asr.generated" and _re.search(r"[A-Za-z]", kw.get("text", "")):
                     act["n"] += 1
                     act["said"].append(kw.get("text", ""))
+                if ev == "asr.generated" and guard is not None:
+                    guard.on_user_text(kw.get("text", ""))
                 if ev == "function.started":
                     act["fstart"].append(kw.get("model_step"))
                 return _emit(ev, **kw)
             tr.emit = emit
             led = ToolLedger(sid, tr)
+            if guard is not None:
+                guard.ledger = led
             state = {"s": None}
             bound = reg.bind(led, lambda: state["s"].turn_id if state["s"] else 0,
                              lambda: state["s"].model_step if state["s"] else None,
@@ -414,11 +432,20 @@ def main():
             _rs = ((getattr(eng, "fc_ctx_fix_info", None) or {}).get("fix") or {}).get("stats") or {}
             n_resume0 = len(_rs.get("resume_inputs", []))
             n_eotr0 = len(_rs.get("eotr_steps", []))
+            guard_un = None
+            if guard is not None:
+                from mynah_v2.agent.call_guard import install
+                guard_un = install(eng, guard, tracer=tr)
             t0 = time.monotonic()
             sess.open(prompt)
             run_paced(sess, wav, pace="realtime", tail_silence_s=a.tail_s, max_extra_s=a.max_extra_s, drain=True)
             wall = time.monotonic() - t0
             sess.close("normal")
+            cg = None
+            if guard is not None:
+                from mynah_v2.agent.call_guard import summary as guard_summary
+                cg = guard_summary(guard)
+                guard_un()
             tr.close()
             import live_gates
             fcev = live_gates.fc_events(od / "trace.jsonl")              # FC openings, calls, results, resumes (M4/C3)
@@ -455,7 +482,8 @@ def main():
                    "audio_in_s": round(wav.numel() / 16000, 1), "audio_out_s": round(len(agent) / T.OUTPUT_SR, 1),
                    "stats": {k: v for k, v in vars(sess.stats).items() if k not in ("step_ms", "step_ms_model")},
                    "grounding_violations": sess.controller.grounding_violations,
-                   "fc_events": fcev, "fc_resume_inputs": resume_inputs, "fc_eotr_steps": eotr_steps}
+                   "fc_events": fcev, "fc_resume_inputs": resume_inputs, "fc_eotr_steps": eotr_steps,
+                   "call_guard": cg}
             (od / "summary.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False))
             with open(out / "records.jsonl", "a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")

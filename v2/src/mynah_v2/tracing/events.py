@@ -27,6 +27,7 @@ TOOL_RUNNING = "tool.running"
 TOOL_COMPLETED = "tool.completed"
 TOOL_FAILED = "tool.failed"
 TOOL_MULTI_CALL = "tool.multi_call"               # ENHANCED: several calls in one call text
+TOOL_GUARD = "tool.guard"                         # EXPERIMENT call guard: a call admitted or refused before execution
 TOOL_RESULT_LATE = "tool.result.late"            # result after timeout/cancel/stale, or a 2nd delivery
 TOOL_RESULT_INJECTED = "tool.result.injected"
 TOOL_RESULT_CONSUMED = "tool.result.consumed"

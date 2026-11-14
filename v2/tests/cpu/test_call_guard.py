@@ -328,3 +328,29 @@ def test_close_frees_everything_and_refuses_late_calls():
     assert g.reg.entries() == [] and not g.issued
     d = g.admit("prepare_return", {"item": "x", "customer_id": "C1002"})
     assert d.rule == "closed" and json.loads(d.response)["status"] == "not_executed"
+
+
+def test_install_wraps_and_restores_the_engine_executor():
+    from types import SimpleNamespace
+
+    from mynah_v2.agent.call_guard import install, summary
+    from mynah_v2.tracing.events import Tracer
+    ran = []
+    pipe = SimpleNamespace(_execute_tool_call=lambda t: (ran.append(t), NF("qgq999"))[1])
+    orig = pipe._execute_tool_call
+    eng = SimpleNamespace(pipeline=pipe)
+    tr = Tracer(None, session_id="s")
+    g = CallGuard(session_id="s")
+    un = install(eng, g, tracer=tr)
+    assert pipe._execute_tool_call is not orig
+    g.on_user_text("order Q Q nine nine nine")
+    c = ct("get_order_status", {"order_id": "qgq999"})
+    pipe._execute_tool_call(c)
+    refused = json.loads(pipe._execute_tool_call(c))
+    assert refused["status"] == "not_executed" and len(ran) == 1
+    ev = [e for e in tr.events if e.name == "tool.guard"]
+    assert [e.fields["allow"] for e in ev] == [True, False] and ev[1].fields["rule"] == "repeat"
+    s = summary(g)
+    assert s["admitted"] == 1 and s["refused"] == {"repeat": 1}
+    un()
+    assert pipe._execute_tool_call is orig and g.closed

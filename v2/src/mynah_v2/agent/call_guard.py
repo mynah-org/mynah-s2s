@@ -345,7 +345,9 @@ def guarded_executor(execute: Callable[[str], str | None], guard: CallGuard, tra
         for c in calls:
             d = guard.admit(c.name, c.arguments)
             if tracer is not None:
-                tracer.emit("tool.guard", tool=c.name, args=c.arguments, allow=d.allow, rule=d.rule)
+                from mynah_v2.tracing import events as E
+                tracer.emit(E.TOOL_GUARD, tool=c.name, args=c.arguments, allow=d.allow, rule=d.rule,
+                            input_epoch=guard.input_epoch)
             if not d.allow:
                 out.append(d.response)
                 continue
@@ -361,3 +363,28 @@ def guarded_executor(execute: Callable[[str], str | None], guard: CallGuard, tra
         return ", ".join(r if r is not None else json.dumps({"error": "invalid_call"}) for r in out)
 
     return run
+
+
+def install(engine, guard: CallGuard, tracer=None) -> Callable[[], None]:
+    """Put ``guard`` in front of a single-session engine's executor (``engine.pipeline._execute_tool_call``, the
+    function NeMo's FC loop calls; set before the session's FC threads start). Returns ``uninstall``: restores the
+    previous executor and frees the guard. For B>1 the routed per-session executor would be wrapped instead."""
+    p = engine.pipeline
+    prev = p._execute_tool_call
+    p._execute_tool_call = guarded_executor(prev, guard, tracer)
+
+    def uninstall() -> None:
+        p._execute_tool_call = prev
+        guard.close()
+    return uninstall
+
+
+def summary(guard: CallGuard) -> dict:
+    """What a run records: every decision, the refusals by rule, the registry size at the end."""
+    log = list(guard.log)
+    by_rule: dict[str, int] = {}
+    for r in log:
+        if not r["allow"]:
+            by_rule[r["rule"]] = by_rule.get(r["rule"], 0) + 1
+    return {"decisions": log, "admitted": sum(r["allow"] for r in log), "refused": by_rule,
+            "input_epoch": guard.input_epoch, "entries_left": len(guard.reg.entries())}

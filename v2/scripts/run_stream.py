@@ -107,6 +107,9 @@ def main():
                     help="persona / instructions placed in NVIDIA's FC prompt template together with the tool schemas "
                          "(text, or @file.txt); default: NVIDIA's default system message")
     ap.add_argument("--tool-delay", type=float, default=0.0)
+    ap.add_argument("--call-guard", action="store_true",
+                    help="EXPERIMENT: per-session call registry + admission control in front of the executor "
+                         "(mynah_v2.agent.call_guard); default off")
     ap.add_argument("--override", action="append", default=[], help="cfg key=value (OmegaConf dotlist)")
     presets.add_determinism_args(ap)
     ap.add_argument("--no-llm-cache", action="store_true",
@@ -253,6 +256,18 @@ def main():
             np.random.seed(a.seed)
             torch.manual_seed(a.seed)
             torch.cuda.manual_seed_all(a.seed)
+        guard, guard_un = None, None
+        if a.call_guard:                       # EXPERIMENT: refusals answer the model, the backend never sees them
+            from mynah_v2.agent.call_guard import CallGuard, install
+            guard = CallGuard(session_id=stem, ledger=led)
+            _emit = tr.emit
+
+            def _guard_emit(ev, _emit=_emit, _g=guard, **kw):   # caller speech (RNN-T user text) = new input epoch
+                if ev == "asr.generated":
+                    _g.on_user_text(kw.get("text", ""))
+                return _emit(ev, **kw)
+            tr.emit = _guard_emit
+            guard_un = install(eng, guard, tracer=tr)
         sess.open(prompt)
         stop_hook = None
         if a.fc_interrupt:
@@ -283,6 +298,11 @@ def main():
         tt = eng.token_tensors()
         recs = list(eng.fc_records)
         sess.close(a.close_kind)
+        cg = None
+        if guard is not None:
+            from mynah_v2.agent.call_guard import summary as guard_summary
+            cg = guard_summary(guard)
+            guard_un()
         tr.close()
         agent = np.concatenate(agent_chunks) if agent_chunks else np.zeros(0, np.float32)
         sf.write(od / "agent.wav", agent, T.OUTPUT_SR)
@@ -315,6 +335,7 @@ def main():
             "max_mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2),
             "llm_cache": cache_info, "thinker_quant": quant_info, "perf_profile": perf_info,
             "preset": {"name": a.preset, **preset_info}, "determinism": det_info,
+            "call_guard": cg,
         }
         summ["token_ids"] = {"text": list(sess.text_ids), "func": list(sess.func_ids)}
         if tt is not None:

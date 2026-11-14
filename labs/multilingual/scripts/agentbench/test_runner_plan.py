@@ -54,3 +54,17 @@ if __name__ == "__main__":
     test_parse_plan()
     test_set_model_cfg()
     print("OK runner plan/cfg")
+
+
+def test_tenant_guard_metadata_stays_out_of_the_prompt():
+    """TENANT_GUARD names real tenant tools and parameters; the tenant schemas (rendered into the prompt) carry no
+    guard keys, so --call-guard never changes the model's input."""
+    import json
+    spec = json.load(open(Path(__file__).resolve().parent / "tenant_furniture.json"))
+    tools = {t["name"]: t["parameters"] for t in spec["tools"]}
+    g = ns["TENANT_GUARD"]
+    for name, sch in g["schemas"].items():
+        assert set(sch["properties"]) <= set(tools[name]["properties"]), name
+    for name, key in g["side_effects"].items():
+        assert name in tools and (key is None or key in tools[name]["properties"])
+    assert "x-source" not in json.dumps(spec["tools"])
