@@ -69,6 +69,27 @@ make demo       # one call: "Can you look up order A B C four five six?" -> tool
 make help       # all targets
 ```
 
+## Web UI
+
+The local HTML5 voice-agent UI lives in `webui/`. It runs with Python and `uv`,
+without Node.js or a frontend build step. The default demo uses simulated
+scenarios and tool calls, so it does not require a model or GPU:
+
+```bash
+make webui
+```
+
+Open <http://127.0.0.1:8787>. To start the V2 runtime and connect the UI in one
+command, use:
+
+```bash
+make webui-gpu
+```
+
+The UI is in English and shows the User/Agent conversation, microphone and
+speaker controls, model activity, tool calls, and an optional editable system
+prompt. More details are in [`webui/README.md`](webui/README.md).
+
 | goal | command |
 |---|---|
 | one conversation, any corpus item (q03 general knowledge, t13 correction mid-call, s05 small talk) | `make demo ITEM=t13` |
