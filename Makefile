@@ -9,7 +9,7 @@ GROUP ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-all setup-tts setup-asr doctor ws-check corpus test-cpu test-gpu demo e2e-fc e2e-corpus multi multi-notools \
-        multi-mixed custom serve client asr score reproduce
+        multi-mixed custom serve client webui webui-gpu asr score reproduce
 
 help: ## show this list
 	@echo "mynah-s2s V2 (work in progress)"
@@ -52,6 +52,20 @@ custom: ## custom scenario + persona prompt (default: v2/eval/examples/furniture
 
 serve: ## realtime WebSocket server on :8765 (one session at a time); stop with Ctrl-C
 	$(M) serve
+
+WEBUI_ARGS ?=
+WEBUI_GPU_LOG ?= /tmp/mynah-v2-webui-gpu.log
+webui: ## local HTML5 UI + Python bridge on http://127.0.0.1:8787 (no Node.js)
+	uv run --project webui --no-sync python webui/server.py $(WEBUI_ARGS)
+webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ctrl-C
+	@set -e; \
+	$(M) serve >$(WEBUI_GPU_LOG) 2>&1 & gpu_pid=$$!; \
+	trap 'kill $$gpu_pid 2>/dev/null || true' EXIT INT TERM; \
+	until grep -q '^READY' $(WEBUI_GPU_LOG); do \
+		kill -0 $$gpu_pid 2>/dev/null || { tail -40 $(WEBUI_GPU_LOG); exit 1; }; \
+		sleep 2; \
+	done; \
+	uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS)
 client: ## stream a WAV to the server at real-time pace: make client WAV=path/to.wav
 	$(M) client $(WAV)
 ws-check: ## non-interactive server + client round trip on one corpus item (WS_ITEM=q03 by default); fails on dropped audio / no answer
