@@ -55,8 +55,9 @@ serve: ## realtime WebSocket server on :8765 (one session at a time); stop with 
 
 WEBUI_ARGS ?=
 WEBUI_GPU_LOG ?= /tmp/mynah-v2-webui-gpu.log
+WEBUI_PYTHON ?= $(if $(wildcard $(HOME)/mynah-s2s/.venv-v2/bin/python),$(HOME)/mynah-s2s/.venv-v2/bin/python,python3)
 webui: ## local HTML5 UI + Python bridge on http://127.0.0.1:8787 (no Node.js)
-	uv run --project webui --no-sync python webui/server.py $(WEBUI_ARGS)
+	@if command -v uv >/dev/null 2>&1; then uv run --project webui --no-sync python webui/server.py $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py $(WEBUI_ARGS); fi
 webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ctrl-C
 	@set -e; \
 	$(M) serve >$(WEBUI_GPU_LOG) 2>&1 & gpu_pid=$$!; \
@@ -65,7 +66,7 @@ webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ct
 		kill -0 $$gpu_pid 2>/dev/null || { tail -40 $(WEBUI_GPU_LOG); exit 1; }; \
 		sleep 2; \
 	done; \
-	uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS)
+	if command -v uv >/dev/null 2>&1; then uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS); fi
 client: ## stream a WAV to the server at real-time pace: make client WAV=path/to.wav
 	$(M) client $(WAV)
 ws-check: ## non-interactive server + client round trip on one corpus item (WS_ITEM=q03 by default); fails on dropped audio / no answer
