@@ -86,7 +86,8 @@ def _encode_kernels():
         tl.store(indices + row * tl.cdiv(V, BLOCK_V) + block, local_idx, mask=row < P)
 
     @triton.jit
-    def reduce(values, indices, best, P, NB: tl.constexpr):
+    def reduce_update(values, indices, r, code, q, scale, minimum, P, D, depth, H,
+                      G: tl.constexpr, NB: tl.constexpr, BLOCK_H: tl.constexpr):
         row = tl.program_id(0)
         best_value = float("inf")
         best_index = 0
@@ -96,15 +97,9 @@ def _encode_kernels():
             take = value < best_value
             best_value = tl.where(take, value, best_value)
             best_index = tl.where(take, index, best_index)
-        tl.store(best + row, best_index, mask=row < P)
-
-    @triton.jit
-    def update(r, best, code, q, scale, minimum, P, D, depth, H, G: tl.constexpr,
-               BLOCK_H: tl.constexpr):
-        row = tl.program_id(0)
         h = tl.arange(0, BLOCK_H)
         valid_h = h < H
-        idx = tl.load(best + row).to(tl.int32)
+        idx = best_index.to(tl.int32)
         half_h = H // 2
         groups = H // G
         packed = tl.load(q + idx * half_h + h // 2, mask=valid_h, other=0)
@@ -114,12 +109,11 @@ def _encode_kernels():
         pos = row * H + h
         old = tl.load(r + pos, mask=valid_h, other=0.0).to(tl.float32)
         tl.store(r + pos, (old - (nib * sc + mn)).to(r.dtype.element_ty), mask=valid_h)
-        # All lanes write the same scalar index.  A scalar store avoids a
-        # block mask on a scalar pointer (and is harmless because the value is
-        # identical in every lane).
+        # All lanes write the same scalar index. A scalar store avoids a block
+        # mask on a scalar pointer and is harmless because the value is equal.
         tl.store(code + row * D + depth, idx)
 
-    _ENCODE_KERNELS = (distance, reduce, update)
+    _ENCODE_KERNELS = (distance, reduce_update)
     return _ENCODE_KERNELS
 
 
@@ -222,20 +216,19 @@ class RVQInt4Encoder(nn.Module):
             code.reshape(-1, self.depth).copy_(flat_code)
             return code
         import triton
-        distance, reduce, update = _encode_kernels()
+        distance, reduce_update = _encode_kernels()
         p = r.shape[0]
         nb = triton.cdiv(self.vocab, self.block_v)
         values = torch.empty((p, nb), dtype=torch.float32, device=r.device)
         indices = torch.empty((p, nb), dtype=torch.int32, device=r.device)
-        best = torch.empty((p,), dtype=torch.int32, device=r.device)
         grid_distance = (p * nb,)
         for qi in range(depth_str, end):
             distance[grid_distance](r, self.q[qi], self.scale[qi], self.minimum[qi], values, indices,
                                     p, self.vocab, self.hidden, G=self.group,
                                     BLOCK_V=self.block_v, BLOCK_H=self.block_h)
-            reduce[(p,)](values, indices, best, p, NB=nb)
-            update[(p,)](r, best, flat_code, self.q[qi], self.scale[qi], self.minimum[qi],
-                         p, self.depth, qi, self.hidden, G=self.group, BLOCK_H=self.block_h)
+            reduce_update[(p,)](values, indices, r, flat_code, self.q[qi], self.scale[qi], self.minimum[qi],
+                                p, self.depth, qi, self.hidden, G=self.group, NB=nb,
+                                BLOCK_H=self.block_h)
         code.reshape(-1, self.depth).copy_(flat_code)
         return code
 
