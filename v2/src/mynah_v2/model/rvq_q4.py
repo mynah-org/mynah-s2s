@@ -97,18 +97,19 @@ def _encode_kernels():
             take = value < best_value
             best_value = tl.where(take, value, best_value)
             best_index = tl.where(take, index, best_index)
-        h = tl.arange(0, BLOCK_H)
-        valid_h = h < H
         idx = best_index.to(tl.int32)
         half_h = H // 2
         groups = H // G
-        packed = tl.load(q + idx * half_h + h // 2, mask=valid_h, other=0)
-        nib = tl.where((h & 1) == 0, packed & 0xF, packed >> 4).to(tl.float32)
-        sc = tl.load(scale + idx * groups + h // G, mask=valid_h, other=0.0).to(tl.float32)
-        mn = tl.load(minimum + idx * groups + h // G, mask=valid_h, other=0.0).to(tl.float32)
-        pos = row * H + h
-        old = tl.load(r + pos, mask=valid_h, other=0.0).to(tl.float32)
-        tl.store(r + pos, (old - (nib * sc + mn)).to(r.dtype.element_ty), mask=valid_h)
+        for h0 in tl.range(0, H, BLOCK_H):
+            h = h0 + tl.arange(0, BLOCK_H)
+            valid_h = h < H
+            packed = tl.load(q + idx * half_h + h // 2, mask=valid_h, other=0)
+            nib = tl.where((h & 1) == 0, packed & 0xF, packed >> 4).to(tl.float32)
+            sc = tl.load(scale + idx * groups + h // G, mask=valid_h, other=0.0).to(tl.float32)
+            mn = tl.load(minimum + idx * groups + h // G, mask=valid_h, other=0.0).to(tl.float32)
+            pos = row * H + h
+            old = tl.load(r + pos, mask=valid_h, other=0.0).to(tl.float32)
+            tl.store(r + pos, (old - (nib * sc + mn)).to(r.dtype.element_ty), mask=valid_h)
         # All lanes write the same scalar index. A scalar store avoids a block
         # mask on a scalar pointer and is harmless because the value is equal.
         tl.store(code + row * D + depth, idx)

@@ -26,8 +26,8 @@ def _kernel():
     import triton.language as tl
 
     @triton.jit
-    def selected_q4(x, q, scale, minimum, ids, y, B, D, K, G: tl.constexpr,
-                   BLOCK_D: tl.constexpr, BLOCK_K: tl.constexpr):
+    def selected_q4(x, q, scale, minimum, bias, ids, y, B, D, K, G: tl.constexpr,
+                   HAS_BIAS: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_K: tl.constexpr):
         bid = tl.program_id(0)
         pd = tl.program_id(1)
         d = pd * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -48,6 +48,8 @@ def _kernel():
             mn = tl.load(minimum + s_base + gi[None, :], mask=mask_d[:, None] & mask_k[None, :], other=0.0)
             xv = tl.load(x + bid * K + k, mask=mask_k, other=0.0).to(tl.float32)
             acc += tl.sum((nib * sc.to(tl.float32) + mn.to(tl.float32)) * xv[None, :], axis=1)
+        if HAS_BIAS:
+            acc += tl.load(bias + idx * D + d, mask=mask_d, other=0.0).to(tl.float32)
         tl.store(y + bid * D + d, acc.to(y.dtype.element_ty), mask=mask_d)
 
     _KERNEL = selected_q4
@@ -104,11 +106,11 @@ class SelectedMoGQ4(nn.Module):
             import triton
             y = torch.empty((x2.shape[0], self.out_size), device=x2.device, dtype=x2.dtype)
             _kernel()[(x2.shape[0], triton.cdiv(self.out_size, 64))](
-                x2, self.q, self.scale, self.minimum, ids, y,
+                x2, self.q, self.scale, self.minimum, self.bias, ids, y,
                 x2.shape[0], self.out_size, self.in_features,
-                G=self.group, BLOCK_D=64, BLOCK_K=128,
+                G=self.group, HAS_BIAS=self.bias.numel() > 0, BLOCK_D=64, BLOCK_K=128,
             )
-        if self.bias.numel():
+        if self.bias.numel() and x2.device.type != "cuda":
             y = y + self.bias.view(self.num_predictions, self.out_size)[ids].to(y.dtype)
         return y.to(x.dtype).reshape(*shape, self.out_size)
 
