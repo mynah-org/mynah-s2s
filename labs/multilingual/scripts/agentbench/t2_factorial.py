@@ -372,7 +372,7 @@ def main():  # pragma: no cover - GPU
         else:
             resp = list(w._build_fc_response_tokens(wrapped))
         tlen = trace_lengths(sess)
-        call_text = ths[(fam(sc), "orig")].decode(call[:-1])
+        call_text = th.decode(call[:-1])               # tokenizer only: any Thinker decodes the same
         v0 = {"call_steps": [len(call), tlen.get("call_steps")], "result_steps": [len(resp) + 1, tlen.get("result_steps")],
               "result_chars": [len(conv), tlen.get("result_chars")],
               "call_has_args": all(str(v) in call_text for v in cfg["args"].values())}
