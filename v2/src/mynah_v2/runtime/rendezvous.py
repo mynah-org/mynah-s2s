@@ -828,6 +828,26 @@ class RendezvousEngine:
                     return "failed"
                 self.cv.wait(min(left, 0.05))
 
+    def _resume_order(self, sids: list[str]) -> list[str]:
+        """Resume the currently swapped-in session first.
+
+        A worker keeps its session state swapped in while it is parked.  The
+        old fixed order therefore paid an unnecessary full capture/restore
+        pair at the start of every stage: if B was active and the requests
+        were ``[A, B]``, resuming A then B caused B→A→B swaps.  Keeping the
+        active worker first reduces that to B→A while preserving the set of
+        requests, their phase ordering, and the batch composition.
+        """
+        active = self.multi.store.active
+        if active not in sids:
+            return sids
+        return [active, *[sid for sid in sids if sid != active]]
+
+    def _resume_parked(self, sids: list[str], state: dict[str, str]) -> None:
+        """Resume a phase's parked workers in swap-minimising order."""
+        for sid in self._resume_order(sids):
+            state[sid] = self._run_until_parked(sid)
+
     @_gpu_exclusive
     def _handoff(self, sid, w, job):
         """Switch ``sid`` in and give it the baton. Under the capture-guard lock: while any thread holds an open
@@ -897,24 +917,20 @@ class RendezvousEngine:
             perc = [s for s in parked if self.workers[s].req.kind == "perception"]
             if perc:                                       # perception first: Thinker-parked sessions keep waiting
                 self._serve_perception([self.workers[s].req for s in perc])
-                for s in perc:
-                    state[s] = self._run_until_parked(s)
+                self._resume_parked(perc, state)
                 continue
             think = [s for s in parked if self.workers[s].req.kind == "thinker"]
             if think:                                      # codec-parked sessions wait until no Thinker is pending
                 self._serve([self.workers[s].req for s in think] + self._take_fc_for_merge())
-                for s in think:
-                    state[s] = self._run_until_parked(s)
+                self._resume_parked(think, state)
                 continue
             tts = [s for s in parked if self.workers[s].req.kind == "eartts"]
             if tts:                                        # EarTTS after the Thinker, before the codec
                 self._serve_eartts([self.workers[s].req for s in tts])
-                for s in tts:
-                    state[s] = self._run_until_parked(s)
+                self._resume_parked(tts, state)
                 continue
             self._serve_codec([self.workers[s].req for s in parked])
-            for s in parked:
-                state[s] = self._run_until_parked(s)
+            self._resume_parked(parked, state)
         for s in live:
             w = self.workers[s]
             if state[s] == "failed":

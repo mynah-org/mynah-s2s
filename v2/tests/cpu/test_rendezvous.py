@@ -213,6 +213,17 @@ def test_pair_equals_solo_with_real_batched_steps_and_thinker_only_on_the_coordi
     rz.close_all()
 
 
+def test_stage_resume_keeps_current_session_first_to_avoid_redundant_state_swaps():
+    _, m, be, rz = rz_engine()
+    open_(rz, "A")
+    open_(rz, "B")
+    assert rz.multi.store.active == "B"
+    assert rz._resume_order(["A", "B"]) == ["B", "A"]
+    assert rz._resume_order(["B"]) == ["B"]
+    assert rz._resume_order(["A"]) == ["A"]
+    rz.close_all()
+
+
 def test_one_session_ends_while_the_other_continues_unbatched():
     sa, sb = solo("A", 2), solo("B", 5)
     _, m, be, rz = rz_engine()
