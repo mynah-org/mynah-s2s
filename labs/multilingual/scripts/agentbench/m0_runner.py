@@ -118,6 +118,7 @@ def write_run_config(out, eng, runtime_fix: dict) -> dict:
           "engine_src_sha256": h.hexdigest(), "nemo_git": runtime_fix.get("nemo_git"), "nemo_dirty": runtime_fix.get("nemo_dirty"),
           "checkpoint": cfg.get("s2s", {}).get("llm_checkpoint_path") if isinstance(cfg, dict) else None,
           "preset": "none (ReferenceEngine, llm_cache=True, m0_runner defaults)",
+          "exp": runtime_fix.get("exp"), "exp_info": runtime_fix.get("exp_info"),
           "engine_fc_ctx_fix": runtime_fix.get("engine_fc_ctx_fix"), "resume_contract": runtime_fix.get("resume_contract"),
           "legacy_lab_flags": {k: runtime_fix.get(k) for k in ("S2S_FIX_CONTEXT_PAD", "S2S_FIX_FC_TOKEN_SYNC")},
           "legacy_lab_flags_effective": runtime_fix.get("legacy_lab_flags_effective"), "effective_cfg": cfg}
@@ -257,6 +258,10 @@ def main():
                     help="EXPERIMENT (with --call-guard): compare call slots / intents with the caller ASR, observe only")
     ap.add_argument("--guard-compact", action="store_true",
                     help="EXPERIMENT (with --call-guard): short refusal responses (fewer FC phase-2 steps)")
+    ap.add_argument("--perf-profile", default="", help="mynah_v2 perf profile applied with --exp (e.g. optimized-graph)")
+    ap.add_argument("--exp", default="",
+                    help="comma list of mynah_v2 perf experiments applied once after load (e.g. the release preset's "
+                         "list, which includes the fast FC phase 2); empty = none, as before")
     ap.add_argument("--fc-resume-by-label", default="",
                     help="'label=pad_pad|label=pad_eotr|label=eotr_step|label=off': re-arm the engine fc_ctx_fix per plan label")
     ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
@@ -275,6 +280,13 @@ def main():
     man = {(r["id"], r["lang"], r["voice"]): r for r in map(json.loads, open(root / "manifest.jsonl"))}
     eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo")), llm_cache=True)
     print(f"engine loaded in {eng.load_s:.1f}s", flush=True)
+    exp_info = None
+    if a.exp or a.perf_profile:
+        if a.mode != "enhanced":
+            raise SystemExit("--exp is ENHANCED only")
+        from mynah_v2 import presets as _presets
+        exp_info = _presets.apply(eng, a.perf_profile or None, a.exp, strict=False)
+        print("EXP", json.dumps(exp_info, default=str)[:2000], flush=True)
     old_fb_default = eng.wrapper.model_cfg.get("first_turn_fallback_frames", None)   # None = code default 50
     import os as _os
     import nemo.collections.speechlm2.inference.pipelines.streaming_s2s_pipeline as _pl
@@ -297,6 +309,7 @@ def main():
     runtime_fix["engine_fc_ctx_fix"] = engine_fix_summary(eng)     # the engine's own FC hand-back fix (M4: recorded)
     from live_gates import DOUBLE, resume_contract
     runtime_fix["resume_contract"] = resume_contract(runtime_fix)
+    runtime_fix["exp"], runtime_fix["exp_info"] = (a.perf_profile, a.exp) if exp_info else None, exp_info
     print("RUNTIME_FIX", runtime_fix, flush=True)
     if runtime_fix["resume_contract"] == DOUBLE:
         raise SystemExit("both FC hand-back fixes are active (lab NeMo patch + engine fc_ctx_fix): refused, results "
