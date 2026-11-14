@@ -81,7 +81,8 @@ class StaticHandler(SimpleHTTPRequestHandler):
             self._json({"scenarios": list(SCENARIOS.values())})
             return
         if path == "/api/config":
-            self._json({"gpu_configured": bool(self.server.v2_ws), "ws_path": "/ws"})
+            configured = bool(self.server.v2_ws)
+            self._json({"gpu_configured": configured, "v2_reachable": probe_v2(self.server.v2_ws) if configured else False, "ws_path": "/ws"})
             return
         if path == "/" or path == "":
             self.path = "/index.html"
@@ -105,6 +106,20 @@ class WebUIHTTPServer(ThreadingHTTPServer):
     def __init__(self, address, handler, *, v2_ws: str | None):
         self.v2_ws = v2_ws
         super().__init__(address, handler)
+
+
+def probe_v2(v2_ws: str | None) -> bool:
+    """Check the V2 TCP listener without creating a model session."""
+    if not v2_ws:
+        return False
+    target = urlparse(v2_ws)
+    if target.hostname is None or target.port is None:
+        return False
+    try:
+        with socket.create_connection((target.hostname, target.port), timeout=0.4):
+            return True
+    except OSError:
+        return False
 
 
 async def emit(ws, ev: str, **fields):

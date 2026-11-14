@@ -1,4 +1,4 @@
-const state = { scenarios: {}, ws: null, transport: "demo", connected: false, mic: null, audioIn: null, audioOut: null, nextPlayback: 0, events: 0, t0: 0, seenText: "" };
+const state = { scenarios: {}, ws: null, transport: "demo", gpuConfigured: false, connected: false, mic: null, audioIn: null, audioOut: null, nextPlayback: 0, events: 0, t0: 0, seenText: "" };
 const $ = (id) => document.getElementById(id);
 
 async function boot() {
@@ -17,7 +17,9 @@ async function boot() {
   updateMicButton();
   updateMicNote();
   const config = await fetch("/api/config").then((r) => r.json());
+  state.gpuConfigured = Boolean(config.gpu_configured && config.v2_reachable !== false);
   if (!config.gpu_configured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · not configured"; }
+  else if (!state.gpuConfigured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · offline"; }
 }
 
 function currentScenario() { return state.scenarios[$("scenarioSelect").value]; }
@@ -40,6 +42,7 @@ function updateMicNote() {
 function connect() {
   if (state.ws && state.ws.readyState < 2) { state.ws.close(); return; }
   state.transport = $("transportSelect").value;
+  if (state.transport === "gpu" && !state.gpuConfigured) { setConnection("error", "V2 bridge not configured"); setAgent("error", "Voice agent unavailable"); setSession("GPU not configured"); setMicNote("This page is not connected to a GPU bridge. Open the SSH-tunnel URL, then refresh."); $("micButton").disabled = true; return; }
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   // Ask the browser for a 16 kHz capture context, matching the V2 client
   // contract. If a browser chooses another rate, advertise that exact rate
@@ -49,7 +52,7 @@ function connect() {
   state.ws.binaryType = "arraybuffer";
   state.ws.onopen = () => { setConnection("ok", state.transport === "gpu" ? "V2 bridge connected" : "Demo bridge connected"); $("connectButton").textContent = "Disconnect"; $("micButton").disabled = false; setSession("Opening agent…", true); state.t0 = performance.now(); const rate = state.audioIn?.sampleRate || 16000; state.ws.send(JSON.stringify({type:"session.start", transport:state.transport, scenario:currentScenario().id, system_prompt:$("promptEditor").value, input_rate:rate})); };
   state.ws.onmessage = (e) => { if (typeof e.data === "string") handleJson(JSON.parse(e.data)); else playPcm(e.data); };
-  state.ws.onerror = () => { setConnection("error", "Bridge unreachable"); setAgent("error", "Voice agent offline"); setSession("Error"); };
+  state.ws.onerror = () => { setConnection("error", state.transport === "gpu" ? "V2 bridge unreachable" : "Demo bridge unreachable"); setAgent("error", "Voice agent offline"); setSession("Connection error"); $("micButton").disabled = true; };
   state.ws.onclose = () => { state.connected = false; $("connectButton").textContent = "Reconnect"; $("micButton").disabled = true; stopMic(); setAgent("idle", "Voice agent offline"); setConnection("idle", state.transport === "gpu" ? "V2 bridge offline" : "Demo bridge offline"); setSession("Disconnected"); updateMicNote(); };
 }
 
@@ -97,7 +100,7 @@ async function toggleMic() {
 }
 function stopMic() { if (!state.mic) return; state.mic.stream.getTracks().forEach((t) => t.stop()); state.mic.ctx.close(); state.mic = null; state.audioIn = null; updateMicButton(); $("waveform").classList.remove("active"); }
 function playPcm(buffer) { if (!state.audioOut) state.audioOut = new AudioContext({sampleRate:22050}); const ctx = state.audioOut; if (ctx.state === "suspended") ctx.resume(); const pcm = new Int16Array(buffer); const data = ctx.createBuffer(1, pcm.length, 22050); const channel = data.getChannelData(0); for (let i=0;i<pcm.length;i++) channel[i] = pcm[i] / 32768; const src = ctx.createBufferSource(); src.buffer = data; src.connect(ctx.destination); state.nextPlayback = Math.max(state.nextPlayback, ctx.currentTime) + data.duration; src.start(Math.max(ctx.currentTime, state.nextPlayback - data.duration)); }
-function speakDemo(text) { if (state.transport !== "demo" || !window.speechSynthesis || !text) return; window.speechSynthesis.cancel(); const utterance = new SpeechSynthesisUtterance(text); utterance.lang = "en-US"; utterance.rate = .98; window.speechSynthesis.speak(utterance); }
+function speakDemo(text) { if (state.transport !== "demo" || !window.speechSynthesis || !text) return; window.speechSynthesis.cancel(); const voices = window.speechSynthesis.getVoices(); const voice = voices.find((v) => /^en-US$/i.test(v.lang) && /Samantha|Alex|Google US English/i.test(v.name)) || voices.find((v) => /^en(-|_)/i.test(v.lang)); const utterance = new SpeechSynthesisUtterance(text); utterance.lang = "en-US"; if (voice) utterance.voice = voice; utterance.rate = .96; utterance.pitch = 1; window.speechSynthesis.speak(utterance); }
 function trySuggestion() { if (!state.ws || state.ws.readyState !== 1) { setMicNote("Connect first, then run the guided example."); setSession("Connect first"); return; } if (state.transport !== "demo") { setMicNote("This example runs in Local simulation. For GPU, speak through the microphone."); return; } state.ws.send(JSON.stringify({type:"demo.request", scenario:currentScenario().id})); setMicNote("Running guided example — watch the activity stream."); setSession("Agent working", true); }
 function resetSession() { const ws = state.ws; state.ws = null; if (ws) { ws.onclose = null; ws.close(); } stopMic(); state.events = 0; $("eventCount").textContent = "0"; $("latencyValue").textContent = "—"; $("activityList").innerHTML = '<div class="empty-state compact"><span class="empty-icon">⌁</span><p>No events yet</p><small>Tool calls and model phases will appear here.</small></div>'; $("transcript").innerHTML = '<div class="empty-state"><span class="empty-icon">◌</span><p>Your conversation will appear here.</p><small>Connect, then start the microphone or run the guided example.</small></div>'; setConnection("idle", state.transport === "gpu" ? "V2 GPU bridge offline" : "Local demo offline"); setAgent("idle", "Voice agent offline"); $("connectButton").textContent = "Connect"; $("micButton").disabled = true; setSession("Ready"); updateMicNote(); }
 boot();
