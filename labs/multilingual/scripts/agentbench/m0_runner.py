@@ -263,7 +263,8 @@ def main():
                     help="comma list of mynah_v2 perf experiments applied once after load (e.g. the release preset's "
                          "list, which includes the fast FC phase 2); empty = none, as before")
     ap.add_argument("--fc-resume-by-label", default="",
-                    help="'label=pad_pad|label=pad_eotr|label=eotr_step|label=off': re-arm the engine fc_ctx_fix per plan label")
+                    help="'label=pad_pad|label=pad_eotr|label=eotr_step|label=off': re-arm the engine fc_ctx_fix per plan label; "
+                         "'label=guard:by_outcome' (or guard:pad_pad / guard:pad_eotr) sets the guarded session's contract")
     ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
     ap.add_argument("--ml-dir", default=str(LAB_HOME / "ckpt/asr-ml"))
     a = ap.parse_args()
@@ -415,7 +416,10 @@ def main():
                 enh.guard_schemas = TENANT_GUARD["schemas"]
                 enh.guard_side_effects = TENANT_GUARD["side_effects"]
                 enh.guard_style = "compact" if a.guard_compact else "full"
-                if a.fc_resume_by_label:       # an explicit lab contract per label wins over the guarded default
+                _rbl = dict(kv.split("=", 1) for kv in filter(None, a.fc_resume_by_label.split("|")))
+                if str(_rbl.get(lab, "")).startswith("guard:"):   # the guarded session's own contract (e.g. by_outcome)
+                    enh.resume_with_guard = _rbl[lab].split(":", 1)[1]
+                elif a.fc_resume_by_label:     # an explicit lab contract per label wins over the guarded default
                     enh.resume_with_guard = None
             sess = Session(eng, tr, Mode(a.mode), enh, on_audio=lambda x: chunks.append(x.numpy()),
                            controller=Controller(prompt, ledger=led, tools=dict(eng.pipeline.tool_registry)))
@@ -439,7 +443,7 @@ def main():
                 import observe
                 un_obs = observe.install(eng.wrapper, obs_rows)
             res_by_label = dict(kv.split("=", 1) for kv in filter(None, a.fc_resume_by_label.split("|")))
-            if lab in res_by_label:
+            if lab in res_by_label and not res_by_label[lab].startswith("guard:"):
                 set_fc_resume(eng, res_by_label[lab])
             sess_fix = dict(runtime_fix, engine_fc_ctx_fix=engine_fix_summary(eng))
             sess_fix["resume_contract"] = resume_contract(sess_fix)

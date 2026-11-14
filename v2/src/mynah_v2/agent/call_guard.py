@@ -327,6 +327,8 @@ class CallGuard:
         self.max_issued = max_issued
         self._neg, self._ref, self._budget_epoch = 0, 0, 0
         self.log: collections.deque[dict] = collections.deque(maxlen=max_entries * 4)
+        self.resume_log: collections.deque[dict] = collections.deque(maxlen=max_entries * 4)
+        self._last: dict | None = None
         self.closed = False
         self.asr = asr_shadow                    # optional ASR shadow (observe only)
         if response_style not in RESPONSE_STYLES:
@@ -423,6 +425,7 @@ class CallGuard:
                     self._ref += 1
             self.log.append({"tool": name, "args": args, "allow": d.allow, "rule": d.rule, "input_epoch": ep,
                              **{k: v for k, v in d.audit.items() if k != "previous_result"}})
+            self._last = {"outcome": None if d.allow else "refused", "epoch": ep}
             return d
 
     def complete(self, d: Decision, result: str | None) -> str:
@@ -433,6 +436,7 @@ class CallGuard:
             e = d.entry
             e.result, e.outcome, e.t_ns = result or "", out, self.clock()
             e.state = TIMED_OUT if out == TIMEOUT else COMPLETED
+            self._last = {"outcome": out, "epoch": e.epoch}
             if self.ledger is not None:            # link the ledger entry this execution opened (newest match)
                 cands = [c for c in list(self.ledger.calls.values())
                          if c.name == e.tool and canon_args(c.arguments) == e.key[3]]
@@ -452,6 +456,23 @@ class CallGuard:
                 self._budget_spent()
                 self._neg += 1
         return out
+
+    def resume_contract(self) -> str:
+        """EXPERIMENT (resume "by_outcome"): the FC resume contract for the hand-back that is about to happen, from the
+        last call of this session. (PAD, EOTR) lets the model chain a further call (a positive result whose data feeds
+        the next tool); (PAD, PAD) after a negative / timed-out / refused result, or when the caller spoke after the
+        call was issued (the new request leads). Observed with (PAD, EOTR): identical re-calls after 10/11 negative
+        results and 0/13 positive ones. A call still in flight (the phase-1 hand-back) keeps (PAD, EOTR)."""
+        with self.lock:
+            last = getattr(self, "_last", None)
+            if self.reg.active() or last is None or last["outcome"] is None:
+                c = "pad_eotr"
+            elif last["outcome"] != PRODUCTIVE or self.input_epoch != last["epoch"]:
+                c = "pad_pad"
+            else:
+                c = "pad_eotr"
+            self.resume_log.append({"contract": c, "last": dict(last) if last else None, "input_epoch": self.input_epoch})
+            return c
 
     def _response(self, d: Decision) -> str:
         if self.response_style == "echo" and d.rule in ("repeat", "side_effect_done") and "previous_result" in d.audit:
@@ -533,6 +554,8 @@ def summary(guard: CallGuard) -> dict:
             by_rule[r["rule"]] = by_rule.get(r["rule"], 0) + 1
     out = {"decisions": log, "admitted": sum(r["allow"] for r in log), "refused": by_rule,
            "input_epoch": guard.input_epoch, "entries_left": len(guard.reg.entries())}
+    if guard.resume_log:
+        out["resume"] = list(guard.resume_log)
     if guard.asr is not None:
         out["asr_shadow"] = guard.asr.report()
         out["asr_slot_mismatches"] = [{"tool": r["tool"], "args": r["args"], "asr_slots": r.get("asr_slots")}

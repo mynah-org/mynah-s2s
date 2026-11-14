@@ -574,3 +574,29 @@ def test_session_attaches_the_guard_by_default_in_enhanced_only():
     o = Session(e3, Tracer(None, session_id="z"), Mode.ENHANCED, EnhancedOptions(call_guard=False))
     o.open(None)
     assert o.guard is None
+
+
+# ------------------------------------------------------------------ resume "by_outcome" (EXPERIMENT)
+def test_resume_by_outcome_follows_the_last_call():
+    """(PAD, EOTR) after a positive result (a chain may follow), (PAD, PAD) after a negative or refused one or when the
+    caller spoke after the call; (PAD, EOTR) while a call is in flight or before any call."""
+    g = CallGuard()
+    assert g.resume_contract() == "pad_eotr"                        # no call yet
+    g.on_user_text("find me, Mario Rossi, 20135")
+    d = g.admit("find_customer", {"full_name": "Mario Rossi"})
+    assert g.resume_contract() == "pad_eotr"                        # in flight (phase-1 hand-back)
+    g.complete(d, json.dumps({"status": "found", "customer_id": "C1002"}))
+    assert g.resume_contract() == "pad_eotr"                        # positive: the chain stays possible
+    d = g.admit("prepare_return", {"customer_id": "C1002"})
+    g.complete(d, json.dumps({"status": "not_found"}))
+    assert g.resume_contract() == "pad_pad"                         # negative
+    r = g.admit("prepare_return", {"customer_id": "C1002"})
+    assert not r.allow and g.resume_contract() == "pad_pad"         # refused repeat
+    g.on_user_text("ok try order X Y Z")
+    d = g.admit("get_order_status", {"order_id": "XYZ"})
+    g.complete(d, json.dumps({"order_id": "XYZ", "found": True}))
+    g.on_user_text("and also")                                      # the caller spoke after the call
+    assert g.resume_contract() == "pad_pad"
+    assert [x["contract"] for x in g.resume_log] == ["pad_eotr"] * 3 + ["pad_pad"] * 3
+    from mynah_v2.agent.call_guard import summary
+    assert summary(g)["resume"][-1]["contract"] == "pad_pad"

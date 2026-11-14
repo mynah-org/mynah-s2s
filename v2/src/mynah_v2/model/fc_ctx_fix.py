@@ -127,6 +127,9 @@ def enable(engine, pad_fill: bool = True, channels=_CH, func_pad: bool = False, 
                     # per-session override (a guarded session resumes on (PAD, EOTR): the call guard stops the loops
                     # that EOTR re-opens, and the model keeps its chained calls); keyed by stream id
                     ov = (getattr(engine, "_v2_resume_by_stream", None) or {}).get(kw.get("stream_id"))
+                    if ov == "by_outcome":          # the session guard picks the contract from its last call
+                        g = (getattr(engine, "_v2_guard_by_stream", None) or {}).get(kw.get("stream_id"))
+                        ov = g.resume_contract() if g is not None else "pad_eotr"
                     if ov is not None:
                         stats.setdefault("resume_override", {})[ov] = stats.setdefault("resume_override", {}).get(ov, 0) + 1
                     for d, name in zip(dst, _CH):

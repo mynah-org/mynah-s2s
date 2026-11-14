@@ -311,3 +311,28 @@ def test_per_stream_resume_override_for_guarded_sessions():
         reads[sid] = eng.wrapper.reads[-1][2:]
     assert reads == {0: (PAD, PAD), 1: (PAD, EOTR), 2: (PAD, PAD)}
     fc_ctx_fix.disable(eng)
+
+
+def test_by_outcome_resume_asks_the_stream_guard():
+    """"by_outcome": fc_ctx_fix asks the stream's guard (resume_contract) at each hand-back; no guard = (PAD, EOTR)."""
+    eng = FakeEngine()
+    fc_ctx_fix.enable(eng, pad_fill=True, channels=("gen_text", "gen_asr_text"), func_pad=True)
+
+    class G:
+        def __init__(self, c):
+            self.c = c
+
+        def resume_contract(self):
+            return self.c
+    eng._v2_resume_by_stream = {0: "by_outcome", 1: "by_outcome", 2: "by_outcome"}
+    eng._v2_guard_by_stream = {0: G("pad_pad"), 1: G("pad_eotr")}
+    reads = {}
+    for sid in (0, 1, 2):
+        ctx = Ctx()
+        for _ in range(10):
+            main_step(eng, ctx, sid)
+        fc_cycle(eng, ctx, sid, p1=[30, 21], p2=[40, EOTR])
+        main_step(eng, ctx, sid)
+        reads[sid] = eng.wrapper.reads[-1][2:]
+    assert reads == {0: (PAD, PAD), 1: (PAD, EOTR), 2: (PAD, EOTR)}
+    fc_ctx_fix.disable(eng)
