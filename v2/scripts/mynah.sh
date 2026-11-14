@@ -17,6 +17,9 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 V2=$REPO/v2
 source $V2/scripts/env.sh
 export PYTHONPATH=$V2/src${PYTHONPATH:+:$PYTHONPATH}
+# Older DGX exports may not define RESULTS in env.sh; keep the launcher usable
+# without changing the shared machine environment.
+RESULTS=${RESULTS:-${MYNAH_HOME:-$HOME/mynah-s2s}/results}
 CALLER_DIR=$PWD                      # user paths (SPEC=, MSG=, WAV=) are relative to where make / mynah.sh was run
 cd $V2
 abspath() { case "$1" in /*) echo "$1" ;; *) if [ -e "$CALLER_DIR/$1" ]; then echo "$CALLER_DIR/$1"; else echo "$V2/$1"; fi ;; esac; }
