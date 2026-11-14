@@ -118,6 +118,12 @@ exercised by `make multi`.
 | `release-exact` | the same with `--sdpa default` | bit-identical to the deterministic reference line |
 | `reference` | NVIDIA's reference step, no V2 execution optimisation | NVIDIA's numerics (slower; parity checks) |
 
+Tool-call policy (ENHANCED, on by default, also in `serve.py` and the multi-session engines): the per-session call
+guard and the outcome-driven resume contract (`architecture.md`, "Function calls"). `run_stream.py` options:
+`--no-call-guard` (guard off, the engine's own resume contract), `--guard-resume by_outcome|pad_eotr|pad_pad|engine`,
+`--guard-echo` (a refused repeat restates the earlier result; experimental). The run summary records every guard
+decision and the contract used at each resume (`call_guard`).
+
 Any single flag can be overridden, e.g. `make multi ARGS="--fc-merge off"`, `make demo ARGS="--sdpa default"`,
 `ARGS="--deterministic off"` (NeMo's serving default: not reproducible run-to-run). The determinism switches are plain
 PyTorch settings and work on any GPU: where flash attention is not available PyTorch picks the next attention kernel.

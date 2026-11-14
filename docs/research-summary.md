@@ -34,6 +34,11 @@ Can an open-weight full-duplex S2S model act as a voice agent that listens while
 - **Per-session random streams are required under batching** [VERIFIED]: with one shared generator a session's audio
   depended on which other sessions were in the batch (a reproducible garbled greeting); per-session counter-based
   streams fixed it (batching off: bit-identical to a solo run).
+- **The resume contract after a tool call decides loops and chains** [VERIFIED, small n]. Feeding the
+  end-of-tool-response token when the model resumes lets the official checkpoint chain a dependent call, but it then
+  re-issued the identical call after 10 of 11 negative results (0 of 13 positive); feeding padding stops the loops
+  and loses the chain. Choosing per call from the result's outcome keeps both, with a call guard as the safety net.
+  Prompt rules, typed results and decoding settings did not stop the re-call.
 - **Function-call bursts drive tail latency** [VERIFIED]. The reference runs one language-model step, one speech step
   and one codec decode per async call step; serving them greedily compressed a whole call cycle into a few slow
   rounds. Capping steps per round only spread the work (call latency 2-3× higher, other sessions' backlog grew);
