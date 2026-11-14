@@ -48,7 +48,7 @@ def main():
     ap.add_argument("--no-llm-cache", action="store_true",
                     help="diagnostic: NVIDIA's shipped no-cache Thinker (default: V2 incremental Thinker)")
     ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
-                    help="opt-in safe INT4 preset: Thinker projections plus text/function heads; all graph-sensitive audio stays BF16")
+                    help="opt-in INT4 preset: Thinker, output heads, and graph-safe EarTTS backbone; remaining audio state stays BF16")
     ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: replace Thinker backbone linears with native int4 tinygemm; lower memory and may improve GB10 decode speed")
     ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
@@ -75,6 +75,7 @@ def main():
     if a.int4:
         a.thinker_int4 = True
         a.int4_heads = True
+        a.eartts_int4 = True
     if a.thinker_int4_pack and a.thinker_int4:
         ap.error("use either --thinker-int4 or --thinker-int4-pack, not both")
     if a.thinker_int4_pack and a.int4_heads:

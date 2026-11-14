@@ -31,8 +31,8 @@ def _build_kernel():
     import triton.language as tl
 
     @triton.jit
-    def q4_mm(x, q, scale, minimum, y, M, N, K, G: tl.constexpr,
-              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def q4_mm(x, q, scale, minimum, bias, y, M, N, K, G: tl.constexpr,
+              HAS_BIAS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         pm = tl.program_id(0)
         pn = tl.program_id(1)
         rm = pm * BM + tl.arange(0, BM)
@@ -55,6 +55,8 @@ def _build_kernel():
             hi = (b >> 4).to(tl.float32)
             acc += tl.sum((lo * sc + mn)[None, :, :] * xe[:, None, :] +
                           (hi * sc + mn)[None, :, :] * xo[:, None, :], axis=2)
+        if HAS_BIAS:
+            acc += tl.load(bias + rn, mask=rn < N, other=0.0)[None, :]
         om = (rm[:, None] < M) & (rn[None, :] < N)
         tl.store(y + rm[:, None] * N + rn[None, :], acc.to(y.dtype.element_ty), mask=om)
 
@@ -65,7 +67,8 @@ def _build_kernel():
 class GraphSafeQ4Linear(nn.Module):
     """Static-capacity, batched asymmetric-Q4 linear for EarTTS graph replay."""
 
-    def __init__(self, lin: nn.Linear, group: int = 128, max_batch: int = 16):
+    def __init__(self, lin: nn.Linear, group: int = 128, max_batch: int = 16,
+                 block_n: int = 64, block_k: int = 128):
         super().__init__()
         if lin.weight.device.type != "cuda":
             raise ValueError("GraphSafeQ4Linear requires CUDA weights")
@@ -73,7 +76,10 @@ class GraphSafeQ4Linear(nn.Module):
             raise ValueError(f"unsupported EarTTS source dtype: {lin.weight.dtype}")
         p = pack_w4(lin.weight.data, group=group)
         self.in_features, self.out_features = lin.in_features, lin.out_features
+        if block_n not in (32, 64, 128) or block_k not in (128, 256, 512):
+            raise ValueError("unsupported EarTTS Q4 tile configuration")
         self.group, self.max_batch = p["group"], max_batch
+        self.block_n, self.block_k = block_n, block_k
         self.register_buffer("q", p["q"].contiguous())
         self.register_buffer("scale", p["scale"].contiguous())
         self.register_buffer("minimum", p["min"].contiguous())
@@ -94,11 +100,10 @@ class GraphSafeQ4Linear(nn.Module):
             raise RuntimeError(f"EarTTS Q4 static batch capacity {self.max_batch} exceeded by M={m}")
         y = self._out[:m]
         kernel = _build_kernel()
-        grid = (triton_cdiv(m, 2), triton_cdiv(self.out_features, 64))
-        kernel[grid](x2, self.q, self.scale, self.minimum, y, m, self.out_features, self.in_features,
-                     G=self.group, BM=2, BN=64, BK=128)
-        if self.bias is not None:
-            y.add_(self.bias.to(y.dtype))
+        grid = (triton_cdiv(m, 2), triton_cdiv(self.out_features, self.block_n))
+        bias = self.bias if self.bias is not None else self._out.reshape(-1)
+        kernel[grid](x2, self.q, self.scale, self.minimum, bias, y, m, self.out_features, self.in_features,
+                     G=self.group, HAS_BIAS=self.bias is not None, BM=2, BN=self.block_n, BK=self.block_k)
         return y.reshape(*x.shape[:-1], self.out_features)
 
     def nbytes(self) -> int:
@@ -109,8 +114,19 @@ def triton_cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
 
 
-def quantize_eartts_int4(engine, group: int = 128, max_batch: int = 16) -> dict:
-    """Opt-in Q4 for EarTTS's Gemma backbone only; perception and output heads stay unchanged."""
+def quantize_eartts_int4(engine, group: int = 128, max_batch: int = 16, backend: str = "native") -> dict:
+    """Opt-in Q4 for EarTTS's Gemma backbone only; perception and output heads stay unchanged.
+
+    ``native`` uses Torch's tinygemm INT4 kernel and is the serving default on
+    GB10. ``triton`` remains available for kernel experiments and platforms
+    without the native operator.
+    """
+    if backend not in {"native", "triton"}:
+        raise ValueError(f"unsupported EarTTS Q4 backend: {backend}")
+    NativeInt4 = None
+    if backend == "native":
+        from mynah_v2.model.quant import Int4Linear
+        NativeInt4 = Int4Linear
     duplex = engine.wrapper.model.tts_model
     tts = duplex.tts_model
     backbone = tts.backbone
@@ -118,8 +134,13 @@ def quantize_eartts_int4(engine, group: int = 128, max_batch: int = 16) -> dict:
     for name, mod in list(backbone.named_modules()):
         if isinstance(mod, nn.Linear):
             before += mod.weight.numel() * mod.weight.element_size()
-            q = GraphSafeQ4Linear(mod, group=group, max_batch=max_batch)
-            after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+            q = (NativeInt4(mod, max_group=group) if NativeInt4 is not None else
+                 GraphSafeQ4Linear(mod, group=group, max_batch=max_batch,
+                                   block_n=128 if mod.out_features >= 4096 else 64,
+                                   block_k=256 if mod.in_features >= 2048 else 128))
+            qbytes = q.nbytes() if hasattr(q, "nbytes") else sum(
+                t.numel() * t.element_size() for t in (q.packed, q.scales_zeros))
+            after += qbytes + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
             parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
             parent = backbone.get_submodule(parent_name) if parent_name else backbone
             setattr(parent, child_name, q)
@@ -128,6 +149,6 @@ def quantize_eartts_int4(engine, group: int = 128, max_batch: int = 16) -> dict:
         raise RuntimeError("no direct EarTTS backbone linears found")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return {"eartts_quant": "q4_triton_graph_safe", "scope": "tts_model.backbone",
+    return {"eartts_quant": f"q4_{backend}_graph_safe", "scope": "tts_model.backbone",
             "linears": n, "group": group, "max_batch": max_batch,
             "fp_bytes": before, "q4_bytes": after}

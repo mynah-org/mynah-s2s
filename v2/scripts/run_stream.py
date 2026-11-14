@@ -153,7 +153,7 @@ def main():
     ap.add_argument("--perf-profile", default=None, choices=["optimized-exact", "optimized-graph"],
                     help="validated performance profile (mynah_v2.model.perf.PROFILES); ENHANCED only")
     ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
-                    help="opt-in safe INT4 preset: Thinker projections plus text/function heads; graph-sensitive audio stays BF16")
+                    help="opt-in INT4 preset: Thinker, output heads, and graph-safe EarTTS backbone; remaining audio state stays BF16")
     ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: int4 weight-only Thinker (mynah_v2.model.quant); refused in REFERENCE mode")
     ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
@@ -170,6 +170,7 @@ def main():
     if a.int4:
         a.thinker_int4 = True
         a.int4_heads = True
+        a.eartts_int4 = True
     if a.thinker_int4_pack and a.thinker_int4:
         ap.error("use either --thinker-int4 or --thinker-int4-pack, not both")
     if a.thinker_int4_pack and a.int4_heads:

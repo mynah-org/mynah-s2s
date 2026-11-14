@@ -93,33 +93,21 @@ form is one switch (the equivalent environment variable is `MYNAH_INT4=1`):
 make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 ```
 
-This quantizes the Thinker projections and text/function output heads with the
-native INT4 tinygemm path. The recurrent/KV caches, embeddings, ASR/RNNT, TTS,
-and codec stay in their original formats for compatibility. The longer flags
+This quantizes the Thinker projections, text/function output heads, and the
+graph-safe EarTTS Gemma backbone with native INT4 tinygemm. The recurrent/KV
+caches, embeddings, perception/RNNT, CAS/subword path, MoG, RVQ, and codec stay
+in their original formats for compatibility. The longer flags
 (`--thinker-int4`, `--int4-heads`, `--int4-group`, `--int4-clip`) remain
 available for experiments. `--max-backlog 120` can be added when testing a
 slower-than-realtime build so input is not dropped while measuring it.
 
-Perception and EarTTS are deliberately not included in the native PyTorch
-INT4 switch: their CUDA-graph/Triton path needs a model-specific fused kernel.
-
-An experimental graph-safe Q4 kernel for the EarTTS Gemma backbone can be
-tested separately:
-
-```bash
-make webui-gpu V2_SERVE_ARGS="--eartts-int4 --perf-profile optimized-graph"
-```
-
-It covers the 196 backbone linears only (not CAS/subword embeddings, MoG
-projections, RVQ, codec, or perception). It passed a real DGX WebSocket turn
-with zero dropped audio, but is not folded into `--int4` yet: on the current
-single-turn sample its end-to-end wall time was 31.5 s versus 25.5 s for the
-same BF16 graph profile, so the next step is kernel/trajectory tuning rather
-than making the slower path the default.
+The legacy `--eartts-int4` flag remains available when testing only the TTS
+backbone. It uses the native tinygemm path; the earlier custom Triton Q4 kernel
+is retained only as a kernel experiment.
 
 Compared with the external GGUF Q8 deployment, our current coverage is still
-partial: Thinker + output heads are packed offline, and the experimental Q4
-path adds only the EarTTS Gemma backbone. The remaining pieces are perception
+partial: Thinker + output heads are packed offline, and the Q4 path now adds
+the EarTTS Gemma backbone at runtime. The remaining pieces are perception
 encoder/projection, EarTTS CAS/subword embeddings, MoG projections/MLPs, RVQ
 embeddings, codec decoder, and RNNT-side tensors. The reference project emits
 separate LLM, function-head, perception, and TTS/codec artifacts; its README

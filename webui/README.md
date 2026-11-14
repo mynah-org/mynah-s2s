@@ -32,21 +32,19 @@ through the Make target (or set `MYNAH_INT4=1`):
 make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 ```
 
-The INT4 mode quantizes Thinker projections plus the text/function heads; it
-keeps recurrent/KV caches and the ASR/RNNT, TTS, and codec components unchanged.
-Perception and EarTTS need a model-specific fused kernel before they can use
-the native INT4 path safely.
+The INT4 mode quantizes Thinker projections, text/function heads, and the
+graph-safe EarTTS Gemma backbone with native tinygemm. It keeps recurrent/KV
+caches, perception/RNNT, CAS/subword, MoG, RVQ, and codec components unchanged.
 
-The first graph-safe EarTTS Q4 backend is available for an explicit test:
+The legacy TTS-only switch is still available for isolated tests:
 
 ```bash
 make webui-gpu V2_SERVE_ARGS="--eartts-int4 --perf-profile optimized-graph"
 ```
 
 It quantizes only the Gemma backbone linears. CAS/subword embeddings, MoG
-projections, RVQ, codec, and perception remain unchanged. This mode has passed
-a real WebSocket turn on DGX without graph errors, but remains separate from
-`--int4` until its end-to-end latency beats the BF16 graph profile.
+projections, RVQ, codec, and perception remain unchanged. The combined
+`--int4` path has passed a real DGX WebSocket turn with zero dropped audio.
 
 For repeatable startup, export the native packed weights once and pass the pack
 instead:
