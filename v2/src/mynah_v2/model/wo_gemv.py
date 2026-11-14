@@ -206,6 +206,11 @@ def _build():
 MAX_BATCHED_M = 16          # batched-decode rows per launch (B sessions); more rows (prompt prefill) → dequant matmul
 
 _TLS = threading.local()
+# Triton's Autotuner keeps ``nargs`` on the kernel object while it selects a
+# config.  The live perception and FC workers can enter the same W8 kernel
+# concurrently, so serialize only the host-side launch/autotune bookkeeping;
+# the CUDA launch remains asynchronous after the lock is released.
+_AUTOTUNE_LOCK = threading.RLock()
 
 
 @contextlib.contextmanager
@@ -270,29 +275,31 @@ def gemv(x: torch.Tensor, p, bias: torch.Tensor | None = None) -> torch.Tensor:
         mp = min(max(mp, getattr(_TLS, "min_mp", 1)), MAX_BATCHED_M)
         grid = lambda meta: (_KERNELS["cdiv"](n, meta["BN"]),)  # noqa: E731
         bias_ptr = bias if bias is not None else p["q"]
-        try:
-            _KERNELS["w8"][grid](x2, p["q"], p["scale"], bias_ptr, y, mrows, n, k,
-                                   MP=mp, HAS_BIAS=bias is not None, FP8=(f == "f8"))
-        except TypeError:
-            # Compatibility with the upstream CPU dispatch fake (and only
-            # that fake): older W8 launch shims did not expose the fused bias
-            # pointer.  Never hide a real CUDA kernel error.
-            if x.device.type == "cuda":
-                raise
-            _KERNELS["w8"][grid](x2, p["q"], p["scale"], y, mrows, n, k,
-                                   MP=mp, FP8=(f == "f8"))
+        with _AUTOTUNE_LOCK:
+            try:
+                _KERNELS["w8"][grid](x2, p["q"], p["scale"], bias_ptr, y, mrows, n, k,
+                                       MP=mp, HAS_BIAS=bias is not None, FP8=(f == "f8"))
+            except TypeError:
+                # Compatibility with the upstream CPU dispatch fake (and
+                # only that fake): older W8 launch shims did not expose the
+                # fused bias pointer. Never hide a real CUDA kernel error.
+                if x.device.type == "cuda":
+                    raise
+                _KERNELS["w8"][grid](x2, p["q"], p["scale"], y, mrows, n, k,
+                                       MP=mp, FP8=(f == "f8"))
         return y.reshape(*x.shape[:-1], n)
     outs = []
     for row in x2:
         row = row.contiguous()
         y = torch.empty(n, device=x.device, dtype=x.dtype)
         grid = lambda meta: (_KERNELS["cdiv"](n, meta["BN"]),)  # noqa: E731
-        if f == "w4":
-            _KERNELS["w4"][grid](row, p["q"], p["scale"], p["min"], y, n, k, G=p["group"])
-        elif f == "nvf4":
-            _KERNELS["nvf4"][grid](row, p["q"], p["bscale"], p["gscale"], y, n, k)
-        else:
-            raise ValueError(f)
+        with _AUTOTUNE_LOCK:
+            if f == "w4":
+                _KERNELS["w4"][grid](row, p["q"], p["scale"], p["min"], y, n, k, G=p["group"])
+            elif f == "nvf4":
+                _KERNELS["nvf4"][grid](row, p["q"], p["bscale"], p["gscale"], y, n, k)
+            else:
+                raise ValueError(f)
         outs.append(y)
     y = torch.stack(outs).reshape(*x.shape[:-1], n)
     return y if bias is None else y + bias.to(y.dtype)
