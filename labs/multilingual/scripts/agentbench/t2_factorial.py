@@ -45,8 +45,9 @@ from t1_probe import BOS, EOS, EOTC, PAD, SOTC, Thinker, fc_call, frame_tokens, 
 
 EOTR = 22
 CONTRACTS = "0/0,12/12,12/0,0/22,12/22,12/22s"
-# first-cell wall estimates for the budget guard (job 278: m08 41 s = 225 forced steps + 5 re-call decodes, ~85 ms/step)
-FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 55.0, "m03_empty": 40.0, "m02_nf": 35.0, "t14_nf": 32.0,
+# first-cell wall estimates for the budget guard (job 278: m08 41 s = 225 forced steps + 5 re-call decodes, ~85 ms/step;
+# m07 measured 29.4-29.5 s in jobs 111/112)
+FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 32.0, "m03_empty": 40.0, "m02_nf": 35.0, "t14_nf": 32.0,
                 "t13_found": 35.0}
 FX1 = MYNAH_HOME / "results/v2/fcfix/FX1-fix"
 RES = LAB_HOME / "results/agentbench"
