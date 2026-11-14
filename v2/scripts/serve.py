@@ -42,6 +42,12 @@ def main():
                     help="if closing a session takes longer (stuck engine), refuse new sessions until restarted")
     ap.add_argument("--no-llm-cache", action="store_true",
                     help="diagnostic: NVIDIA's shipped no-cache Thinker (default: V2 incremental Thinker)")
+    ap.add_argument("--thinker-int4", action="store_true",
+                    help="EXPERIMENT: replace Thinker backbone linears with native int4 tinygemm; lower memory and may improve GB10 decode speed")
+    ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128],
+                    help="int4 weight group size for --thinker-int4 (smaller groups preserve more quality but use more metadata)")
+    ap.add_argument("--int4-clip", action="store_true",
+                    help="use a per-group clipping search for --thinker-int4 (slower startup, lower quantization error)")
     ap.add_argument("--tool-timeout", type=float, default=8.0,
                     help="ENHANCED: max seconds a tool may run before an explicit timeout error goes to the model")
     ap.add_argument("--exp", default=None, help="comma list of extra perf experiments (ENHANCED only)")
@@ -53,6 +59,8 @@ def main():
     presets.add_determinism_args(ap)
     a = ap.parse_args()
     print("PRESET", a.preset, presets.fill(a, presets.SINGLE, a.preset), flush=True)
+    if a.thinker_int4 and a.mode == "reference":
+        ap.error("--thinker-int4 is experimental and requires --mode enhanced")
     if (a.perf_profile or a.exp) and a.mode == "reference":
         ap.error("--perf-profile / --exp are never applied in REFERENCE mode")
     if a.cudnn_benchmark:
@@ -68,8 +76,16 @@ def main():
                           llm_cache=not a.no_llm_cache)
     presets.apply_determinism(a)
     print("LLM_CACHE", eng.llm_cache_info, flush=True)
+    if a.thinker_int4:
+        from mynah_v2.model.quant import quantize_thinker_int4
+        quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip)
+        print("THINKER_QUANT", quant_info, flush=True)
     if a.perf_profile or a.exp:
-        print("PERF_PROFILE", presets.apply(eng, a.perf_profile, a.exp, strict=a.strict), flush=True)
+        exp = a.exp
+        if a.thinker_int4:
+            # Int4 replaces backbone Linear objects; do not stack the default w8 MLP swap on top.
+            exp = ",".join(x for x in (exp or "").split(",") if x and not x.startswith(("wo:", "wor:")))
+        print("PERF_PROFILE", presets.apply(eng, a.perf_profile, exp, strict=a.strict), flush=True)
 
     def controller_factory(sid, tracer, mode, session_ref):
         """Composition root: a fresh controller + ledger per session; ENHANCED gets the bounded tool wait

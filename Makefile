@@ -51,16 +51,17 @@ custom: ## custom scenario + persona prompt (default: v2/eval/examples/furniture
 	$(M) custom $(SPEC) $(MSG)
 
 serve: ## realtime WebSocket server on :8765 (one session at a time); stop with Ctrl-C
-	$(M) serve
+	ARGS="$(V2_SERVE_ARGS)" $(M) serve
 
 WEBUI_ARGS ?=
 WEBUI_GPU_LOG ?= /tmp/mynah-v2-webui-gpu.log
 WEBUI_PYTHON ?= $(if $(wildcard $(HOME)/mynah-s2s/.venv-v2/bin/python),$(HOME)/mynah-s2s/.venv-v2/bin/python,python3)
+V2_SERVE_ARGS ?=
 webui: ## local HTML5 UI + Python bridge on http://127.0.0.1:8787 (no Node.js)
 	@if command -v uv >/dev/null 2>&1; then uv run --project webui --no-sync python webui/server.py $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py $(WEBUI_ARGS); fi
 webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ctrl-C
 	@set -e; \
-	$(M) serve >$(WEBUI_GPU_LOG) 2>&1 & gpu_pid=$$!; \
+	ARGS="$(V2_SERVE_ARGS)" $(M) serve >$(WEBUI_GPU_LOG) 2>&1 & gpu_pid=$$!; \
 	trap 'kill $$gpu_pid 2>/dev/null || true' EXIT INT TERM; \
 	until grep -q '^READY' $(WEBUI_GPU_LOG); do \
 		kill -0 $$gpu_pid 2>/dev/null || { tail -40 $(WEBUI_GPU_LOG); exit 1; }; \
