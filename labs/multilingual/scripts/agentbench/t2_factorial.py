@@ -114,7 +114,10 @@ SCEN["m07_chain"]["live_outcome"] = "chain"
 #         (fc_sotc_boost is read and logged, never applied); this measures whether one would separate the cases.
 # The teacher-forced history was recorded under the original prompt: for p1 the cell measures the post-result
 # decision on that history, not whether the model would have reached it (own_text_mismatch_0_s reports that).
-VARIANTS = ("base", "p1", "p3", "p1p3", "b2", "typed", "app", "appnt")
+VARIANTS = ("base", "p1", "p3", "p1p3", "b2", "typed", "app", "appnt", "p2pre")
+# p2pre (owner GO 2026-11-14, FC fast path (ii)): the same cell also consumes FC phase 2 with ONE continuation forward
+# (mynah_v2.model.fc_phase2_prefill) from a clone of the cache taken before phase 2; EOTR logits, the first resume frame
+# and every contract outcome are reported for both (sequential = "contracts", prefill = "contracts_p2pre").
 # explicit application contract for tools (owner 2026-11-14, configurability workstream B), appended to the tenant
 # system message or to NVIDIA's default message; "appnt" adds the text "/no_think" (a plain prompt string here: the
 # VoiceChat checkpoint has no reasoning mode, this only tests whether the string changes behaviour)
@@ -488,8 +491,13 @@ def main():  # pragma: no cover - GPU
         s, sched = st["s"], st["sched"]
         cache = th.prefill()
         main_pred, fc1, agree, nat, lp_eotr = [], [], [], None, None
+        p2 = {"cache": None, "rows": [], "fl_seq": None}
         for r in sched:
             audio = f[r["audio"][1]] if r["audio"][0] == "feat" else sil
+            if v == "p2pre" and r["kind"] == "fc2":
+                if p2["cache"] is None:
+                    p2["cache"] = th.clone(cache)          # the state right before phase 2
+                p2["rows"].append((audio, r["agent_in"], r["func_in"]))
             tl, fl, cache = th.step(cache, audio, r["agent_in"], r["func_in"])
             if r["kind"] == "main":
                 main_pred.append((int(tl.argmax()), int(fl.argmax())))
@@ -500,7 +508,23 @@ def main():  # pragma: no cover - GPU
             else:
                 lf = logp_rows(fl)
                 nat, lp_eotr = int(lf.argmax()), round(float(lf[EOTR]), 3)
-        hm = [t_ for t_ in range(s + 1) if main_pred[t_][0] != st["rec"].get(t_, PAD)]
+                p2["fl_seq"] = fl
+        p2res = None
+        if v == "p2pre" and p2["rows"]:
+            from mynah_v2.model.fc_phase2_prefill import continuation_forward
+            tp = time.monotonic()
+            x = th.frames(torch.stack([a_.reshape(-1) for a_, _, _ in p2["rows"]]),
+                          [ag for _, ag, _ in p2["rows"]], [fu for _, _, fu in p2["rows"]])
+            with torch.no_grad():
+                hp = continuation_forward(th.stt.llm, x.contiguous(), p2["cache"])
+                flp = th.stt.function_head(hp[:, -1:])[0, -1]
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            lfp, lfs = logp_rows(flp), logp_rows(p2["fl_seq"])
+            p2res = {"positions": len(p2["rows"]), "prefill_s": round(time.monotonic() - tp, 3),
+                     "nat_last": int(lfp.argmax()), "lp_EOTR_last": round(float(lfp[EOTR]), 3),
+                     "max_abs_dlogp_last": round(float((lfp - lfs).abs().max()), 4),
+                     "same_nat": int(lfp.argmax()) == nat}
         res = {"arm": arm, "scenario": sc, "variant": v, "prompt": rep["prompts"][f"{fam(sc)}:{prompt_variant(v)}"],
                "n_resp": len(st["resp"]), "schedule_sha": st["sha"], "nat_last": nat, "lp_EOTR_last": lp_eotr,
                "own_sotc_at_s": main_pred[s][1] == SOTC, "own_func_pad_before_s": all(p[1] == PAD for p in main_pred[:s]),
@@ -510,7 +534,10 @@ def main():  # pragma: no cover - GPU
             res["V1"] = {"text_mismatch": hm[:20], "sotc_at_s": main_pred[s][1] == SOTC,
                          "call_match": fc1 == st["call"], "pass": not hm and main_pred[s][1] == SOTC and fc1 == st["call"]}
         tail = f[s + 1:s + 1 + a.n_free]        # continuation: the live main loop resumes on frame s+1 of the audio
-        for pr in a.contracts.split(","):
+        res["p2pre"] = p2res
+        for cache, key in ([(cache, "contracts")] + ([(p2["cache"], "contracts_p2pre")] if p2res else [])):
+          res.setdefault(key, {})
+          for pr in a.contracts.split(","):  # noqa: E111 (one extra level: sequential and prefilled caches)
             biased = pr.endswith("b")               # "12/22b" = the same contract + the b2 bias, same history/cache
             ta, fa, silent = parse_pair(pr.rstrip("b"))
             bc, pre = th.clone(cache), None
@@ -541,8 +568,8 @@ def main():  # pragma: no cover - GPU
             if o["first"] == "new_call":
                 o["new_call_ids"], o["new_call_text"] = decode_call(th, bc, sil)
             o["reply_text"] = th.decode(o.pop("reply_ids"))
-            res["contracts"][pr] = {"silent_step": pre, "first_frame": rows[0] if rows else pre, "frames": rows[:6],
-                                    "outcome": o}
+            res[key][pr] = {"silent_step": pre, "first_frame": rows[0] if rows else pre, "frames": rows[:6],
+                            "outcome": o}
         res["s"] = round(time.monotonic() - t, 1)
         return res
 

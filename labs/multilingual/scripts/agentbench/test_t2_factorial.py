@@ -85,8 +85,10 @@ def test_variant_prompt_and_plan():
     base = "You are the voice assistant."
     assert F.variant_prompt(base, "base") == base and F.variant_prompt(base, "p3") == base
     assert F.variant_prompt(base, "p1").endswith(F.P1_RULE) and F.variant_prompt(base, "p1p3") == F.variant_prompt(base, "p1")
-    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1", "orig", "orig", "app", "appnt"]
-    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3", "orig", "typed", "orig", "orig"]
+    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1", "orig", "orig", "app", "appnt",
+                                                         "orig"]
+    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3", "orig", "typed", "orig", "orig",
+                                                         "orig"]
     assert F.variant_prompt(base, "app").endswith(F.APP_CONTRACT)
     assert F.variant_prompt(base, "appnt").endswith(F.APP_CONTRACT + " /no_think")
     assert "at most one tool call at a time" in F.APP_CONTRACT and "Never invent" in F.APP_CONTRACT
