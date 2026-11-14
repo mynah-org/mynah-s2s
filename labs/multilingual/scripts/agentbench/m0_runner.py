@@ -251,7 +251,8 @@ def main():
     ap.add_argument("--no-fc-fix", action="store_true",
                     help="force the post-FC runtime fix flags to 0 (lab default is already OFF since 2026-11-12 14:30)")
     ap.add_argument("--call-guard", action="store_true",
-                    help="EXPERIMENT: engine call registry + admission control in front of the executor; default off")
+                    help="(legacy, now the engine's ENHANCED default) call registry + admission control")
+    ap.add_argument("--no-call-guard", action="store_true", help="ENHANCED without the engine call guard")
     ap.add_argument("--asr-shadow", action="store_true",
                     help="EXPERIMENT (with --call-guard): compare call slots / intents with the caller ASR, observe only")
     ap.add_argument("--guard-compact", action="store_true",
@@ -379,26 +380,16 @@ def main():
             tr = Tracer(od / "trace.jsonl", session_id=sid)
             _emit = tr.emit
 
-            guard = None
-            if a.call_guard:                   # EXPERIMENT (engine call_guard), metadata outside the schemas
-                from mynah_v2.agent.call_guard import AsrShadow, CallGuard
-                guard = CallGuard(TENANT_GUARD["schemas"], session_id=sid, side_effects=TENANT_GUARD["side_effects"],
-                                  asr_shadow=AsrShadow(intent_tools={"transfer": "escalate_to_human"})
-                                  if a.asr_shadow else None, response_style="compact" if a.guard_compact else "full")
 
             def emit(ev, _emit=_emit, **kw):  # instance-level hook, no V2 code change
                 if ev == "asr.generated" and _re.search(r"[A-Za-z]", kw.get("text", "")):
                     act["n"] += 1
                     act["said"].append(kw.get("text", ""))
-                if ev == "asr.generated" and guard is not None:
-                    guard.on_user_text(kw.get("text", ""), kw.get("model_step"))
                 if ev == "function.started":
                     act["fstart"].append(kw.get("model_step"))
                 return _emit(ev, **kw)
             tr.emit = emit
             led = ToolLedger(sid, tr)
-            if guard is not None:
-                guard.ledger = led
             state = {"s": None}
             bound = reg.bind(led, lambda: state["s"].turn_id if state["s"] else 0,
                              lambda: state["s"].model_step if state["s"] else None,
@@ -406,6 +397,13 @@ def main():
             eng.bind_session_tools(dict(bound))
             chunks = []
             enh = EnhancedOptions() if a.mode == "enhanced" else None
+            if enh is not None:                # tenant metadata kept OUT of the schemas (prompt unchanged)
+                enh.call_guard = not a.no_call_guard
+                enh.guard_schemas = TENANT_GUARD["schemas"]
+                enh.guard_side_effects = TENANT_GUARD["side_effects"]
+                enh.guard_style = "compact" if a.guard_compact else "full"
+                if a.fc_resume_by_label:       # an explicit lab contract per label wins over the guarded default
+                    enh.resume_with_guard = None
             sess = Session(eng, tr, Mode(a.mode), enh, on_audio=lambda x: chunks.append(x.numpy()),
                            controller=Controller(prompt, ledger=led, tools=dict(eng.pipeline.tool_registry)))
             state["s"] = sess
@@ -438,20 +436,12 @@ def main():
             _rs = ((getattr(eng, "fc_ctx_fix_info", None) or {}).get("fix") or {}).get("stats") or {}
             n_resume0 = len(_rs.get("resume_inputs", []))
             n_eotr0 = len(_rs.get("eotr_steps", []))
-            guard_un = None
-            if guard is not None:
-                from mynah_v2.agent.call_guard import install
-                guard_un = install(eng, guard, tracer=tr)
             t0 = time.monotonic()
             sess.open(prompt)
             run_paced(sess, wav, pace="realtime", tail_silence_s=a.tail_s, max_extra_s=a.max_extra_s, drain=True)
             wall = time.monotonic() - t0
             sess.close("normal")
-            cg = None
-            if guard is not None:
-                from mynah_v2.agent.call_guard import summary as guard_summary
-                cg = guard_summary(guard)
-                guard_un()
+            cg = sess.guard_summary
             tr.close()
             import live_gates
             fcev = live_gates.fc_events(od / "trace.jsonl")              # FC openings, calls, results, resumes (M4/C3)

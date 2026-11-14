@@ -108,8 +108,9 @@ def main():
                          "(text, or @file.txt); default: NVIDIA's default system message")
     ap.add_argument("--tool-delay", type=float, default=0.0)
     ap.add_argument("--call-guard", action="store_true",
-                    help="EXPERIMENT: per-session call registry + admission control in front of the executor "
-                         "(mynah_v2.agent.call_guard); default off")
+                    help="(legacy, now the ENHANCED default) per-session call registry + admission control")
+    ap.add_argument("--no-call-guard", action="store_true",
+                    help="ENHANCED without the call guard (and with the engine's own FC resume contract)")
     ap.add_argument("--asr-shadow", action="store_true",
                     help="EXPERIMENT (with --call-guard): compare call slots with the caller ASR, observe only")
     ap.add_argument("--guard-compact", action="store_true",
@@ -262,20 +263,13 @@ def main():
             np.random.seed(a.seed)
             torch.manual_seed(a.seed)
             torch.cuda.manual_seed_all(a.seed)
-        guard, guard_un = None, None
-        if a.call_guard:                       # EXPERIMENT: refusals answer the model, the backend never sees them
-            from mynah_v2.agent.call_guard import AsrShadow, CallGuard, install
-            guard = CallGuard(session_id=stem, ledger=led, asr_shadow=AsrShadow() if a.asr_shadow else None,
-                              response_style="echo" if a.guard_echo else "compact" if a.guard_compact else "full")
-            _emit = tr.emit
-
-            def _guard_emit(ev, _emit=_emit, _g=guard, **kw):   # caller speech (RNN-T user text) = new input epoch
-                if ev == "asr.generated":
-                    _g.on_user_text(kw.get("text", ""), kw.get("model_step"))
-                return _emit(ev, **kw)
-            tr.emit = _guard_emit
-            guard_un = install(eng, guard, tracer=tr)
+        if enh is not None:                    # the call guard is the ENHANCED default (Session attaches it)
+            enh.call_guard = not a.no_call_guard
+            enh.guard_style = "echo" if a.guard_echo else "compact" if a.guard_compact else "full"
         sess.open(prompt)
+        if a.asr_shadow and sess.guard is not None:
+            from mynah_v2.agent.call_guard import AsrShadow
+            sess.guard.asr = AsrShadow()
         stop_hook = None
         if a.fc_interrupt:
             import threading
@@ -305,11 +299,7 @@ def main():
         tt = eng.token_tensors()
         recs = list(eng.fc_records)
         sess.close(a.close_kind)
-        cg = None
-        if guard is not None:
-            from mynah_v2.agent.call_guard import summary as guard_summary
-            cg = guard_summary(guard)
-            guard_un()
+        cg = sess.guard_summary
         tr.close()
         agent = np.concatenate(agent_chunks) if agent_chunks else np.zeros(0, np.float32)
         sf.write(od / "agent.wav", agent, T.OUTPUT_SR)

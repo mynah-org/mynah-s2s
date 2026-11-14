@@ -538,3 +538,72 @@ def summary(guard: CallGuard) -> dict:
         out["asr_slot_mismatches"] = [{"tool": r["tool"], "args": r["args"], "asr_slots": r.get("asr_slots")}
                                       for r in log if any(v == "mismatch" for v in (r.get("asr_slots") or {}).values())]
     return out
+
+
+# ------------------------------------------------------------------ session attachment (the default path)
+def guard_handler(name: str, fn, guard: CallGuard, tracer=None):
+    """A bound tool handler (``handler(args) -> str``, what NeMo's executor calls for one parsed call) behind the
+    session's guard: refused calls answer with the guard's response and never reach ``fn`` (nor the ledger inside it).
+    Every path that executes session tools goes through these handlers: one session, several sessions (the routed
+    per-session registry), and the controller's multi-call path."""
+    def handler(args, *a, **kw):
+        d = guard.admit(name, args if isinstance(args, dict) else {})
+        if tracer is not None:
+            from mynah_v2.tracing import events as E
+            tracer.emit(E.TOOL_GUARD, tool=name, args=args, allow=d.allow, rule=d.rule, input_epoch=guard.input_epoch)
+        if not d.allow:
+            return d.response
+        try:
+            res = fn(args, *a, **kw)
+        except Exception as e:  # noqa: BLE001 - a crashing handler must not leave the entry in flight
+            res = json.dumps({"error": f"{type(e).__name__}: {e}"})
+            guard.complete(d, res)
+            raise
+        guard.complete(d, res)
+        return res
+    handler.__wrapped__ = fn
+    handler.__v2_call_guard__ = guard
+    return handler
+
+
+def attach_session_guard(engine, guard: CallGuard, resume: str | None = "pad_eotr", tracer=None) -> None:
+    """Put ``guard`` on the tools the CURRENT session bound (``engine.session_tools``) and make the engine feed it the
+    caller's ASR (read by ``ReferenceEngine.step``). ``resume`` = the FC resume contract for this
+    session's stream while guarded (fc_ctx_fix reads ``engine._v2_resume_by_stream``; the guard itself is kept in
+    ``engine._v2_guard_by_stream``, both keyed by stream id): "pad_eotr" lets the model chain
+    calls (its loops after a negative result are what the guard stops); None keeps the engine's contract. Undone by
+    ``detach_session_guard`` (the engine's close calls it) and by the tool unbind."""
+    binding = engine.session_tools
+    reg = binding.registry
+    for name in list(getattr(binding, "names", [])):
+        if name in reg and not hasattr(reg[name], "__v2_call_guard__"):
+            reg[name] = guard_handler(name, reg[name], guard, tracer)
+    _by(engine, "_v2_guard_by_stream")[engine.stream_id] = guard
+    if resume:
+        _by(engine, "_v2_resume_by_stream")[engine.stream_id] = resume
+
+
+def _by(engine, name: str) -> dict:
+    d = getattr(engine, name, None)
+    if d is None:
+        d = {}
+        setattr(engine, name, d)
+    return d
+
+
+def session_guard(engine):
+    """The guard of the engine's CURRENT stream (keyed by stream id: one engine serves sessions one after the other or,
+    through MultiSessionEngine, several at once with one stream id each)."""
+    return (getattr(engine, "_v2_guard_by_stream", None) or {}).get(getattr(engine, "stream_id", None))
+
+
+def detach_session_guard(engine) -> dict | None:
+    """End of the session: the summary of the guard's decisions (also kept in ``engine._v2_guard_summaries[stream]``);
+    the guard and the resume override of this stream are removed."""
+    sid = getattr(engine, "stream_id", None)
+    g = _by(engine, "_v2_guard_by_stream").pop(sid, None)
+    _by(engine, "_v2_resume_by_stream").pop(sid, None)
+    s = summary(g) if g is not None else None
+    if s is not None:
+        _by(engine, "_v2_guard_summaries")[sid] = s
+    return s

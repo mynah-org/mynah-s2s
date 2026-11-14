@@ -293,3 +293,21 @@ def test_engine_modes_default_unchanged_and_eotr_step_explicit(monkeypatch):
     assert exp["enabled"] and seen[-1]["eotr_step"] is True and seen[-1]["func_pad"] is False
     other = SimpleNamespace(cfg=SimpleNamespace(s2s=SimpleNamespace(llm_checkpoint_path="/x/lab-ckpt")))
     assert not ReferenceEngine._default_fc_ctx_fix(other, None)["enabled"]   # non-official stays off by default
+
+
+def test_per_stream_resume_override_for_guarded_sessions():
+    """A guarded session (engine._v2_resume_by_stream[stream] = "pad_eotr") resumes on (PAD, EOTR) while the engine
+    default is (PAD, PAD); other streams keep the default; "pad_pad" forces PAD; no entry = the engine contract."""
+    eng = FakeEngine()
+    fc_ctx_fix.enable(eng, pad_fill=True, channels=("gen_text", "gen_asr_text"), func_pad=True)   # official default
+    eng._v2_resume_by_stream = {1: "pad_eotr", 2: "pad_pad"}
+    reads = {}
+    for sid in (0, 1, 2):
+        ctx = Ctx()
+        for _ in range(10):
+            main_step(eng, ctx, sid)
+        fc_cycle(eng, ctx, sid, p1=[30, 21], p2=[40, EOTR])
+        main_step(eng, ctx, sid)
+        reads[sid] = eng.wrapper.reads[-1][2:]
+    assert reads == {0: (PAD, PAD), 1: (PAD, EOTR), 2: (PAD, PAD)}
+    fc_ctx_fix.disable(eng)

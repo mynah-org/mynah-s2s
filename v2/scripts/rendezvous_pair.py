@@ -137,6 +137,8 @@ def main():
     ap.add_argument("--fc-ctx-fix", default="auto", choices=["auto", "on", "off"],
                     help="FC hand-back fix (selective): auto = ON for the official VoiceChat checkpoint only; off = rollback")
     ap.add_argument("--graphs", type=int, default=None, help="BatchedThinker CUDA graphs (0 = eager)")
+    ap.add_argument("--no-call-guard", action="store_true",
+                    help="sessions without the per-session call guard (default ON, solo AND pair, as in serving)")
     ap.add_argument("--tail-s", type=float, default=6.0)
     ap.add_argument("--drain-s", type=float, default=40.0,
                     help="after the scripted audio, keep feeding silence while an FC cycle is open (+ tail after it "
@@ -343,6 +345,9 @@ def main():
         if diag is not None:
             diag.solo_sid = sid
         eng.bind_session_tools(tools)
+        if tools and not a.no_call_guard:              # same default as the pair (rz.open) and as serving
+            from mynah_v2.agent.call_guard import CallGuard
+            eng.set_session_guard(CallGuard(session_id=sid))
         eng.open(prompt)
         t0 = time.perf_counter()
         acc["t0_ns"] = time.monotonic_ns()
@@ -424,7 +429,7 @@ def main():
     for i, s in enumerate(sess):
         logs[s["sid"]] = []
         tools, prompt = tools_of(s, logs[s["sid"]])
-        rz.open(s["sid"], prompt, tools=tools, seed=s["seed"])
+        rz.open(s["sid"], prompt, tools=tools, seed=s["seed"], guard=not a.no_call_guard)
         snap(f"N{i + 1}_after_open")               # fixed cost of one more session (prefill done, before any chunk)
         pair[s["sid"]] = {"text_ids": [], "func_ids": [], "text": "", "fc_records": 0, "tools": logs[s["sid"]]}
     rounds, misses, mem_samples = [], 0, []

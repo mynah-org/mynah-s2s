@@ -24,6 +24,7 @@ class SessionToolBinding:
         self.epoch = 0
         self.active = False
         self.stale_calls: list[dict] = []
+        self.names: list[str] = []              # the tools the current session bound (wrapped by a call guard, if any)
         self._lock = threading.Lock()
 
     def bind(self, tools: dict[str, Callable]) -> int:
@@ -34,6 +35,7 @@ class SessionToolBinding:
             ep = self.epoch
             for name, fn in tools.items():
                 self.registry[name] = self._guard(name, fn, ep)
+            self.names = list(tools)
             self.active = True
             return ep
 
@@ -52,6 +54,7 @@ class SessionToolBinding:
             self.epoch += 1
             self.registry.clear()
             self.registry.update(self.base)
+            self.names = []
             self.active = False
 
 

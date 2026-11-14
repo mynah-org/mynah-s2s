@@ -494,3 +494,83 @@ def test_echo_refusal_restates_the_earlier_outcome():
     for _ in range(3):                                   # past the budget: the compact budget text, still a response
         r = g.admit("get_order_status", a)
     assert json.loads(r.response)["next_step"]
+
+
+def test_attach_session_guard_wraps_bound_tools_and_detach_clears():
+    from types import SimpleNamespace
+
+    from mynah_v2.agent.call_guard import attach_session_guard, detach_session_guard
+    from mynah_v2.model.session_tools import SessionToolBinding
+    ran = []
+    reg = {"builtin": lambda a: "b"}
+    binding = SessionToolBinding(reg)
+    binding.bind({"get_order_status": lambda a: (ran.append(a), NF("qgq999"))[1]})
+    eng = SimpleNamespace(session_tools=binding, stream_id=7)
+    g = CallGuard(session_id="s")
+    attach_session_guard(eng, g)
+    from mynah_v2.agent.call_guard import session_guard
+    assert session_guard(eng) is g and eng._v2_resume_by_stream == {7: "pad_eotr"}
+    assert not hasattr(reg["builtin"], "__v2_call_guard__")           # only the session's own tools are guarded
+    g.on_user_text("order Q Q nine")
+    assert json.loads(reg["get_order_status"]({"order_id": "qgq999"}))["found"] is False
+    assert json.loads(reg["get_order_status"]({"order_id": "qgq999"}))["status"] == "not_executed"
+    assert len(ran) == 1
+    attach_session_guard(eng, g)                                       # idempotent: not wrapped twice
+    assert reg["get_order_status"].__wrapped__.__wrapped__ is not None
+    s = detach_session_guard(eng)
+    assert s["admitted"] == 1 and s["refused"] == {"repeat": 1}
+    assert session_guard(eng) is None and eng._v2_resume_by_stream == {} and eng._v2_guard_summaries[7] == s
+    binding.unbind()
+    assert set(reg) == {"builtin"}
+
+
+def test_session_attaches_the_guard_by_default_in_enhanced_only():
+    from types import SimpleNamespace
+
+    import torch
+
+    from mynah_v2.model.session_tools import SessionToolBinding
+    from mynah_v2.runtime.session import EnhancedOptions, Mode, Session
+    from mynah_v2.tracing.events import Tracer
+
+    class Eng:
+        chunk_samples = 2560
+
+        def __init__(self):
+            self.pipeline = SimpleNamespace(tool_registry={})
+            self.session_tools = SessionToolBinding(self.pipeline.tool_registry)
+            self.session_tools.bind({"t": lambda a: "{}"})
+            self.stream_id = 0
+            self.opened = 0
+
+        def set_session_guard(self, guard, resume="pad_eotr", tracer=None):
+            from mynah_v2.agent.call_guard import attach_session_guard
+            attach_session_guard(self, guard, resume=resume, tracer=tracer)
+
+        def open(self, p):
+            self.opened += 1
+
+        def close(self):
+            from mynah_v2.agent.call_guard import detach_session_guard
+            detach_session_guard(self)
+
+        def fc_active(self):
+            return False
+
+        def step(self, x, is_last=False):
+            raise AssertionError
+
+    e = Eng()
+    s = Session(e, Tracer(None, session_id="x"), Mode.ENHANCED, EnhancedOptions())
+    s.open(None)
+    assert s.guard is not None and e._v2_resume_by_stream == {0: "pad_eotr"}
+    s.close("cancel")
+    assert s.guard_summary is not None and e._v2_resume_by_stream == {}
+    e2 = Eng()
+    r = Session(e2, Tracer(None, session_id="y"), Mode.REFERENCE, None)
+    r.open(None)
+    assert r.guard is None and not getattr(e2, "_v2_resume_by_stream", None)   # REFERENCE stays NVIDIA's behaviour
+    e3 = Eng()
+    o = Session(e3, Tracer(None, session_id="z"), Mode.ENHANCED, EnhancedOptions(call_guard=False))
+    o.open(None)
+    assert o.guard is None

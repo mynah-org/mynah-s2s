@@ -178,6 +178,11 @@ class ReferenceEngine:
         from mynah_v2.model.session_tools import SessionToolBinding
         # base registry = builtins + constructor tools; per-session handlers are bound/unbound around each session
         self.session_tools = SessionToolBinding(self.pipeline.tool_registry)
+        # per-session call guard (agent.call_guard; attached by the session layer, default ON in ENHANCED) and the FC
+        # resume contract of guarded streams (read by fc_ctx_fix from the FC thread, keyed by stream id)
+        self._v2_guard_by_stream: dict = {}
+        self._v2_resume_by_stream: dict = {}
+        self._v2_guard_summaries: dict = {}
         self.fc_still_running = 0
         self.fc_records: list[FCRecord] = []
         self._fc_lock = threading.Lock()
@@ -308,6 +313,11 @@ class ReferenceEngine:
         """Tool handlers owned by the next/current session (unbound by ``close``); see session_tools.py."""
         return self.session_tools.bind(tools)
 
+    def set_session_guard(self, guard, resume: str | None = "pad_eotr", tracer=None) -> None:
+        """Guard the current session's bound tools (agent.call_guard.attach_session_guard); cleared by ``close``."""
+        from mynah_v2.agent.call_guard import attach_session_guard
+        attach_session_guard(self, guard, resume=resume, tracer=tracer)
+
     def open(self, system_prompt: str | None, fc_wait_s: float = 10.0) -> None:
         from nemo.collections.speechlm2.inference.streaming.framing.s2s_request_options import S2SRequestOptions
         from mynah_v2.model.session_tools import release_fc_thread
@@ -345,6 +355,10 @@ class ReferenceEngine:
         ad = full_a[self._pos["asr"]:] if len(full_a) >= self._pos["asr"] else " "
         fd = full_f[self._pos["func"]:]
         self._pos = {"text": len(full_t), "asr": len(full_a), "func": len(full_f)}
+        gb = getattr(self, "_v2_guard_by_stream", None)
+        g = gb.get(self.stream_id) if gb else None
+        if g is not None and ad and ad.strip():           # the caller's speech = the guard's input epoch
+            g.on_user_text(ad)
         st.cleanup_after_response()
         ctx = self._ctx()
         new_t, new_f, fi = [], [], self._last_frame_idx
@@ -384,6 +398,8 @@ class ReferenceEngine:
 
     def close(self) -> None:
         try:
+            from mynah_v2.agent.call_guard import detach_session_guard
+            detach_session_guard(self)
             self.release_fc()
             self.pipeline.close_session()
         finally:

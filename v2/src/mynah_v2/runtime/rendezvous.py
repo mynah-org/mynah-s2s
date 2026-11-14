@@ -928,7 +928,8 @@ class RendezvousEngine:
         return out
 
     # ------------------------------------------------------------------------------------------------ sessions
-    def open(self, sid: str, system_prompt: Optional[str], tools: Optional[dict] = None, seed: Optional[int] = None):
+    def open(self, sid: str, system_prompt: Optional[str], tools: Optional[dict] = None, seed: Optional[int] = None,
+             guard: bool | dict = True):
         if sid in self.workers:
             raise RendezvousError(f"session {sid!r} already open")
         # registering the session (store record, unique stream id) happens on the driver; the prefill runs in the
@@ -946,6 +947,10 @@ class RendezvousEngine:
         def job():
             if tools:
                 self.engine.bind_session_tools(tools)
+                if guard:                                # default ON: the session's tools behind its own guard
+                    from mynah_v2.agent.call_guard import CallGuard
+                    self.engine.set_session_guard(CallGuard(session_id=str(sid),
+                                                            **(guard if isinstance(guard, dict) else {})))
             self.engine.open(system_prompt)
         res = self.run_round({sid: job})[sid]
         if isinstance(res, BaseException):
