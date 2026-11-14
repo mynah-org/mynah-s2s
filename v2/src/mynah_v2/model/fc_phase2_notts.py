@@ -2,7 +2,7 @@
 
 Phase 2 of NeMo's non-blocking FC (`_run_fc_async_steps` called with `tool_response_text`) forces the
 `<TOOL_RESPONSE>` tokens one per step and lets the model predict EOTR. Every forced step also runs one EarTTS step (CFG)
-and one codec decode + `.cpu()` (wrapper ~:1471-1564), about 36 + ~30 ms of the ~165 ms step on GB10. None of that
+and one codec decode + `.cpu()` (wrapper ~:1471-1564), a large share of the step. None of that
 reaches the caller: the pipeline passes no TTS audio queue to phase 2 ("TTS during forced-token injection produces
 silence ... we do NOT pass tts_audio_output_queue here", pipeline ~:1658-1666) and the non-blocking hand-back never
 reads phase-2 chunks. The text/ASR predictions are forced to PAD and the function prediction is overwritten by the

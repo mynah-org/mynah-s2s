@@ -281,7 +281,7 @@ class AsrShadow:
                 "unfulfilled": [i for i in self.intents if i["fulfilled"] is False]}
 
 
-# Compact refusals (opt-in, response_style="compact"): every refusal token is one FC phase-2 step (~165 ms on GB10);
+# Compact refusals (opt-in, response_style="compact"): every refusal token is one FC phase-2 step;
 # the full repeat refusal is 86 tokens (87 steps, 14.1 s), these are ~30. The earlier result is NOT restated: the model
 # already read it in its own context. Admission rules are identical in both styles.
 COMPACT = {
