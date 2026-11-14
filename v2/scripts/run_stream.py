@@ -111,10 +111,10 @@ def main():
                     help="(legacy, now the ENHANCED default) per-session call registry + admission control")
     ap.add_argument("--no-call-guard", action="store_true",
                     help="ENHANCED without the call guard (and with the engine's own FC resume contract)")
-    ap.add_argument("--guard-resume", choices=["pad_eotr", "pad_pad", "by_outcome", "engine"], default="pad_eotr",
-                    help="FC resume contract of a guarded session: (PAD,EOTR) keeps chains (default), (PAD,PAD), "
-                         "by_outcome (EXPERIMENT: (PAD,PAD) after a negative / refused result or new caller speech, else "
-                         "(PAD,EOTR)), or the engine's own")
+    ap.add_argument("--guard-resume", choices=["by_outcome", "pad_eotr", "pad_pad", "engine"], default="by_outcome",
+                    help="FC resume contract of a guarded session: by_outcome (default: (PAD,PAD) after a negative / "
+                         "refused result or new caller speech, else (PAD,EOTR)), a fixed (PAD,EOTR) / (PAD,PAD), or the "
+                         "engine's own")
     ap.add_argument("--asr-shadow", action="store_true",
                     help="EXPERIMENT (with --call-guard): compare call slots with the caller ASR, observe only")
     ap.add_argument("--guard-compact", action="store_true",

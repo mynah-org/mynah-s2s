@@ -509,7 +509,7 @@ def test_attach_session_guard_wraps_bound_tools_and_detach_clears():
     g = CallGuard(session_id="s")
     attach_session_guard(eng, g)
     from mynah_v2.agent.call_guard import session_guard
-    assert session_guard(eng) is g and eng._v2_resume_by_stream == {7: "pad_eotr"}
+    assert session_guard(eng) is g and eng._v2_resume_by_stream == {7: "by_outcome"}
     assert not hasattr(reg["builtin"], "__v2_call_guard__")           # only the session's own tools are guarded
     g.on_user_text("order Q Q nine")
     assert json.loads(reg["get_order_status"]({"order_id": "qgq999"}))["found"] is False
@@ -563,7 +563,7 @@ def test_session_attaches_the_guard_by_default_in_enhanced_only():
     e = Eng()
     s = Session(e, Tracer(None, session_id="x"), Mode.ENHANCED, EnhancedOptions())
     s.open(None)
-    assert s.guard is not None and e._v2_resume_by_stream == {0: "pad_eotr"}
+    assert s.guard is not None and e._v2_resume_by_stream == {0: "by_outcome"}
     s.close("cancel")
     assert s.guard_summary is not None and e._v2_resume_by_stream == {}
     e2 = Eng()

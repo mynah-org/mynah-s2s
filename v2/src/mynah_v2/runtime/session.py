@@ -77,7 +77,7 @@ class EnhancedOptions:
     guard_style: str = "full"                   # "full" (validated) | "echo" (shorter refusals) | "compact"
     guard_schemas: dict | None = None           # {tool: {"properties": {slot: {"x-source": "result"|"caller"}}}}
     guard_side_effects: dict | None = None      # {tool: idempotency-key parameter or None}
-    resume_with_guard: str | None = "pad_eotr"  # FC resume contract of a guarded session (None = engine default)
+    resume_with_guard: str | None = "by_outcome"  # FC resume contract of a guarded session (None = engine default)
 
 
 class Engine(Protocol):

@@ -313,7 +313,7 @@ class ReferenceEngine:
         """Tool handlers owned by the next/current session (unbound by ``close``); see session_tools.py."""
         return self.session_tools.bind(tools)
 
-    def set_session_guard(self, guard, resume: str | None = "pad_eotr", tracer=None) -> None:
+    def set_session_guard(self, guard, resume: str | None = "by_outcome", tracer=None) -> None:
         """Guard the current session's bound tools (agent.call_guard.attach_session_guard); cleared by ``close``."""
         from mynah_v2.agent.call_guard import attach_session_guard
         attach_session_guard(self, guard, resume=resume, tracer=tracer)

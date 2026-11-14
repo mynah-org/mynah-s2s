@@ -458,7 +458,7 @@ class CallGuard:
         return out
 
     def resume_contract(self) -> str:
-        """EXPERIMENT (resume "by_outcome"): the FC resume contract for the hand-back that is about to happen, from the
+        """Resume "by_outcome" (the guarded default): the FC resume contract for the hand-back that is about to happen, from the
         last call of this session. (PAD, EOTR) lets the model chain a further call (a positive result whose data feeds
         the next tool); (PAD, PAD) after a negative / timed-out / refused result, or when the caller spoke after the
         call was issued (the new request leads). Observed with (PAD, EOTR): identical re-calls after 10/11 negative
@@ -589,12 +589,14 @@ def guard_handler(name: str, fn, guard: CallGuard, tracer=None):
     return handler
 
 
-def attach_session_guard(engine, guard: CallGuard, resume: str | None = "pad_eotr", tracer=None) -> None:
+def attach_session_guard(engine, guard: CallGuard, resume: str | None = "by_outcome", tracer=None) -> None:
     """Put ``guard`` on the tools the CURRENT session bound (``engine.session_tools``) and make the engine feed it the
     caller's ASR (read by ``ReferenceEngine.step``). ``resume`` = the FC resume contract for this
     session's stream while guarded (fc_ctx_fix reads ``engine._v2_resume_by_stream``; the guard itself is kept in
-    ``engine._v2_guard_by_stream``, both keyed by stream id): "pad_eotr" lets the model chain
-    calls (its loops after a negative result are what the guard stops); None keeps the engine's contract. Undone by
+    ``engine._v2_guard_by_stream``, both keyed by stream id): "by_outcome" (default) asks the guard at each hand-back
+    (``CallGuard.resume_contract``: (PAD, EOTR) after a positive result so a dependent call can follow, (PAD, PAD)
+    after a negative / refused one or new caller speech); "pad_eotr" / "pad_pad" fix one contract; None keeps the
+    engine's contract. Undone by
     ``detach_session_guard`` (the engine's close calls it) and by the tool unbind."""
     binding = engine.session_tools
     reg = binding.registry
