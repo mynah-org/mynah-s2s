@@ -27,6 +27,8 @@ def main():
                     help="write the legacy Thinker-only pack instead of the combined bundle")
     ap.add_argument("--no-eartts", action="store_true",
                     help="exclude the EarTTS Gemma backbone from the combined bundle")
+    ap.add_argument("--no-extended", action="store_true",
+                    help="exclude safe perception/RNNT-joint/TTS auxiliary Linear scopes")
     a = ap.parse_args()
     if not a.output.endswith(".safetensors"):
         ap.error("output must end in .safetensors")
@@ -37,7 +39,8 @@ def main():
                                       include_heads=not a.no_heads)
     else:
         info = save_int4_bundle(eng, a.output, max_group=a.int4_group, clip=a.int4_clip,
-                                include_heads=not a.no_heads, include_eartts=not a.no_eartts)
+                                include_heads=not a.no_heads, include_eartts=not a.no_eartts,
+                                include_extended=not a.no_extended)
     print("INT4_PACK", info, flush=True)
 
 

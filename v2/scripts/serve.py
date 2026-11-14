@@ -48,7 +48,7 @@ def main():
     ap.add_argument("--no-llm-cache", action="store_true",
                     help="diagnostic: NVIDIA's shipped no-cache Thinker (default: V2 incremental Thinker)")
     ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
-                    help="opt-in INT4 preset: Thinker, output heads, and graph-safe EarTTS backbone; remaining audio state stays BF16")
+                    help="opt-in INT4 preset: all measured standard Linear paths; conv/LSTM/codebooks/codec stay BF16")
     ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: replace Thinker backbone linears with native int4 tinygemm; lower memory and may improve GB10 decode speed")
     ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
@@ -63,6 +63,8 @@ def main():
                     help="use a per-group clipping search for --thinker-int4 (slower startup, lower quantization error)")
     ap.add_argument("--eartts-int4", action="store_true", default=_env_flag("MYNAH_EARTTS_INT4"),
                     help="EXPERIMENT: graph-safe native INT4 for the EarTTS Gemma backbone only; requires enhanced mode")
+    ap.add_argument("--int4-extended", action="store_true", default=_env_flag("MYNAH_INT4_EXTENDED"),
+                    help="EXPERIMENT: also quantize perception Linear, RNNT joint, CAS/fusion/MoG Linear paths")
     ap.add_argument("--tool-timeout", type=float, default=8.0,
                     help="ENHANCED: max seconds a tool may run before an explicit timeout error goes to the model")
     ap.add_argument("--exp", default=None, help="comma list of extra perf experiments (ENHANCED only)")
@@ -82,6 +84,7 @@ def main():
         a.thinker_int4 = True
         a.int4_heads = True
         a.eartts_int4 = True
+        a.int4_extended = True
     if a.int4_pack:
         # A bundle already contains both graph-safe families.  It is valid to
         # combine it with --int4 as a convenient preset, but never requantize
@@ -90,12 +93,15 @@ def main():
         a.thinker_int4 = True
         a.int4_heads = False
         a.eartts_int4 = False
+        a.int4_extended = False
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
         ap.error("--thinker-int4 is experimental and requires --mode enhanced")
     if a.eartts_int4 and a.mode == "reference":
         ap.error("--eartts-int4 is experimental and requires --mode enhanced")
+    if a.int4_extended and a.mode == "reference":
+        ap.error("--int4-extended is experimental and requires --mode enhanced")
     if (a.perf_profile or a.exp) and a.mode == "reference":
         ap.error("--perf-profile / --exp are never applied in REFERENCE mode")
     if a.cudnn_benchmark:
@@ -123,6 +129,9 @@ def main():
     if a.eartts_int4:
         from mynah_v2.model.eartts_q4 import quantize_eartts_int4
         print("EARTTS_QUANT", quantize_eartts_int4(eng), flush=True)
+    if a.int4_extended:
+        from mynah_v2.model.quant import quantize_extended_int4
+        print("EXTENDED_QUANT", quantize_extended_int4(eng), flush=True)
     if a.perf_profile or a.exp:
         exp = a.exp
         if a.thinker_int4:

@@ -153,7 +153,7 @@ def main():
     ap.add_argument("--perf-profile", default=None, choices=["optimized-exact", "optimized-graph"],
                     help="validated performance profile (mynah_v2.model.perf.PROFILES); ENHANCED only")
     ap.add_argument("--int4", action="store_true", default=_env_flag("MYNAH_INT4"),
-                    help="opt-in INT4 preset: Thinker, output heads, and graph-safe EarTTS backbone; remaining audio state stays BF16")
+                    help="opt-in INT4 preset: all measured standard Linear paths; conv/LSTM/codebooks/codec stay BF16")
     ap.add_argument("--thinker-int4", action="store_true", default=_env_flag("MYNAH_THINKER_INT4"),
                     help="EXPERIMENT: int4 weight-only Thinker (mynah_v2.model.quant); refused in REFERENCE mode")
     ap.add_argument("--thinker-int4-pack", default=os.environ.get("MYNAH_THINKER_INT4_PACK"),
@@ -166,6 +166,8 @@ def main():
     ap.add_argument("--int4-clip", action="store_true", help="per-group clipping search (MSE)")
     ap.add_argument("--eartts-int4", action="store_true", default=_env_flag("MYNAH_EARTTS_INT4"),
                     help="EXPERIMENT: graph-safe native INT4 for the EarTTS Gemma backbone only; requires enhanced mode")
+    ap.add_argument("--int4-extended", action="store_true", default=_env_flag("MYNAH_INT4_EXTENDED"),
+                    help="EXPERIMENT: also quantize perception Linear, RNNT joint, CAS/fusion/MoG Linear paths")
     a = ap.parse_args()
     preset_info = presets.fill(a, presets.SINGLE, a.preset)
     print("PRESET", a.preset, preset_info, flush=True)
@@ -177,17 +179,21 @@ def main():
         a.thinker_int4 = True
         a.int4_heads = True
         a.eartts_int4 = True
+        a.int4_extended = True
     if a.int4_pack:
         a.thinker_int4_pack = a.int4_pack
         a.thinker_int4 = True
         a.int4_heads = False
         a.eartts_int4 = False
+        a.int4_extended = False
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
         ap.error("--thinker-int4 is experimental and never allowed in REFERENCE mode")
     if a.eartts_int4 and a.mode == "reference":
         ap.error("--eartts-int4 is experimental and never allowed in REFERENCE mode")
+    if a.int4_extended and a.mode == "reference":
+        ap.error("--int4-extended is experimental and never allowed in REFERENCE mode")
     if a.pace == "fast" and a.tools:
         ap.error("--pace fast is invalid with tools: the reference FC fast path runs on wall time while generate_step "
                  "returns at once, so unpaced input/drain closes sessions mid-call (golden v1 incident, 2026-11-11)")
@@ -247,6 +253,9 @@ def main():
     if a.eartts_int4:
         from mynah_v2.model.eartts_q4 import quantize_eartts_int4
         print("EARTTS_QUANT", quantize_eartts_int4(eng), flush=True)
+    if a.int4_extended:
+        from mynah_v2.model.quant import quantize_extended_int4
+        print("EXTENDED_QUANT", quantize_extended_int4(eng), flush=True)
     perf_info = None
     if a.perf_profile or a.exp:
         perf_info = presets.apply(eng, a.perf_profile, a.exp, strict=a.strict)

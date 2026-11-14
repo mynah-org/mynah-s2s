@@ -5,8 +5,8 @@ linear weights read per step). On GB10/sm_121 with torch 2.10 native kernels (mi
 bf16 64.4 ms/step, int8 weight-only ``_weight_int8pack_mm`` 86.5 ms (slower), fp8 row-wise ``_scaled_mm`` not supported
 by cuBLASLt, int4 ``_weight_int4pack_mm`` 11.9 ms (5.4×). Only int4 actually pays off, hence this module.
 
-Scope: Thinker Mamba/attention/MLP projections and optional text/function heads. The bundle API also stores the
-separately discovered EarTTS Gemma backbone linears. Embeddings, RNN-T, perception, CAS/MoG/RVQ and codec stay
+Scope: Thinker Mamba/attention/MLP projections, optional text/function heads, and the standard Linear paths in
+perception, RNNT joint, CAS/fusion and MoG. Embeddings, RNN-T decoder, convolution/codebooks and codec stay
 outside this module until they have a compatible graph-safe backend. Asymmetric min-max per group
 (torchao/tinygemm convention: w ≈ (q - 8) · scale + zero). Group 128, or 64/32 when K is not a multiple.
 The replaced module keeps an empty ``weight`` buffer so the remote code's device/dtype checks still work
@@ -178,6 +178,62 @@ def restore_thinker(originals) -> None:
     torch.cuda.empty_cache()
 
 
+def _quantize_linear_tree(root: nn.Module, max_group: int, scope: str,
+                          predicate=None) -> dict:
+    """Replace ordinary Linear children in one model scope, reporting safe skips."""
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Linear) or (predicate is not None and not predicate(name, mod)):
+            continue
+        # Torch tinygemm requires the output tile (N) to be aligned.  The
+        # RNNT vocabulary projection is 1025 wide; keep it BF16 rather than
+        # producing a pack that only fails when the first RNNT token is read.
+        if mod.out_features % 8:
+            skipped.append({"name": name, "reason": f"out_features={mod.out_features} is not 8-aligned"})
+            continue
+        try:
+            group, _ = _pick(mod.in_features, max_group)
+            before += mod.weight.numel() * mod.weight.element_size()
+            q = Int4Linear(mod, max_group=max_group)
+        except (StopIteration, ValueError) as exc:
+            skipped.append({"name": name, "reason": str(exc)})
+            continue
+        after += q.packed.numel() * q.packed.element_size() + q.scales_zeros.numel() * 2
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "linears": n, "skipped": skipped, "max_group": max_group,
+            "bf16_bytes": before, "int4_bytes": after}
+
+
+def quantize_extended_int4(engine, max_group: int = 128) -> dict:
+    """Quantize the Q8-equivalent standard matrix paths with native tinygemm.
+
+    This intentionally excludes convolution weights, the RNNT decoder LSTM,
+    embeddings/codebooks, MoG ``proj_mus`` (read directly by a custom matmul),
+    and the codec. Those paths need distinct fused kernels/layouts.
+    """
+    model = engine.wrapper.model
+    scopes = {
+        "perception": _quantize_linear_tree(model.stt_model.perception, max_group, "perception"),
+        "rnnt_joint": _quantize_linear_tree(model.stt_model.rnnt_joint, max_group, "rnnt_joint"),
+    }
+    tts = model.tts_model.tts_model
+    scopes["eartts_aux"] = _quantize_linear_tree(
+        tts, max_group, "eartts_aux",
+        predicate=lambda name, _mod: (
+            not name.startswith("backbone.") and name != "mog_head.proj_mus"
+        ),
+    )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"extended_int4": True, "scopes": scopes,
+            "linears": sum(v["linears"] for v in scopes.values()),
+            "skipped": sum(len(v["skipped"]) for v in scopes.values())}
+
+
 PACK_FORMAT = "mynah.int4.tinygemm.v1"
 BUNDLE_FORMAT = "mynah.int4.bundle.v1"
 
@@ -255,14 +311,16 @@ def _bundle_module_spec(root_name: str, name: str, mod: Int4Linear, tensors: dic
 
 
 def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool = False,
-                     include_heads: bool = True, include_eartts: bool = True) -> dict:
+                     include_heads: bool = True, include_eartts: bool = True,
+                     include_extended: bool = True) -> dict:
     """Export one offline INT4 bundle for every currently graph-safe weight family.
 
     The bundle deliberately uses the same Torch tinygemm representation for the
     Thinker and the EarTTS Gemma backbone.  That means the server can load one
     file, validate every module, and only then swap anything in the live model.
-    Unsupported audio pieces (perception, CAS/MoG/RVQ, and codec) are not put in
-    the bundle until they have their own measured graph-safe implementation.
+    Unsupported audio pieces (convolution, decoder LSTM, embeddings/codebooks,
+    MoG direct ``proj_mus``, and codec) are not put in the bundle until they
+    have their own measured graph-safe implementation.
     """
     path = Path(path)
     if path.suffix != ".safetensors":
@@ -274,6 +332,7 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
     if include_eartts:
         from mynah_v2.model.eartts_q4 import quantize_eartts_int4
         eartts_info = quantize_eartts_int4(engine, group=max_group, backend="native")
+    extended_info = quantize_extended_int4(engine, max_group=max_group) if include_extended else None
 
     model = engine.wrapper.model
     tensors = {}
@@ -287,6 +346,19 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
         for name, mod in backbone.named_modules():
             if isinstance(mod, Int4Linear):
                 modules.append(_bundle_module_spec("eartts_backbone", name, mod, tensors))
+    if include_extended:
+        perception = model.stt_model.perception
+        for name, mod in perception.named_modules():
+            if isinstance(mod, Int4Linear):
+                modules.append(_bundle_module_spec("perception", name, mod, tensors))
+        rnnt_joint = model.stt_model.rnnt_joint
+        for name, mod in rnnt_joint.named_modules():
+            if isinstance(mod, Int4Linear):
+                modules.append(_bundle_module_spec("rnnt_joint", name, mod, tensors))
+        tts = model.tts_model.tts_model
+        for name, mod in tts.named_modules():
+            if isinstance(mod, Int4Linear) and not name.startswith("backbone."):
+                modules.append(_bundle_module_spec("eartts_aux", name, mod, tensors))
     if not modules:
         raise RuntimeError("no native INT4 modules were produced")
     manifest = {
@@ -298,13 +370,17 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
         "scopes": {
             "stt_model": "Thinker projections and optional text/function heads",
             "eartts_backbone": "EarTTS Gemma backbone linears",
+            "perception": "Perception Conformer Linear layers; convolution stays BF16",
+            "rnnt_joint": "RNNT joint projections; decoder LSTM stays BF16",
+            "eartts_aux": "CAS/fusion/MoG standard Linear layers",
         },
-        "unsupported_scopes": ["perception", "rnnt", "cas_subword", "mog", "rvq", "codec"],
+        "unsupported_scopes": ["perception_convolution", "rnnt_decoder_lstm", "embeddings",
+                               "mog_proj_mus", "rvq", "codec"],
         "quantizer": "asymmetric_minmax_tinygemm",
         "max_group": max_group,
         "clip_search": clip,
         "modules": modules,
-        "quant_info": {"thinker": thinker_info, "eartts": eartts_info},
+        "quant_info": {"thinker": thinker_info, "eartts": eartts_info, "extended": extended_info},
     }
     from safetensors.torch import save_file
     tmp_pack = path.with_name(path.name + ".tmp")
@@ -314,7 +390,8 @@ def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool 
     tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp_manifest.replace(path.with_suffix(".json"))
     return {"path": str(path), "manifest": str(path.with_suffix(".json")), "modules": len(modules),
-            "format": BUNDLE_FORMAT, "thinker": thinker_info, "eartts": eartts_info}
+            "format": BUNDLE_FORMAT, "thinker": thinker_info, "eartts": eartts_info,
+            "extended": extended_info}
 
 
 def load_thinker_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
@@ -385,6 +462,11 @@ def load_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
         raise ValueError(f"unsupported int4 pack format: {manifest.get('format')!r}")
     model = engine.wrapper.model
     roots = {"stt_model": model.stt_model, "eartts_backbone": model.tts_model.tts_model.backbone}
+    if hasattr(model.stt_model, "perception"):
+        roots["perception"] = model.stt_model.perception
+    if hasattr(model.stt_model, "rnnt_joint"):
+        roots["rnnt_joint"] = model.stt_model.rnnt_joint
+    roots["eartts_aux"] = model.tts_model.tts_model
     device = str(next(model.parameters()).device)
     from safetensors.torch import load_file
     tensors = load_file(str(path), device=device)

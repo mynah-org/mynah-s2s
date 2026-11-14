@@ -32,9 +32,10 @@ through the Make target (or set `MYNAH_INT4=1`):
 make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 ```
 
-The INT4 mode quantizes Thinker projections, text/function heads, and the
-graph-safe EarTTS Gemma backbone with native tinygemm. It keeps recurrent/KV
-caches, perception/RNNT, CAS/subword, MoG, RVQ, and codec components unchanged.
+The INT4 mode quantizes all measured standard Linear paths: Thinker/head,
+perception Conformer, RNNT joint, EarTTS Gemma, CAS/fusion, and compatible MoG
+linears. It keeps recurrent/KV caches, convolution/codebooks, RNNT decoder
+LSTM, MoG `proj_mus`, and codec components in BF16.
 
 The legacy TTS-only switch is still available for isolated tests:
 
@@ -43,7 +44,7 @@ make webui-gpu V2_SERVE_ARGS="--eartts-int4 --perf-profile optimized-graph"
 ```
 
 It quantizes only the Gemma backbone linears. CAS/subword embeddings, MoG
-projections, RVQ, codec, and perception remain unchanged. The combined
+direct projections, RVQ, codec, and perception remain unchanged. The combined
 `--int4` path has passed a real DGX WebSocket turn with zero dropped audio.
 
 For repeatable startup, export the native packed weights once and pass the bundle
@@ -55,7 +56,7 @@ make webui-gpu V2_SERVE_ARGS="--int4-pack /path/to/voicechat-int4.safetensors"
 ```
 
 This writes `.safetensors` plus a sibling `.json` manifest. The bundle includes
-the Thinker/output heads and native INT4 EarTTS backbone. No INT4 option means
+all measured standard Linear scopes and records the remaining BF16 scopes. No INT4 option means
 the normal BF16 server path.
 
 To open it from another device on the LAN, use `--host 0.0.0.0` and pass the
