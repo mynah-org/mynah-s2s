@@ -50,11 +50,24 @@ The current custom bundle has the following verified results:
 - GPU specialized tests: `5 passed`, including dense/grouped ConvTranspose,
   RNNT fused B=4, MoG, RVQ, pointwise and depthwise paths.
 
-The custom Q8 bundle is semantically correct but still above the sub-1 realtime
-target. The true multi-session scheduler remains a separate integration path;
-the existing B>1 kernel tests validate batch safety of the quantized components,
-not a claim that the full Q8 `ReferenceEngine` is already serving concurrent
-sessions.
+The offline bundle is also wired into the real multi-session runner. Use one
+switch; the runner loads one model, opens all sessions, and batches Thinker,
+perception, codec, and EarTTS work where possible:
+
+```bash
+python v2/scripts/rendezvous_pair.py \
+  --group p3_overlapping_tool_calls \
+  --audio-root /path/to/agent-audio \
+  --out /tmp/q8-pair \
+  --int8-pack /path/to/voicechat-w8.safetensors
+```
+
+The concurrent gate has passed with two sessions and overlapping tool calls:
+both sessions produced the expected tool calls and grounded answers with no
+cross-session leak. The path is functionally correct, but the current
+multi-session profile is still above a strict 160 ms round budget; the gate
+records batch histograms, FC queue time, graph capture cost, memory, and
+per-session latency in `pair_gate.json` for further optimization.
 
 ## CUDA and Triton compatibility
 
