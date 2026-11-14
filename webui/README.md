@@ -37,6 +37,17 @@ keeps recurrent/KV caches and the ASR/RNNT, TTS, and codec components unchanged.
 Perception and EarTTS need a model-specific fused kernel before they can use
 the native INT4 path safely.
 
+The first graph-safe EarTTS Q4 backend is available for an explicit test:
+
+```bash
+make webui-gpu V2_SERVE_ARGS="--eartts-int4 --perf-profile optimized-graph"
+```
+
+It quantizes only the Gemma backbone linears. CAS/subword embeddings, MoG
+projections, RVQ, codec, and perception remain unchanged. This mode has passed
+a real WebSocket turn on DGX without graph errors, but remains separate from
+`--int4` until its end-to-end latency beats the BF16 graph profile.
+
 For repeatable startup, export the native packed weights once and pass the pack
 instead:
 

@@ -59,6 +59,8 @@ def main():
                     help="int4 weight group size for --thinker-int4 (smaller groups preserve more quality but use more metadata)")
     ap.add_argument("--int4-clip", action="store_true",
                     help="use a per-group clipping search for --thinker-int4 (slower startup, lower quantization error)")
+    ap.add_argument("--eartts-int4", action="store_true", default=_env_flag("MYNAH_EARTTS_INT4"),
+                    help="EXPERIMENT: graph-safe Triton Q4 for the EarTTS Gemma backbone only; requires enhanced mode")
     ap.add_argument("--tool-timeout", type=float, default=8.0,
                     help="ENHANCED: max seconds a tool may run before an explicit timeout error goes to the model")
     ap.add_argument("--exp", default=None, help="comma list of extra perf experiments (ENHANCED only)")
@@ -83,6 +85,8 @@ def main():
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
         ap.error("--thinker-int4 is experimental and requires --mode enhanced")
+    if a.eartts_int4 and a.mode == "reference":
+        ap.error("--eartts-int4 is experimental and requires --mode enhanced")
     if (a.perf_profile or a.exp) and a.mode == "reference":
         ap.error("--perf-profile / --exp are never applied in REFERENCE mode")
     if a.cudnn_benchmark:
@@ -107,6 +111,9 @@ def main():
             quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
                                                include_heads=a.int4_heads)
         print("THINKER_QUANT", quant_info, flush=True)
+    if a.eartts_int4:
+        from mynah_v2.model.eartts_q4 import quantize_eartts_int4
+        print("EARTTS_QUANT", quantize_eartts_int4(eng), flush=True)
     if a.perf_profile or a.exp:
         exp = a.exp
         if a.thinker_int4:

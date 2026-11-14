@@ -103,6 +103,29 @@ slower-than-realtime build so input is not dropped while measuring it.
 Perception and EarTTS are deliberately not included in the native PyTorch
 INT4 switch: their CUDA-graph/Triton path needs a model-specific fused kernel.
 
+An experimental graph-safe Q4 kernel for the EarTTS Gemma backbone can be
+tested separately:
+
+```bash
+make webui-gpu V2_SERVE_ARGS="--eartts-int4 --perf-profile optimized-graph"
+```
+
+It covers the 196 backbone linears only (not CAS/subword embeddings, MoG
+projections, RVQ, codec, or perception). It passed a real DGX WebSocket turn
+with zero dropped audio, but is not folded into `--int4` yet: on the current
+single-turn sample its end-to-end wall time was 31.5 s versus 25.5 s for the
+same BF16 graph profile, so the next step is kernel/trajectory tuning rather
+than making the slower path the default.
+
+Compared with the external GGUF Q8 deployment, our current coverage is still
+partial: Thinker + output heads are packed offline, and the experimental Q4
+path adds only the EarTTS Gemma backbone. The remaining pieces are perception
+encoder/projection, EarTTS CAS/subword embeddings, MoG projections/MLPs, RVQ
+embeddings, codec decoder, and RNNT-side tensors. The reference project emits
+separate LLM, function-head, perception, and TTS/codec artifacts; its README
+also says Q4 converts but the supported measurements are Q8. See the
+[reference layout](https://github.com/mkotyushev/nemotron-voicechat-realtime-gguf#why-gguf).
+
 To avoid quantizing at every server start, export a validated offline pack once:
 
 ```bash

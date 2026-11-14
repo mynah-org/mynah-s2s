@@ -162,6 +162,8 @@ def main():
                     help="also quantize the text/function output heads with --thinker-int4; keeps caches and embeddings unchanged")
     ap.add_argument("--int4-group", type=int, default=128, choices=[32, 64, 128])
     ap.add_argument("--int4-clip", action="store_true", help="per-group clipping search (MSE)")
+    ap.add_argument("--eartts-int4", action="store_true", default=_env_flag("MYNAH_EARTTS_INT4"),
+                    help="EXPERIMENT: graph-safe Triton Q4 for the EarTTS Gemma backbone only; requires enhanced mode")
     a = ap.parse_args()
     preset_info = presets.fill(a, presets.SINGLE, a.preset)
     print("PRESET", a.preset, preset_info, flush=True)
@@ -178,6 +180,8 @@ def main():
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
         ap.error("--thinker-int4 is experimental and never allowed in REFERENCE mode")
+    if a.eartts_int4 and a.mode == "reference":
+        ap.error("--eartts-int4 is experimental and never allowed in REFERENCE mode")
     if a.pace == "fast" and a.tools:
         ap.error("--pace fast is invalid with tools: the reference FC fast path runs on wall time while generate_step "
                  "returns at once, so unpaced input/drain closes sessions mid-call (golden v1 incident, 2026-11-11)")
@@ -234,6 +238,9 @@ def main():
             quant_info = quantize_thinker_int4(eng, max_group=a.int4_group, clip=a.int4_clip,
                                                include_heads=a.int4_heads)
         print("THINKER_QUANT", quant_info, flush=True)
+    if a.eartts_int4:
+        from mynah_v2.model.eartts_q4 import quantize_eartts_int4
+        print("EARTTS_QUANT", quantize_eartts_int4(eng), flush=True)
     perf_info = None
     if a.perf_profile or a.exp:
         perf_info = presets.apply(eng, a.perf_profile, a.exp, strict=a.strict)
