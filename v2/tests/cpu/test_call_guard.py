@@ -437,3 +437,60 @@ def test_compact_responses_same_decisions_shorter_text():
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
+
+
+def test_spoken_spans_whole_runs_only():
+    from mynah_v2.agent.call_guard import spoken_spans
+    assert "XYZ123" in spoken_spans("Hi, where is my order X Y Z one two three?")
+    assert "WXY615" in spoken_spans("you check order Wxy six one five.")
+    assert "20135" in spoken_spans("I'm Mario Rosie, postcode two zero one three five.")
+    assert "99999999" in spoken_spans("I'm Anna, post code nine nine nine nine nine nine nine nine.")
+    assert "9999" not in spoken_spans("post code nine nine nine nine nine nine nine nine.")
+    g = _shadow_guard()
+    g.on_user_text("morning. I'm anniverspost code nine nine nine nine nine nine nine nine.has my order shipped")
+    g.admit("find_customer", {"postcode": "9999"})
+    assert g.log[-1]["asr_slots"] == {"postcode": "mismatch"}            # m11: the old substring rule said match
+
+
+def test_transfer_intent_labelled_sentences():
+    """Synthetic labelled set (negations and look-alikes): transfer / negated / none."""
+    from mynah_v2.agent.call_guard import summary
+    cases = {
+        "I'd like to speak to an operator, please.": "transfer",
+        "Can you transfer me to a real person?": "transfer",
+        "Put me through to someone who can help.": "transfer",
+        "I want to talk to a human.": "transfer",
+        "Connect me with a representative.": "transfer",
+        "I don't want to speak to an operator, just tell me the status.": "negated",
+        "No need to transfer me to anyone, I'm fine.": "none",
+        "Please do not connect me to an agent.": "negated",
+        "Never mind the operator, where is my order?": "none",
+        "My order number is X Y Z one two three.": "none",
+        "The courier said someone would call me.": "none",
+        "Is a human going to deliver it or a drone?": "none",
+    }
+    for text, want in cases.items():
+        g = _shadow_guard()
+        g.on_user_text(text)
+        intents = summary(g)["asr_shadow"]["intents"]
+        got = "none" if not intents else ("negated" if intents[0]["negated"] else "transfer")
+        assert got == want or (want == "none" and got == "negated"), (text, got)
+
+
+def test_echo_refusal_restates_the_earlier_outcome():
+    from mynah_v2.agent.call_guard import ECHO_NOTE
+    g = CallGuard(response_style="echo")
+    g.on_user_text("check order W x y six one five.")
+    a = {"order_id": "WXYY615"}
+    g.complete(g.admit("get_order_status", a), NF("WXYY615"))
+    r = g.admit("get_order_status", a)
+    assert r.rule == "repeat"
+    assert json.loads(r.response) == {"order_id": "WXYY615", "found": False, "note": ECHO_NOTE}   # outcome kept
+    assert len(r.response) < 100
+    full = CallGuard()
+    full.on_user_text("x")
+    full.complete(full.admit("get_order_status", a), NF("WXYY615"))
+    assert full.admit("get_order_status", a).rule == r.rule                                   # same admission
+    for _ in range(3):                                   # past the budget: the compact budget text, still a response
+        r = g.admit("get_order_status", a)
+    assert json.loads(r.response)["next_step"]

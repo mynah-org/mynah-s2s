@@ -181,7 +181,9 @@ NEXT_STEP = {
 _DIG = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
         "seven": "7", "eight": "8", "nine": "9"}
 _STOP = {"a", "i", "is", "my", "the", "and", "it", "to", "of", "me", "you", "do", "be", "on", "at", "in", "an", "or",
-         "so", "we", "he", "she", "its", "can", "hi", "ok", "um", "uh"}
+         "so", "we", "he", "she", "its", "can", "hi", "ok", "um", "uh", "for", "get", "see", "yes", "but", "not", "now",
+         "how", "who", "why", "was", "are", "has", "had", "did", "our", "her", "his", "him", "out", "all", "any",
+         "one's", "am", "as", "by", "if", "no", "up", "us", "hey"}
 _NEG = re.compile(r"\b(don'?t|do not|not|no|never|without|never mind)\b")
 _TRANSFER = re.compile(r"\b(operator|human|real person|a person|someone|an agent|representative)\b")
 _TRANSFER_VERB = re.compile(r"\b(speak|talk|transfer|connect|put me through)\b")
@@ -199,6 +201,27 @@ def spoken_canon(s: str) -> str:
         elif len(w) <= 3 and w not in _STOP:
             out.append(w)
     return "".join(out).upper()
+
+
+def spoken_spans(s: str) -> set[str]:
+    """Maximal runs of spoken id pieces (digit words, digits, single letters, short non-stop letter runs), each run
+    canonicalised ("order X Y Z one two three" -> {"XYZ123"}; "eight nines" -> {"99999999"}). A slot matches only a
+    WHOLE run: a substring of a longer run (9999 inside eight nines) is a mismatch."""
+    spans, cur = set(), []
+    for w in re.findall(r"[a-z]+|\d", str(s).lower()):
+        if w in _DIG:
+            cur.append(_DIG[w])
+        elif w.isdigit():
+            cur.append(w)
+        elif len(w) <= 3 and w not in _STOP:
+            cur.append(w)
+        else:
+            if cur:
+                spans.add("".join(cur).upper())
+            cur = []
+    if cur:
+        spans.add("".join(cur).upper())
+    return spans
 
 
 def id_like(v) -> bool:
@@ -240,12 +263,12 @@ class AsrShadow:
         return "".join(t for _, t in self.segments)
 
     def slot_check(self, args: dict) -> dict:
-        heard = spoken_canon(self.text())
+        spans = spoken_spans(self.text())
         out = {}
         for k, v in (args or {}).items():
             if isinstance(v, str) and id_like(v):
                 cv = "".join(ch for ch in v if ch.isalnum()).upper()     # the call's value is a code, not speech
-                out[k] = "match" if cv and cv in heard else "mismatch" if heard else "absent"
+                out[k] = "match" if cv and cv in spans else "mismatch" if spans else "absent"
         return out
 
     def on_call(self, name: str) -> None:
@@ -271,7 +294,12 @@ COMPACT = {
     "budget": {"status": "not_executed", "next_step": "Ask the caller."},
     "closed": {"status": "not_executed", "next_step": "Ask the caller."},
 }
-RESPONSE_STYLES = ("full", "compact")
+RESPONSE_STYLES = ("full", "compact", "echo")
+# "compact" FAILED live (job 122): {"status": "already_done"} was read as "the order is done" (m02 said "Your order
+# ... is already done"; t14 lost the not-found outcome and re-looked it up after the caller's next question).
+# "echo" keeps the outcome: a repeat refusal restates the EARLIER result the model already read, plus a short note
+# (t14 / m02: 45 phase-2 steps instead of 87); the other rules use the compact texts.
+ECHO_NOTE = "Already checked. Tell the caller."
 
 
 class CallGuard:
@@ -426,7 +454,15 @@ class CallGuard:
         return out
 
     def _response(self, d: Decision) -> str:
-        if self.response_style == "compact":
+        if self.response_style == "echo" and d.rule in ("repeat", "side_effect_done") and "previous_result" in d.audit:
+            try:
+                prev = json.loads(d.audit["previous_result"])
+            except (json.JSONDecodeError, TypeError):
+                prev = None
+            if isinstance(prev, dict):
+                return json.dumps(dict(prev, note=ECHO_NOTE))
+            return json.dumps({"previous_result": d.audit["previous_result"], "note": ECHO_NOTE})
+        if self.response_style in ("compact", "echo"):
             return json.dumps(COMPACT.get(d.rule, COMPACT["budget"]))
         body = {"status": "not_executed", "reason": d.reason}
         if "previous_result" in d.audit:
