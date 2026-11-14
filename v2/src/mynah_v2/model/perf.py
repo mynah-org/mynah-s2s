@@ -572,6 +572,9 @@ def _fcprof_disable(engine) -> None:
 
 
 experiment("fc_profile")((_fcprof_enable, _fcprof_disable))       # diagnostic, token-neutral (CUDA events, FC thread)
+# FC phase 2 without EarTTS/codec (Thinker inputs unchanged; only the post-FC audio context and the FC duration change)
+experiment("fc_phase2_notts")((lambda e: __import__("mynah_v2.model.fc_phase2_notts", fromlist=["x"]).enable(e),
+                               lambda e: __import__("mynah_v2.model.fc_phase2_notts", fromlist=["x"]).disable(e)))
 # multi-session: 2 slots per session (main loop + FC fast path); same graphs/numerics, only the slot pool is larger
 experiment("eartts_graph_full_s4")((lambda e: _full_enable(e, slots=4), _full_disable))
 PROFILES["optimized-graph"] = ("mamba_host_pos", "no_timer_sync", "eartts_graph_full", "eartts_fused_rmsnorm")
