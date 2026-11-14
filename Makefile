@@ -61,7 +61,9 @@ int4-pack: ## export offline native INT4 bundle + JSON manifest (INT4_ARGS=...)
 WEBUI_ARGS ?=
 WEBUI_GPU_LOG ?= /tmp/mynah-v2-webui-gpu.log
 WEBUI_PYTHON ?= $(if $(wildcard $(HOME)/mynah-s2s/.venv-v2/bin/python),$(HOME)/mynah-s2s/.venv-v2/bin/python,python3)
-V2_SERVE_ARGS ?=
+# The WebUI path targets the measured GB10 configuration by default. Direct
+# `make serve` remains BF16 unless the caller explicitly passes --int4.
+V2_SERVE_ARGS ?= --int4 --cudnn-benchmark
 webui: ## local HTML5 UI + Python bridge on http://127.0.0.1:8787 (no Node.js)
 	@if command -v uv >/dev/null 2>&1; then uv run --project webui --no-sync python webui/server.py $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py $(WEBUI_ARGS); fi
 webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ctrl-C

@@ -25,12 +25,16 @@ python v2/scripts/serve.py --trace-dir /tmp/mynah-traces --host 127.0.0.1
 uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session
 ```
 
-To try the experimental lower-latency V2 path, pass the single opt-in switch
-through the Make target (or set `MYNAH_INT4=1`):
+The WebUI GPU target starts V2 with the measured lower-latency INT4 path by
+default (and enables cuDNN benchmarking):
 
 ```bash
-make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
+make webui-gpu
 ```
+
+To override that default, pass an explicit `V2_SERVE_ARGS` value, for example
+`make webui-gpu V2_SERVE_ARGS="--cudnn-benchmark"` for BF16. Direct
+`make serve` remains BF16 unless `--int4` or `MYNAH_INT4=1` is supplied.
 
 The INT4 mode quantizes all measured standard Linear paths: Thinker/head,
 perception Conformer, RNNT joint, EarTTS Gemma, CAS/fusion, and compatible MoG

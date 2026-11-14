@@ -80,14 +80,17 @@ make webui
 ```
 
 Open <http://127.0.0.1:8787>. To start the V2 runtime and connect the UI in one
-command, use:
+command, use. This target starts the measured INT4 + cuDNN benchmark
+configuration by default:
 
 ```bash
 make webui-gpu
 ```
 
-For the GB10 realtime experiment, the lighter INT4 path is opt-in. The short
-form is one switch (the equivalent environment variable is `MYNAH_INT4=1`):
+For BF16, override the Make variable explicitly, for example
+`make webui-gpu V2_SERVE_ARGS="--cudnn-benchmark"`. Direct `make serve` remains
+BF16 unless `--int4` or `MYNAH_INT4=1` is supplied. The INT4 path is also
+available explicitly (the equivalent environment variable is `MYNAH_INT4=1`):
 
 ```bash
 make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
