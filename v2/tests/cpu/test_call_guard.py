@@ -1,4 +1,5 @@
-"""CPU tests of the experimental pre-execution call guard, on the call sequences the live runs actually produced.
+"""CPU tests of the experimental per-session call registry + admission control, on the call sequences the live runs
+actually produced, plus concurrency, timeouts, side effects and cleanup.
 
 Sequences (calls, arguments, backend results, caller speech in between) are copied from the traces:
 - engine FX1 with the (PAD, EOTR) resume: m02 11x get_order_status(qgq999) found=false; t14 9x (WXYY615); t13
@@ -8,21 +9,31 @@ Sequences (calls, arguments, backend results, caller speech in between) are copi
 - EN m07 r3 (lead 7.5 s, (PAD, PAD)): find_customer without postcode, caller says the postcode,
   prepare_return(customer_id="Mario Rossi"), find_customer(Mario Rossi, 20135), prepare_return(C1002)."""
 import json
+import threading
+import time
 
-from mynah_v2.agent.call_guard import PRODUCTIVE, UNPRODUCTIVE, CallGuard, default_outcome, guarded_executor
+from mynah_v2.agent.call_guard import (PRODUCTIVE, TIMEOUT, UNPRODUCTIVE, CallGuard, default_outcome,
+                                       guarded_executor)
+from mynah_v2.agent.tools import ToolLedger, ToolRegistry
 
 NF = lambda oid: json.dumps({"order_id": oid.upper(), "found": False})  # noqa: E731 - engine orders_tool shape
 FOUND_XYZ = json.dumps({"order_id": "XYZ123", "found": True, "status": "shipped", "delivery_date": "November 12, 2026",
                         "tracking_code": "7319"})
 VERIFIED = json.dumps({"status": "verified", "customer_id": "C1002", "first_name": "Mario",
                        "latest_order": {"item": "Lysa bookcase", "status": "delivered", "date": "2026-11-05"}})
-PENDING = json.dumps({"status": "pending_confirmation", "pending_id": "P001", "item": "Lysa bookcase"})
+PENDING_P001 = json.dumps({"status": "pending_confirmation", "pending_id": "P001", "item": "Lysa bookcase"})
 VERIF_REQ = json.dumps({"status": "verification_required", "matching_names": 1, "next_step": "Ask for the postcode."})
 TENANT = {"find_customer": {"properties": {"full_name": {"type": "string", "x-source": "caller"},
                                            "postcode": {"type": "string", "x-source": "caller"}}},
           "prepare_return": {"properties": {"item": {"type": "string"},
                                             "customer_id": {"type": "string", "x-source": "result"}}},
-          "commit_return": {"properties": {"pending_id": {"type": "string", "x-source": "result"}}}}
+          "commit_return": {"properties": {"pending_id": {"type": "string", "x-source": "result"}}},
+          "escalate_to_human": {"properties": {"reason": {"type": "string"}}}}
+SIDE = {"commit_return": "pending_id", "escalate_to_human": None}
+
+
+def ct(name, args):
+    return json.dumps([{"name": name, "arguments": args}])
 
 
 def run(guard, seq):
@@ -32,85 +43,57 @@ def run(guard, seq):
         if s[0] == "user":
             guard.on_user_text(s[1])
             continue
-        d = guard.check(s[0], s[1])
+        d = guard.admit(s[0], s[1])
         out.append(d.rule or "run")
         if d.allow:
-            guard.record(s[0], s[1], s[2])
+            guard.complete(d, s[2])
         else:
-            assert json.loads(d.response)["status"] == "not_executed"
+            assert json.loads(d.response)["status"] == "not_executed" and json.loads(d.response)["next_step"]
     return out
 
 
 def test_outcome_classifier():
     assert default_outcome(NF("qgq999")) == UNPRODUCTIVE
     assert default_outcome(VERIF_REQ) == UNPRODUCTIVE
-    assert default_outcome(json.dumps({"error": "timeout", "message": "x"})) == UNPRODUCTIVE
+    assert default_outcome(json.dumps({"error": "unknown_tool"})) == UNPRODUCTIVE
+    assert default_outcome(json.dumps({"error": "timeout", "message": "x"})) == TIMEOUT
     assert default_outcome(FOUND_XYZ) == PRODUCTIVE and default_outcome(VERIFIED) == PRODUCTIVE
-    assert default_outcome(PENDING) == PRODUCTIVE
+    assert default_outcome(PENDING_P001) == PRODUCTIVE
     assert default_outcome(json.dumps({"result": 1, "min": 1, "max": 10})) == PRODUCTIVE
 
 
-def test_m02_loop_stops_at_first_repeat_and_next_turn_runs():
-    g = CallGuard()
+# ------------------------------------------------------------------ measured sessions
+def test_m02_loop_backend_runs_once_and_next_turn_is_served():
+    g = CallGuard(session_id="m02")
     a = {"order_id": "qgq999"}
     seq = [("user", "where is my order? Q, Q, nine, nine, nine.")] + [("get_order_status", a, NF("qgq999"))] * 11
     seq += [("user", "give me a random number"), ("generate_random_number", {"min": 1, "max": 10}, '{"result": 10}')]
     got = run(g, seq)
     assert got[:3] == ["run", "repeat", "repeat"]
-    assert set(got[3:11]) == {"budget"}                  # past the budget nothing runs, whatever the model asks
-    assert got[11] == "run"                              # the caller's next question is served normally
+    assert set(got[3:11]) == {"budget"}
+    assert got[11] == "run"
     assert sum(r == "run" for r in got[:11]) == 1        # the backend saw the order lookup once, not 11 times
 
 
-def test_t14_repeat_carries_the_earlier_result():
+def test_t14_repeat_reuses_the_earlier_result():
     g = CallGuard()
     g.on_user_text("check order W x y six one five.")
     a = {"order_id": "WXYY615"}
-    assert g.check("get_order_status", a).allow
-    g.record("get_order_status", a, NF("WXYY615"))
-    d = g.check("get_order_status", a)
-    body = json.loads(d.response)
-    assert d.rule == "repeat" and body["previous_result"] == {"order_id": "WXYY615", "found": False}
+    d = g.admit("get_order_status", a)
+    g.complete(d, NF("WXYY615"))
+    r = g.admit("get_order_status", a)
+    body = json.loads(r.response)
+    assert r.rule == "repeat" and body["previous_result"] == {"order_id": "WXYY615", "found": False}
     assert "Do not call the tool again" in body["next_step"]
 
 
-def test_t13_corrected_id_is_a_legitimate_new_call_then_its_repeat_is_blocked():
+def test_t13_corrected_id_runs_then_its_repeat_is_refused():
     g = CallGuard()
     got = run(g, [("user", "where is my order X Y Z one two three"), ("get_order_status", {"order_id": "XYZ123"}, FOUND_XYZ),
                   ("user", "sorry, I meant D F G two four six"),
                   ("get_order_status", {"order_id": "DF246"}, NF("DF246")),
                   ("get_order_status", {"order_id": "DF246"}, NF("DF246"))])
     assert got == ["run", "run", "repeat"]
-
-
-def test_retry_with_new_arguments_after_not_found_is_not_blocked_by_similarity():
-    g = CallGuard()
-    got = run(g, [("user", "order Q Q nine nine nine"), ("get_order_status", {"order_id": "qgq999"}, NF("qgq999")),
-                  ("get_order_status", {"order_id": "QQQ999"}, NF("QQQ999"))])
-    assert got == ["run", "run"]
-
-
-def test_two_negative_results_without_new_input_exhaust_the_budget():
-    g = CallGuard()
-    got = run(g, [("user", "order Q Q nine nine nine"), ("get_order_status", {"order_id": "qgq999"}, NF("qgq999")),
-                  ("get_order_status", {"order_id": "QQQ999"}, NF("QQQ999")),
-                  ("get_order_status", {"order_id": "QGQ990"}, NF("QGQ990"))])
-    assert got == ["run", "run", "budget"]
-
-
-def test_same_call_after_the_caller_spoke_again_is_a_legitimate_retry():
-    g = CallGuard()
-    got = run(g, [("user", "order Q Q Q nine nine nine"), ("get_order_status", {"order_id": "QQQ999"}, NF("QQQ999")),
-                  ("user", "yes, Q Q Q nine nine nine, please check again"),
-                  ("get_order_status", {"order_id": "qqq-999"}, NF("QQQ999"))])
-    assert got == ["run", "run"]
-
-
-def test_repeat_of_a_productive_call_without_new_input_is_a_reopen():
-    g = CallGuard()
-    got = run(g, [("user", "X Y Z one two three"), ("get_order_status", {"order_id": "XYZ123"}, FOUND_XYZ),
-                  ("get_order_status", {"order_id": "XYZ123"}, FOUND_XYZ)])
-    assert got == ["run", "repeat"]
 
 
 def test_m01_two_calls_a_caller_turn_apart_both_run():
@@ -120,23 +103,23 @@ def test_m01_two_calls_a_caller_turn_apart_both_run():
     assert got == ["run", "run"]
 
 
-def test_m07_chain_runs():
-    g = CallGuard(TENANT)
+def test_m07_chain_runs_without_new_speech():
+    g = CallGuard(TENANT, side_effects=SIDE)
     got = run(g, [("user", "I want to return the bookcase I bought, Mario Rossi, postcode two zero one three five"),
                   ("find_customer", {"full_name": "Mario Rossi", "postcode": "20135"}, VERIFIED),
-                  ("prepare_return", {"item": "Lysa bookcase", "customer_id": "C1002"}, PENDING)])
-    assert got == ["run", "run"]                         # the chained call needs NO new caller speech
+                  ("prepare_return", {"item": "Lysa bookcase", "customer_id": "C1002"}, PENDING_P001)])
+    assert got == ["run", "run"]
     assert g.log[0]["caller_slots_unchecked"] == ["full_name", "postcode"]
 
 
-def test_r3_invented_customer_id_is_rejected_and_the_chain_still_completes():
-    g = CallGuard(TENANT)
+def test_r3_invented_customer_id_is_refused_and_the_chain_still_completes():
+    g = CallGuard(TENANT, side_effects=SIDE)
     got = run(g, [("user", "I want to return the bookcase I bought. Mario Rosie."),
                   ("find_customer", {"full_name": "Mario Rossi"}, VERIF_REQ),
                   ("user", "postcode two zero one three five."),
-                  ("prepare_return", {"item": "bookcase", "customer_id": "Mario Rossi"}, PENDING),
+                  ("prepare_return", {"item": "bookcase", "customer_id": "Mario Rossi"}, PENDING_P001),
                   ("find_customer", {"full_name": "Mario Rossi", "postcode": "20135"}, VERIFIED),
-                  ("prepare_return", {"item": "Lysa bookcase", "customer_id": "C1002"}, PENDING)])
+                  ("prepare_return", {"item": "Lysa bookcase", "customer_id": "C1002"}, PENDING_P001)])
     assert got == ["run", "ungrounded", "run", "run"]
 
 
@@ -145,13 +128,147 @@ def test_id_from_a_negative_result_is_not_grounded():
     got = run(g, [("user", "return, Lindvik, two zero one three five"),
                   ("find_customer", {"full_name": "Lindvik", "postcode": "20135"},
                    json.dumps({"status": "not_found", "customer_id": "C9999"})),
-                  ("prepare_return", {"item": "x", "customer_id": "C9999"}, PENDING)])
+                  ("prepare_return", {"item": "x", "customer_id": "C9999"}, PENDING_P001)])
     assert got == ["run", "ungrounded"]
 
 
+# ------------------------------------------------------------------ retries
+def test_retry_with_new_arguments_after_not_found_is_not_blocked_by_similarity():
+    g = CallGuard()
+    got = run(g, [("user", "order Q Q nine nine nine"), ("get_order_status", {"order_id": "qgq999"}, NF("qgq999")),
+                  ("get_order_status", {"order_id": "QQQ999"}, NF("QQQ999"))])
+    assert got == ["run", "run"]
+
+
+def test_two_negative_results_without_new_input_spend_the_budget():
+    g = CallGuard()
+    got = run(g, [("user", "order Q Q nine nine nine"), ("get_order_status", {"order_id": "qgq999"}, NF("qgq999")),
+                  ("get_order_status", {"order_id": "QQQ999"}, NF("QQQ999")),
+                  ("get_order_status", {"order_id": "QGQ990"}, NF("QGQ990"))])
+    assert got == ["run", "run", "budget"]
+
+
+def test_same_call_after_new_speech_is_a_legitimate_retry():
+    g = CallGuard()
+    got = run(g, [("user", "order Q Q Q nine nine nine"), ("get_order_status", {"order_id": "QQQ999"}, NF("QQQ999")),
+                  ("user", "yes, Q Q Q nine nine nine, please check again"),
+                  ("get_order_status", {"order_id": "qqq-999"}, NF("QQQ999"))])
+    assert got == ["run", "run"]
+    g.on_user_text("  ...  ")                                    # punctuation / silence is not new input
+    assert g.admit("get_order_status", {"order_id": "QQQ999"}).rule == "repeat"
+
+
+def test_productive_reopen_without_new_input_is_refused():
+    g = CallGuard()
+    got = run(g, [("user", "X Y Z one two three"), ("get_order_status", {"order_id": "XYZ123"}, FOUND_XYZ),
+                  ("get_order_status", {"order_id": "XYZ123"}, FOUND_XYZ)])
+    assert got == ["run", "repeat"]
+
+
+# ------------------------------------------------------------------ side effects
+def test_side_effect_without_idempotency_key_never_reruns_even_after_new_speech():
+    g = CallGuard(TENANT, side_effects=SIDE)
+    got = run(g, [("user", "I want a person"), ("escalate_to_human", {"reason": "return"}, '{"status": "transferring"}'),
+                  ("user", "hello? a person please"), ("escalate_to_human", {"reason": "return"}, "{}")])
+    assert got == ["run", "side_effect_done"]
+
+
+def test_side_effect_with_idempotency_key_goes_to_the_backend():
+    g = CallGuard(TENANT, side_effects=SIDE)
+    got = run(g, [("user", "return, Mario Rossi, two zero one three five"),
+                  ("find_customer", {"full_name": "Mario Rossi", "postcode": "20135"}, VERIFIED),
+                  ("prepare_return", {"item": "Lysa bookcase", "customer_id": "C1002"}, PENDING_P001),
+                  ("user", "yes"),
+                  ("commit_return", {"pending_id": "P001"}, '{"status": "submitted"}'),
+                  ("commit_return", {"pending_id": "P001"}, '{"status": "already_submitted"}'),
+                  ("commit_return", {"pending_id": "P777"}, "{}")])
+    assert got == ["run", "run", "run", "run", "ungrounded"]   # the backend deduplicates by pending_id
+
+
+def test_timed_out_side_effect_is_never_retried_automatically():
+    g = CallGuard(TENANT, side_effects=SIDE)
+    g.on_user_text("a person please")
+    d = g.admit("escalate_to_human", {"reason": "x"})
+    g.complete(d, json.dumps({"error": "timeout", "message": "slow"}))
+    g.on_user_text("hello?")
+    r = g.admit("escalate_to_human", {"reason": "x"})
+    assert r.rule == "side_effect_unknown" and "unknown" in json.loads(r.response)["next_step"]
+
+
+# ------------------------------------------------------------------ single-flight, timeouts, concurrency
+def test_timeout_with_backend_still_running_blocks_a_second_run_until_the_late_result():
+    """ENHANCED bind(timeout_s): the handler returns the timeout error while the backend keeps running."""
+    led = ToolLedger("s1")
+    reg = ToolRegistry()
+    release, runs = threading.Event(), []
+
+    def slow(args):
+        runs.append(args)
+        release.wait(5)
+        return NF(args["order_id"])
+    reg.register("get_order_status", slow, "d", {"type": "object", "properties": {"order_id": {"type": "string"}}})
+    h = reg.bind(led, lambda: 1, lambda: None, timeout_s=0.05)["get_order_status"]
+    g = CallGuard(session_id="s1", ledger=led)
+    ex = guarded_executor(lambda text: h(json.loads(text)[0]["arguments"]), g)
+    g.on_user_text("order Q Q nine")
+    first = json.loads(ex(ct("get_order_status", {"order_id": "QQ9"})))
+    assert first["error"] == "timeout"
+    again = json.loads(ex(ct("get_order_status", {"order_id": "QQ9"})))
+    assert again["status"] == "not_executed" and "still running" in again["reason"]
+    other = json.loads(ex(ct("get_order_status", {"order_id": "AB1"})))
+    assert "still running in this session" in other["reason"]   # single-flight counts the running backend
+    release.set()
+    for _ in range(100):
+        if led.calls[g.reg.entries()[0].call_id].late:
+            break
+        time.sleep(0.01)
+    g.on_user_text("can you try again")                       # the refusals spent this turn's budget
+    third = json.loads(ex(ct("get_order_status", {"order_id": "QQ9"})))
+    assert third["found"] is False and len(runs) == 2        # a retry after the backend returned runs normally
+
+
+def test_single_flight_within_a_session():
+    g = CallGuard(max_active=1)
+    g.on_user_text("x")
+    d = g.admit("search_catalog", {"query": "sofa"})
+    assert d.allow
+    busy = g.admit("search_catalog", {"query": "bed"})
+    assert busy.rule == "busy"
+    g.complete(d, '{"results": []}')
+    g.on_user_text("y")
+    assert g.admit("search_catalog", {"query": "bed"}).allow
+
+
+def test_four_sessions_run_four_calls_at_once():
+    """B=4: one guard per session, nothing shared; four backends must be in flight together."""
+    inside, peak, lock, gate = [0], [0], threading.Lock(), threading.Barrier(4, timeout=5)
+
+    def backend(text):
+        with lock:
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+        gate.wait()                                   # passes only if all four are inside at the same time
+        with lock:
+            inside[0] -= 1
+        return '{"found": true}'
+    guards = [CallGuard(session_id=f"s{i}") for i in range(4)]
+    exs = [guarded_executor(backend, g) for g in guards]
+    res = [None] * 4
+
+    def worker(i):
+        guards[i].on_user_text("order")
+        res[i] = exs[i](ct("get_order_status", {"order_id": "XYZ123"}))
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert peak[0] == 4 and all(json.loads(r) == {"found": True} for r in res)
+
+
 def test_guarded_executor_keeps_the_fc_contract():
-    """The executor always returns a TOOL_RESPONSE for a parsed call (never None for a rejection: the model must not
-    be left waiting); the backend runs only for allowed calls; unparsable text goes to the existing policy."""
+    """Always a TOOL_RESPONSE for a parsed call (never None for a refusal: the model must not be left waiting); the
+    backend runs only for admitted calls; unparsable text goes to the existing policy; a crash frees the entry."""
     ran = []
 
     def backend(call_text):
@@ -159,15 +276,55 @@ def test_guarded_executor_keeps_the_fc_contract():
         return NF("qgq999")
     g = CallGuard()
     ex = guarded_executor(backend, g)
-    ct = json.dumps([{"name": "get_order_status", "arguments": {"order_id": "qgq999"}}])
-    assert json.loads(ex(ct))["found"] is False
-    r = ex(ct)
+    c = ct("get_order_status", {"order_id": "qgq999"})
+    assert json.loads(ex(c))["found"] is False
+    r = ex(c)
     assert r is not None and json.loads(r)["status"] == "not_executed" and len(ran) == 1
-    assert ex("not json") == NF("qgq999") and len(ran) == 2       # passthrough, guard not consulted
+    assert ex("not json") == NF("qgq999") and len(ran) == 2
     multi = json.dumps([{"name": "get_order_status", "arguments": {"order_id": "qgq999"}},
                         {"name": "get_order_status", "arguments": {"order_id": "ABC456"}}])
+    g3 = CallGuard()
+    g3.on_user_text("x")
+    g3.complete(g3.admit("get_order_status", {"order_id": "qgq999"}), NF("qgq999"))
+    parts = json.loads("[" + guarded_executor(lambda t: '{"found": true}', g3)(multi) + "]")
+    assert parts[0]["status"] == "not_executed" and parts[1] == {"found": True}
+
+    def boom(t):
+        raise RuntimeError("backend down")
     g2 = CallGuard()
     g2.on_user_text("x")
-    g2.record("get_order_status", {"order_id": "qgq999"}, NF("qgq999"))
-    parts = json.loads("[" + guarded_executor(lambda t: '{"found": true}', g2)(multi) + "]")
-    assert parts[0]["status"] == "not_executed" and parts[1] == {"found": True}
+    assert "backend down" in json.loads(guarded_executor(boom, g2)(c))["error"]
+    assert g2._active() == 0
+
+
+# ------------------------------------------------------------------ memory bound, TTL, close
+def test_ttl_and_lru_bound_free_entries():
+    now = [0]
+    g = CallGuard(ttl_s=10, max_entries=4, clock=lambda: now[0])
+    for i in range(10):
+        g.on_user_text(f"order {i}")
+        d = g.admit("get_order_status", {"order_id": f"A{i}"})
+        g.complete(d, FOUND_XYZ)
+    assert len(g.reg.entries()) == 4                          # bounded
+    g.on_user_text("again")
+    now[0] = int(11e9)
+    g.admit("get_order_status", {"order_id": "B1"})
+    assert [e.args for e in g.reg.entries()] == [{"order_id": "B1"}]   # older than the TTL: gone
+
+
+def test_issued_ids_are_bounded():
+    g = CallGuard(max_issued=8)
+    for i in range(20):
+        g.on_user_text(f"lookup {i}")
+        g.complete(g.admit("find_customer", {"n": i}), json.dumps({"status": "verified", "customer_id": f"C{i}"}))
+    assert len(g.issued) == 8 and "c19" in g.issued and "c0" not in g.issued
+
+
+def test_close_frees_everything_and_refuses_late_calls():
+    g = CallGuard(TENANT)
+    run(g, [("user", "Mario Rossi two zero one three five"),
+            ("find_customer", {"full_name": "Mario Rossi", "postcode": "20135"}, VERIFIED)])
+    g.close()
+    assert g.reg.entries() == [] and not g.issued
+    d = g.admit("prepare_return", {"item": "x", "customer_id": "C1002"})
+    assert d.rule == "closed" and json.loads(d.response)["status"] == "not_executed"
