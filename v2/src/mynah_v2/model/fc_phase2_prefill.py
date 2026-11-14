@@ -161,6 +161,25 @@ class DeferredPhase2:
                 "function_predicted_token": ans["function_predicted_token"], "cache": ans.get("cache", cache)}
 
 
+_TL = threading.local()            # the deferred interface of THIS thread's phase-2 call (None elsewhere)
+
+
+class _Dispatch:
+    """Installed once as ``wrapper.model_llm_interface``: a thread inside a phase-2 call gets its own deferred
+    interface, every other thread (main loops, other sessions' FC threads) the real one. Several sessions share the
+    wrapper object (MultiSessionEngine), so the interface is never swapped per call."""
+
+    def __init__(self, real):
+        self.real = real
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+    def __call__(self, *a, **kw):
+        d = getattr(_TL, "deferred", None)
+        return (d if d is not None else self.real)(*a, **kw)
+
+
 def _wrap(inner_steps, engine, stats: dict, chunk: int | None):
     w = engine.wrapper
 
@@ -172,13 +191,16 @@ def _wrap(inner_steps, engine, stats: dict, chunk: int | None):
                 or "causal_conv1d_update" not in vars(sys.modules[type(w.model.stt_model.llm).__module__])):
             stats["passthrough"] = stats.get("passthrough", 0) + 1
             return inner_steps(*a, **kw)
-        real = w.model_llm_interface
-        d = DeferredPhase2(real, w.model.stt_model, fs, threading.get_ident(), stats, chunk)
-        w.model_llm_interface = d
+        disp = w.model_llm_interface
+        if not isinstance(disp, _Dispatch):
+            disp = w.model_llm_interface = _Dispatch(disp)
+        d = DeferredPhase2(disp.real, w.model.stt_model, fs, threading.get_ident(), stats, chunk)
+        prev = getattr(_TL, "deferred", None)
+        _TL.deferred = d
         try:
             out = inner_steps(*a, **kw)
         finally:
-            w.model_llm_interface = real
+            _TL.deferred = prev
             if d.pending:                                           # early exit: keep the cache = counted steps
                 d.flush()
                 stats["flushed_on_exit"] = stats.get("flushed_on_exit", 0) + 1
