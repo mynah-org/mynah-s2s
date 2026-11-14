@@ -4,7 +4,9 @@ import torch
 import torch.nn as nn
 import json
 
-from mynah_v2.model.quant import BUNDLE_FORMAT, Int4Linear, TARGETS, _pick, dequantize_int4_reference, load_int4_pack
+from mynah_v2.model.quant import (BUNDLE_FORMAT, W8_BUNDLE_FORMAT, Int4Linear, TARGETS, _pick,
+                                  dequantize_int4_reference, load_int4_pack, load_w8_bundle)
+from mynah_v2.model.wo_gemv import WOLinear
 
 
 def test_group_and_tiles_fit_every_nemotron_k():
@@ -80,3 +82,53 @@ def test_offline_bundle_loads_thinker_and_eartts_scopes_atomically(tmp_path):
     assert info["modules"] == 2
     assert isinstance(engine.wrapper.model.stt_model.layers[0], Int4Linear)
     assert isinstance(engine.wrapper.model.tts_model.tts_model.backbone.layers[0], Int4Linear)
+
+
+def test_offline_w8_bundle_loads_without_requantizing(tmp_path):
+    class FakeStt(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(7, 4, dtype=torch.bfloat16)])
+            self.perception = nn.Identity()
+            self.rnnt_joint = nn.Identity()
+
+    class FakeBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(7, 4, dtype=torch.bfloat16)])
+
+    class FakeTTS(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tts_model = nn.Module()
+            self.tts_model.backbone = FakeBackbone()
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.stt_model = FakeStt()
+            self.tts_model = FakeTTS()
+
+    class FakeEngine:
+        def __init__(self):
+            self.wrapper = type("Wrapper", (), {"model": FakeModel()})()
+
+    tensors, modules = {}, []
+    for root, name in (("stt_model", "layers.0"), ("eartts_backbone", "layers.0")):
+        prefix = f"{root}.{name}"
+        qk, sk = f"{prefix}.q", f"{prefix}.scale"
+        tensors[qk] = torch.ones(4, 7, dtype=torch.int8)
+        tensors[sk] = torch.ones(4, dtype=torch.float32)
+        modules.append({"root": root, "name": name, "kind": "linear", "fmt": "w8",
+                        "in_features": 7, "out_features": 4, "q_key": qk, "scale_key": sk})
+    from safetensors.torch import save_file
+    pack = tmp_path / "w8.safetensors"
+    save_file(tensors, str(pack))
+    (tmp_path / "w8.json").write_text(json.dumps({"format": W8_BUNDLE_FORMAT, "modules": modules}))
+
+    engine = FakeEngine()
+    info = load_w8_bundle(engine, pack)
+    assert info["modules"] == 2
+    assert isinstance(engine.wrapper.model.stt_model.layers[0], WOLinear)
+    assert isinstance(engine.wrapper.model.tts_model.tts_model.backbone.layers[0], WOLinear)
+    assert torch.equal(engine.wrapper.model.stt_model.layers[0].p_q, tensors["stt_model.layers.0.q"])

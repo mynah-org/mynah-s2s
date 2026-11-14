@@ -7,11 +7,62 @@ codebooks, depthwise filters, or recurrent gates directly.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from mynah_v2.model.wo_gemv import WOLinear, pack_w8
+
+
+_W8_LSTM_KERNEL = None
+
+
+def _w8_lstm_kernel():
+    """Build the one-launch Q8 RNNT gate/activation kernel lazily on CUDA."""
+    global _W8_LSTM_KERNEL
+    if _W8_LSTM_KERNEL is not None:
+        return _W8_LSTM_KERNEL
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def fused(x, h, c, qih, sih, qhh, shh, bias, out, c_new, I, H, BLOCK_H: tl.constexpr,
+              BLOCK_K: tl.constexpr):
+        b = tl.program_id(0)
+        j = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        valid = j < H
+        gate = tl.arange(0, 4)[:, None]
+        n = gate * H + j[None, :]
+        acc = tl.load(bias + n, mask=valid[None, :], other=0.0).to(tl.float32)
+        for k0 in tl.range(0, I, BLOCK_K):
+            k = k0 + tl.arange(0, BLOCK_K)
+            mk = k < I
+            w = tl.load(qih + n[:, :, None] * I + k[None, None, :],
+                        mask=valid[None, :, None] & mk[None, None, :], other=0).to(tl.float32)
+            xv = tl.load(x + b * I + k, mask=mk, other=0.0).to(tl.float32)
+            acc += tl.sum(w * xv[None, None, :], axis=2) * tl.load(sih + n, mask=valid[None, :], other=0.0).to(tl.float32)
+        for k0 in tl.range(0, H, BLOCK_K):
+            k = k0 + tl.arange(0, BLOCK_K)
+            mk = k < H
+            w = tl.load(qhh + n[:, :, None] * H + k[None, None, :],
+                        mask=valid[None, :, None] & mk[None, None, :], other=0).to(tl.float32)
+            hv = tl.load(h + b * H + k, mask=mk, other=0.0).to(tl.float32)
+            acc += tl.sum(w * hv[None, None, :], axis=2) * tl.load(shh + n, mask=valid[None, :], other=0.0).to(tl.float32)
+        gi, gf, gg, go = acc[0], acc[1], acc[2], acc[3]
+        fi = 1.0 / (1.0 + tl.exp(-gi))
+        ff = 1.0 / (1.0 + tl.exp(-gf))
+        fo = 1.0 / (1.0 + tl.exp(-go))
+        gg = 2.0 / (1.0 + tl.exp(-2.0 * gg)) - 1.0
+        old_c = tl.load(c + b * H + j, mask=valid, other=0.0).to(tl.float32)
+        cn = ff * old_c + fi * gg
+        hn = fo * (2.0 / (1.0 + tl.exp(-2.0 * cn)) - 1.0)
+        tl.store(out + b * H + j, hn.to(out.dtype.element_ty), mask=valid)
+        tl.store(c_new + b * H + j, cn.to(c_new.dtype.element_ty), mask=valid)
+
+    _W8_LSTM_KERNEL = (fused, triton.cdiv)
+    return _W8_LSTM_KERNEL
 
 
 class W8PointwiseConv1d(nn.Module):
@@ -48,13 +99,14 @@ class W8PointwiseConv1d(nn.Module):
 class Int8LSTM(nn.Module):
     """Q8 RNNT prediction LSTM using batched weight-only GEMV matrices."""
 
-    def __init__(self, rnn_module: nn.Module):
+    def __init__(self, rnn_module: nn.Module, fused: bool = False):
         super().__init__()
         lstm = getattr(rnn_module, "lstm", None)
         if not isinstance(lstm, nn.LSTM) or lstm.proj_size or lstm.bidirectional:
             raise ValueError("only unidirectional unprojected LSTM is supported")
         self.input_size, self.hidden_size = lstm.input_size, lstm.hidden_size
         self.num_layers = lstm.num_layers
+        self.fused = bool(fused)
         self.ih = nn.ModuleList()
         self.hh = nn.ModuleList()
         self.bias = nn.ParameterList()
@@ -85,6 +137,32 @@ class Int8LSTM(nn.Module):
             hs = [state[0][i].contiguous() for i in range(self.num_layers)]
             cs = [state[1][i].contiguous() for i in range(self.num_layers)]
         outputs = x.new_empty((t, b, self.hidden_size))
+        if x.device.type == "cuda" and self.fused and t and b:
+            import triton
+
+            kernel, cdiv = _w8_lstm_kernel()
+            # h is read across all output gates, so each layer uses ping-pong
+            # buffers instead of writing its recurrent input in place.  The
+            # cell state is also double-buffered to keep graph/capture and
+            # concurrent session ownership explicit.
+            hbuf = [[torch.empty((b, self.hidden_size), dtype=x.dtype, device=x.device) for _ in range(2)]
+                    for _ in range(self.num_layers)]
+            cbuf = [[torch.empty((b, self.hidden_size), dtype=x.dtype, device=x.device) for _ in range(2)]
+                    for _ in range(self.num_layers)]
+            for ti in range(t):
+                y = x[ti].contiguous()
+                for li in range(self.num_layers):
+                    slot = ti & 1
+                    hnew, cnew = hbuf[li][slot], cbuf[li][slot]
+                    ih, hh = self.ih[li], self.hh[li]
+                    kernel[(b, cdiv(self.hidden_size, 128))](
+                        y, hs[li], cs[li], ih.p_q, ih.p_scale, hh.p_q, hh.p_scale,
+                        self.bias[li], hnew, cnew, self.input_size if li == 0 else self.hidden_size,
+                        self.hidden_size, BLOCK_H=128, BLOCK_K=128,
+                    )
+                    hs[li], cs[li], y = hnew, cnew, hnew
+                outputs[ti].copy_(y)
+            return outputs, (torch.stack(hs), torch.stack(cs))
         for ti in range(t):
             y = x[ti]
             for li in range(self.num_layers):

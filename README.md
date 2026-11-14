@@ -96,6 +96,13 @@ available explicitly (the equivalent environment variable is `MYNAH_INT4=1`):
 make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
 ```
 
+For a measured BF16 EarTTS experiment, use
+`--perf-profile optimized-bf16`. It keeps the reference FP32 snapshot on the
+host for reversible A/B runs, converts the EarTTS backbone to BF16, and enables
+the fused backbone/MoG norms plus cached RVQ constants before graph capture.
+This is opt-in because the checkpoint's FP32 EarTTS path remains the quality
+reference.
+
 This quantizes all measured standard Linear paths: Thinker projections and
 heads, 218 perception Conformer linears, RNNT joint projections, the EarTTS
 Gemma backbone, and compatible CAS/fusion/MoG linears. Dense codec decoder
@@ -129,6 +136,19 @@ argmin/update path. Q8 is intentionally not the default: the exact `t02`
 tool-call smoke completed correctly, but the full all-Q8 path measured `RTF
 10.38` on GB10 and is currently a parity/memory path rather than a realtime
 serving candidate.
+
+The standard Q8 scopes can also be exported once and loaded without
+requantizing at startup:
+
+```bash
+make w8-pack W8_PACK=/path/to/voicechat-w8.safetensors
+make webui-gpu V2_SERVE_ARGS="--int8-pack /path/to/voicechat-w8.safetensors"
+```
+
+The Q8 manifest records the runtime-only scopes that are still enabled from
+the checkpoint at startup. `MYNAH_INT8_RNNT_FUSED=1` enables the experimental
+single-launch Q8 RNNT gate/activation kernel; measure it on the target GPU
+before adopting it, since Q8 is not the default realtime path.
 
 The legacy `--eartts-int4` flag remains available when testing only the TTS
 backbone. It uses the native tinygemm path; the earlier custom Triton Q4 kernel

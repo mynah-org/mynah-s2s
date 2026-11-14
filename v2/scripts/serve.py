@@ -69,12 +69,14 @@ def main():
                     help="EXPERIMENT: also quantize perception Linear, RNNT joint, CAS/fusion/MoG Linear paths")
     ap.add_argument("--int8", action="store_true", default=_env_flag("MYNAH_INT8"),
                     help="opt-in Q8 parity preset: Thinker, EarTTS, perception, RNNT joint, codec 1x1, and specialized Q8 paths")
+    ap.add_argument("--int8-pack", default=os.environ.get("MYNAH_INT8_PACK"),
+                    help="load one offline .safetensors + sibling .json Q8 bundle; specialized Q8 paths remain runtime opt-ins")
     ap.add_argument("--int8-specialized", action="store_true", default=_env_flag("MYNAH_INT8_SPECIALIZED"),
                     help="enable Q8 selected-MoG, RVQ, depthwise codec, and RNNT prediction paths (implied by --int8)")
     ap.add_argument("--tool-timeout", type=float, default=8.0,
                     help="ENHANCED: max seconds a tool may run before an explicit timeout error goes to the model")
     ap.add_argument("--exp", default=None, help="comma list of extra perf experiments (ENHANCED only)")
-    ap.add_argument("--perf-profile", default=None, choices=["optimized-exact", "optimized-graph"],
+    ap.add_argument("--perf-profile", default=None, choices=["optimized-exact", "optimized-graph", "optimized-bf16"],
                     help="validated performance profile (mynah_v2.model.perf.PROFILES); ENHANCED only")
     ap.add_argument("--cudnn-benchmark", action="store_true",
                     help="performance option: torch.backends.cudnn.benchmark (codec 48 -> 5 ms/chunk on GB10); changes "
@@ -86,6 +88,12 @@ def main():
         ap.error("use only one of --int4-pack and --thinker-int4-pack")
     if a.int4_pack is None:
         a.int4_pack = a.thinker_int4_pack
+    int8_requested = a.int8
+    if a.int8_pack:
+        if int8_requested or a.int4 or a.thinker_int4 or a.eartts_int4 or a.int4_extended or a.int4_pack:
+            ap.error("--int8-pack cannot be combined with --int8 or INT4 options")
+        a.int8 = True
+        a.int8_specialized = True
     if a.int4:
         if a.int8:
             ap.error("--int4 and --int8 are mutually exclusive")
@@ -161,11 +169,15 @@ def main():
         from mynah_v2.model.quant import quantize_extended_int4
         print("EXTENDED_QUANT", quantize_extended_int4(eng), flush=True)
     if a.int8:
-        from mynah_v2.model.quant import quantize_extended_w8, quantize_thinker_w8
-        from mynah_v2.model.eartts_q8 import quantize_eartts_w8
-        print("THINKER_Q8", quantize_thinker_w8(eng, include_heads=True), flush=True)
-        print("EARTTS_Q8", quantize_eartts_w8(eng), flush=True)
-        print("EXTENDED_Q8", quantize_extended_w8(eng), flush=True)
+        if a.int8_pack:
+            from mynah_v2.model.quant import load_w8_bundle
+            print("INT8_PACK", load_w8_bundle(eng, a.int8_pack), flush=True)
+        else:
+            from mynah_v2.model.quant import quantize_extended_w8, quantize_thinker_w8
+            from mynah_v2.model.eartts_q8 import quantize_eartts_w8
+            print("THINKER_Q8", quantize_thinker_w8(eng, include_heads=True), flush=True)
+            print("EARTTS_Q8", quantize_eartts_w8(eng), flush=True)
+            print("EXTENDED_Q8", quantize_extended_w8(eng), flush=True)
     if a.perf_profile or a.exp:
         exp = a.exp
         if a.thinker_int4:

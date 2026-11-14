@@ -9,7 +9,7 @@ GROUP ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-all setup-tts setup-asr doctor ws-check corpus test-cpu test-gpu demo e2e-fc e2e-corpus multi multi-notools \
-        multi-mixed custom serve int4-pack client webui webui-gpu asr score reproduce
+        multi-mixed custom serve int4-pack w8-pack client webui webui-gpu asr score reproduce
 
 help: ## show this list
 	@echo "mynah-s2s V2 (work in progress)"
@@ -57,6 +57,11 @@ INT4_PACK ?= $(HOME)/mynah-s2s/artifacts/voicechat-int4.safetensors
 INT4_ARGS ?=
 int4-pack: ## export offline native INT4 bundle + JSON manifest (INT4_ARGS=...)
 	ARGS="$(INT4_ARGS)" $(M) int4-pack "$(INT4_PACK)"
+
+W8_PACK ?= $(HOME)/mynah-s2s/artifacts/voicechat-w8.safetensors
+W8_ARGS ?=
+w8-pack: ## export offline per-channel Q8 bundle + JSON manifest (W8_ARGS=...)
+	ARGS="$(W8_ARGS)" $(M) w8-pack "$(W8_PACK)"
 
 WEBUI_ARGS ?=
 WEBUI_GPU_LOG ?= /tmp/mynah-v2-webui-gpu.log

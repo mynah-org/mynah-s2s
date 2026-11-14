@@ -435,7 +435,10 @@ def _bf16_enable(engine) -> dict:
     bb = m.backbone
     if hasattr(bb, "_v2_fp32_state"):
         return {"already": True}
-    bb._v2_fp32_state = {k: v.detach().clone() for k, v in bb.state_dict().items()}
+    # Keep the reversible A/B snapshot on the host.  Keeping the clone on the
+    # GPU made this experiment look BF16-sized in the module tree while still
+    # retaining the full FP32 backbone allocation during the measurement.
+    bb._v2_fp32_state = {k: v.detach().cpu().clone() for k, v in bb.state_dict().items()}
     bb.to(torch.bfloat16)
     orig = bb.forward
 
@@ -465,6 +468,49 @@ def _bf16_disable(engine) -> None:
 
 
 experiment("eartts_bf16_backbone")((_bf16_enable, _bf16_disable))
+
+
+def _bf16_fused_enable(engine) -> dict:
+    """Compose the validated BF16 EarTTS pieces in graph-safe order.
+
+    The backbone conversion must happen before any EarTTS CUDA graph is
+    captured.  Norm/RVQ patches are reversible and keep the non-backbone
+    modules in their reference FP32 dtype.  This is deliberately a named
+    experiment rather than a default profile: NVIDIA's checkpoint notes that
+    FP32 EarTTS is the quality reference.
+    """
+    info = {"backbone": _bf16_enable(engine)}
+    try:
+        info["backbone_norm"] = _ernorm_enable(engine)
+        info["mog_norm"] = _mognorm_enable(engine)
+        info["rvq_cache"] = _rvq_enable(engine)
+    except Exception:
+        # Keep enable atomic for callers using --strict: undo only patches
+        # installed by this composition before re-raising the real error.
+        try:
+            _rvq_disable(engine)
+        finally:
+            try:
+                _mognorm_disable(engine)
+            finally:
+                try:
+                    _ernorm_disable(engine)
+                finally:
+                    _bf16_disable(engine)
+        raise
+    return {"eartts_bf16_fused": info}
+
+
+def _bf16_fused_disable(engine) -> None:
+    # Reverse the dependency order: restore the dynamic generate_step and
+    # norm forwards before moving the backbone parameters back to FP32.
+    _rvq_disable(engine)
+    _mognorm_disable(engine)
+    _ernorm_disable(engine)
+    _bf16_disable(engine)
+
+
+experiment("eartts_bf16_fused")((_bf16_fused_enable, _bf16_fused_disable))
 
 
 # ------------------------------------------------------------------------------------------------ weight-only formats
@@ -576,6 +622,7 @@ experiment("fc_profile")((_fcprof_enable, _fcprof_disable))       # diagnostic, 
 # multi-session: 2 slots per session (main loop + FC fast path); same graphs/numerics, only the slot pool is larger
 experiment("eartts_graph_full_s4")((lambda e: _full_enable(e, slots=4), _full_disable))
 PROFILES["optimized-graph"] = ("mamba_host_pos", "no_timer_sync", "eartts_graph_full", "eartts_fused_rmsnorm")
+PROFILES["optimized-bf16"] = ("mamba_host_pos", "no_timer_sync", "eartts_bf16_fused", "eartts_graph_full")
 PROFILES["optimized-graph-s4"] = ("mamba_host_pos", "no_timer_sync", "eartts_graph_full_s4", "eartts_fused_rmsnorm")
 experiment("eartts_graph_full_s8")((lambda e: _full_enable(e, slots=8), _full_disable))
 PROFILES["optimized-graph-s8"] = ("mamba_host_pos", "no_timer_sync", "eartts_graph_full_s8", "eartts_fused_rmsnorm")
@@ -1160,11 +1207,13 @@ def _rnnt_w8_enable(engine) -> dict:
     rnn = decoder.prediction["dec_rnn"]
     if isinstance(rnn, Int8LSTM):
         return {"rnnt_decoder_w8": "already_enabled"}
-    q8 = Int8LSTM(rnn)
+    fused = os.environ.get("MYNAH_INT8_RNNT_FUSED", "0") == "1"
+    q8 = Int8LSTM(rnn, fused=fused)
     decoder.prediction["dec_rnn"] = q8
     decoder._v2_rnnt_w8_original = rnn
     torch.cuda.empty_cache()
-    return {"rnnt_decoder_w8": True, "bytes": q8.nbytes(), "fallback": "BF16 LSTM when disabled"}
+    return {"rnnt_decoder_w8": True, "bytes": q8.nbytes(), "fused": fused,
+            "fallback": "BF16 LSTM when disabled"}
 
 
 def _rnnt_w8_disable(engine) -> None:

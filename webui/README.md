@@ -36,6 +36,11 @@ To override that default, pass an explicit `V2_SERVE_ARGS` value, for example
 `make webui-gpu V2_SERVE_ARGS="--cudnn-benchmark"` for BF16. Direct
 `make serve` remains BF16 unless `--int4` or `MYNAH_INT4=1` is supplied.
 
+For an explicit BF16 EarTTS measurement, use
+`V2_SERVE_ARGS="--perf-profile optimized-bf16"`. The profile converts the
+backbone to BF16 and enables the fused norms and cached RVQ constants before
+graph capture; it is opt-in because FP32 EarTTS remains the quality reference.
+
 The INT4 mode quantizes all measured standard Linear paths: Thinker/head,
 perception Conformer, RNNT joint, EarTTS Gemma, CAS/fusion, and compatible MoG
 linears. Dense codec decoder `Conv1d(kernel=1)` projections use the same
@@ -67,6 +72,11 @@ Q8 counterparts for the standard matrix paths plus selected MoG, RVQ, codec
 depthwise, and RNNT prediction paths. It is currently an experimental
 parity/memory mode, not the WebUI default: the full all-Q8 corpus smoke is
 semantically correct but measured `RTF 10.38` on GB10.
+
+Export the standard Q8 scopes once with `make w8-pack W8_PACK=/path/to/voicechat-w8.safetensors`,
+then start with `V2_SERVE_ARGS="--int8-pack /path/to/voicechat-w8.safetensors"`.
+The sibling JSON manifest is validated before replacement; selected MoG/RVQ,
+depthwise codec, and RNNT runtime adapters remain opt-in startup work.
 
 For repeatable startup, export the native packed weights once and pass the bundle
 instead:

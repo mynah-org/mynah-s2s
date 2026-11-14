@@ -258,6 +258,34 @@ class WOLinear(torch.nn.Module):
         self.register_buffer("weight", torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device), persistent=False)
         self.bias = lin.bias
 
+    @classmethod
+    def from_packed(cls, lin: torch.nn.Linear, q: torch.Tensor, scale: torch.Tensor,
+                    fmt: str = "w8") -> "WOLinear":
+        """Build a weight-only Linear from an offline Q8 tensor pair.
+
+        The caller supplies the live Linear only for shape/device/bias
+        validation.  No checkpoint weights are requantized during startup.
+        """
+        if fmt != "w8":
+            raise ValueError(f"offline WOLinear expects w8, got {fmt!r}")
+        if q.dtype != torch.int8 or scale.dtype != torch.float32:
+            raise ValueError(f"offline w8 tensors must be int8/float32, got {q.dtype}/{scale.dtype}")
+        if tuple(q.shape) != (lin.out_features, lin.in_features) or tuple(scale.shape) != (lin.out_features,):
+            raise ValueError("offline w8 tensor shape does not match the live Linear")
+        if q.device != lin.weight.device or scale.device != lin.weight.device:
+            raise ValueError("offline w8 tensors must be loaded on the same device as the model")
+        out = cls.__new__(cls)
+        torch.nn.Module.__init__(out)
+        out.in_features, out.out_features, out.fmt = lin.in_features, lin.out_features, fmt
+        out._keys = ["q", "scale"]
+        out.register_buffer("p_q", q.contiguous())
+        out.register_buffer("p_scale", scale.contiguous())
+        out._meta = {"fmt": fmt}
+        out.register_buffer("weight", torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device),
+                            persistent=False)
+        out.bias = lin.bias
+        return out
+
     def packed(self):
         return {**self._meta, **{k: getattr(self, "p_" + k) for k in self._keys}}
 

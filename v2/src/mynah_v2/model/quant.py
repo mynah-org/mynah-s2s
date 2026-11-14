@@ -432,12 +432,119 @@ def quantize_extended_w8(engine) -> dict:
 
 PACK_FORMAT = "mynah.int4.tinygemm.v1"
 BUNDLE_FORMAT = "mynah.int4.bundle.v1"
+W8_BUNDLE_FORMAT = "mynah.w8.bundle.v1"
 
 
 def _replace_child(root: nn.Module, name: str, replacement: nn.Module) -> None:
     parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
     parent = root.get_submodule(parent_name) if parent_name else root
     setattr(parent, child_name, replacement)
+
+
+def _w8_bundle_spec(root_name: str, name: str, mod, tensors: dict) -> dict:
+    """Serialize one runtime Q8 matrix without retaining the live module."""
+    prefix = f"{root_name}.{name}" if name else root_name
+    qk, sk = f"{prefix}.q", f"{prefix}.scale"
+    tensors[qk] = mod.p_q.detach().cpu().contiguous()
+    tensors[sk] = mod.p_scale.detach().cpu().contiguous()
+    return {"root": root_name, "name": name, "kind": "linear", "fmt": "w8",
+            "in_features": mod.in_features, "out_features": mod.out_features,
+            "q_key": qk, "scale_key": sk, "has_bias": mod.bias is not None}
+
+
+def _w8_pointwise_spec(root_name: str, name: str, mod, tensors: dict) -> dict:
+    spec = _w8_bundle_spec(root_name, name, mod.linear, tensors)
+    spec.update({"kind": "pointwise_conv1d", "in_channels": mod.in_channels,
+                 "out_channels": mod.out_channels})
+    return spec
+
+
+def save_w8_bundle(engine, path: str | Path, include_heads: bool = True,
+                   include_eartts: bool = True, include_extended: bool = True) -> dict:
+    """Export the validated standard Q8 matrix paths for offline startup.
+
+    This intentionally mirrors the graph-safe INT4 bundle, but uses plain
+    per-output-channel int8 tensors (no custom selected-MoG/RVQ/temporal
+    codec state). Those specialized paths remain runtime experiments and can
+    still be enabled after loading this bundle.
+    """
+    from mynah_v2.model.wo_gemv import WOLinear
+    from mynah_v2.model.w8_specialized import W8PointwiseConv1d
+
+    path = Path(path)
+    if path.suffix != ".safetensors":
+        raise ValueError("w8 bundle path must end in .safetensors")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    thinker_info = quantize_thinker_w8(engine, include_heads=include_heads)
+    eartts_info = None
+    if include_eartts:
+        from mynah_v2.model.eartts_q8 import quantize_eartts_w8
+        eartts_info = quantize_eartts_w8(engine)
+    extended_info = quantize_extended_w8(engine) if include_extended else None
+
+    model = engine.wrapper.model
+    tensors, modules = {}, []
+    stt = model.stt_model
+    for name, mod in stt.named_modules():
+        if name.startswith("perception.") or name.startswith("rnnt_joint."):
+            continue
+        if isinstance(mod, WOLinear):
+            modules.append(_w8_bundle_spec("stt_model", name, mod, tensors))
+    if include_eartts:
+        for name, mod in model.tts_model.tts_model.backbone.named_modules():
+            if isinstance(mod, WOLinear):
+                modules.append(_w8_bundle_spec("eartts_backbone", name, mod, tensors))
+    if include_extended:
+        perception = model.stt_model.perception
+        for name, mod in perception.named_modules():
+            if isinstance(mod, W8PointwiseConv1d):
+                modules.append(_w8_pointwise_spec("perception", name, mod, tensors))
+            elif isinstance(mod, WOLinear) and not name.endswith(".linear"):
+                modules.append(_w8_bundle_spec("perception", name, mod, tensors))
+        for name, mod in model.stt_model.rnnt_joint.named_modules():
+            if isinstance(mod, WOLinear):
+                modules.append(_w8_bundle_spec("rnnt_joint", name, mod, tensors))
+        tts = model.tts_model.tts_model
+        for name, mod in tts.named_modules():
+            if isinstance(mod, WOLinear) and not name.startswith("backbone."):
+                modules.append(_w8_bundle_spec("eartts_aux", name, mod, tensors))
+        codec = getattr(model.tts_model, "audio_codec", None)
+        decoder = getattr(codec, "decoder", None) if codec is not None else None
+        if decoder is not None:
+            for name, mod in decoder.named_modules():
+                if isinstance(mod, W8PointwiseConv1d):
+                    modules.append(_w8_pointwise_spec("codec_pointwise", name, mod, tensors))
+    if not modules:
+        raise RuntimeError("no native Q8 modules were produced")
+    manifest = {
+        "format": W8_BUNDLE_FORMAT,
+        "backend": "mynah_triton_w8_gemv",
+        "packing": "per_output_channel_symmetric_int8",
+        "compute_dtype": "bfloat16",
+        "weight_only": True,
+        "scopes": {
+            "stt_model": "Thinker projections and optional text/function heads",
+            "eartts_backbone": "EarTTS Gemma backbone linears",
+            "perception": "Perception Conformer Linear layers",
+            "rnnt_joint": "RNNT joint projections",
+            "eartts_aux": "CAS/fusion standard Linear layers",
+            "codec_pointwise": "Dense 1x1 codec decoder projections",
+        },
+        "unsupported_scopes": ["selected_mog", "rvq", "codec_depthwise", "codec_temporal_convolution",
+                               "rnnt_decoder_lstm", "embeddings", "state_and_cache"],
+        "modules": modules,
+        "quant_info": {"thinker": thinker_info, "eartts": eartts_info, "extended": extended_info},
+    }
+    from safetensors.torch import save_file
+    tmp_pack = path.with_name(path.name + ".tmp")
+    tmp_manifest = path.with_suffix(".json.tmp")
+    save_file(tensors, str(tmp_pack), metadata={"format": W8_BUNDLE_FORMAT})
+    tmp_pack.replace(path)
+    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_manifest.replace(path.with_suffix(".json"))
+    return {"path": str(path), "manifest": str(path.with_suffix(".json")), "modules": len(modules),
+            "format": W8_BUNDLE_FORMAT, "thinker": thinker_info, "eartts": eartts_info,
+            "extended": extended_info}
 
 
 def save_thinker_int4_pack(engine, path: str | Path, max_group: int = 128, clip: bool = False,
@@ -756,5 +863,82 @@ def load_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
         torch.cuda.empty_cache()
     return {"path": str(path), "modules": len(replacements), "skipped": missing,
             "format": BUNDLE_FORMAT, "weight_only": manifest.get("weight_only", False),
+            "unsupported_scopes": manifest.get("unsupported_scopes", [])}
+
+
+def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
+    """Validate and load an offline Q8 bundle atomically."""
+    from mynah_v2.model.w8_specialized import W8PointwiseConv1d
+    from mynah_v2.model.wo_gemv import WOLinear
+
+    path = Path(path)
+    manifest_path = path.with_suffix(".json")
+    if not path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(f"w8 bundle requires {path} and {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != W8_BUNDLE_FORMAT:
+        raise ValueError(f"unsupported w8 bundle format: {manifest.get('format')!r}")
+    model = engine.wrapper.model
+    roots = {"stt_model": model.stt_model, "eartts_backbone": model.tts_model.tts_model.backbone,
+             "perception": model.stt_model.perception, "rnnt_joint": model.stt_model.rnnt_joint,
+             "eartts_aux": model.tts_model.tts_model}
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        roots["codec_pointwise"] = decoder
+    device = str(next(model.parameters()).device)
+    from safetensors.torch import load_file
+    tensors = load_file(str(path), device=device)
+    missing, replacements = [], []
+    for spec in manifest.get("modules", []):
+        root_name, name = spec.get("root"), spec.get("name", "")
+        root = roots.get(root_name)
+        if root is None:
+            missing.append(f"{root_name}.{name} (unknown root)")
+            continue
+        try:
+            current = root.get_submodule(name) if name else root
+        except AttributeError:
+            missing.append(f"{root_name}.{name}")
+            continue
+        try:
+            q = tensors[spec["q_key"]]
+            scale = tensors[spec["scale_key"]]
+            if spec.get("kind") == "pointwise_conv1d":
+                if not isinstance(current, torch.nn.Conv1d):
+                    raise ValueError("not nn.Conv1d")
+                if (current.in_channels != spec["in_channels"] or current.out_channels != spec["out_channels"]
+                        or tuple(current.kernel_size) != (1,) or current.groups != 1):
+                    raise ValueError("pointwise channel shape mismatch")
+                lin = torch.nn.Linear(current.in_channels, current.out_channels, bias=current.bias is not None,
+                                      device=current.weight.device, dtype=current.weight.dtype)
+                with torch.no_grad():
+                    lin.weight.copy_(current.weight[:, :, 0])
+                    if current.bias is not None:
+                        lin.bias.copy_(current.bias)
+                replacement = W8PointwiseConv1d.__new__(W8PointwiseConv1d)
+                torch.nn.Module.__init__(replacement)
+                replacement.linear = WOLinear.from_packed(lin, q, scale, fmt=spec.get("fmt", "w8"))
+                replacement.in_channels, replacement.out_channels = current.in_channels, current.out_channels
+            else:
+                if not isinstance(current, torch.nn.Linear):
+                    raise ValueError("not nn.Linear")
+                if (current.in_features != spec["in_features"] or current.out_features != spec["out_features"]):
+                    raise ValueError("linear shape mismatch")
+                replacement = WOLinear.from_packed(current, q, scale, fmt=spec.get("fmt", "w8"))
+        except (KeyError, TypeError, ValueError) as exc:
+            missing.append(f"{root_name}.{name} ({exc})")
+            continue
+        replacements.append((root, name, replacement))
+    if missing and strict:
+        raise RuntimeError("w8 bundle validation failed: " + "; ".join(missing[:8]))
+    for root, name, replacement in replacements:
+        _replace_child(root, name, replacement)
+    if not replacements:
+        raise RuntimeError("w8 bundle did not replace any module")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"path": str(path), "modules": len(replacements), "skipped": missing,
+            "format": W8_BUNDLE_FORMAT, "weight_only": manifest.get("weight_only", False),
             "unsupported_scopes": manifest.get("unsupported_scopes", [])}
 # End of quantization helpers.
