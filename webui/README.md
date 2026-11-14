@@ -39,6 +39,11 @@ INT4 kernel; temporal/grouped convolution, codebooks, recurrent/KV caches,
 RNNT decoder LSTM, MoG `low_mat` by default, and remaining codec components stay BF16.
 Dynamic mode also enables the selected-MoG and RVQ gather/sum Q4 kernels;
 `MYNAH_INT4_SPECIALIZED=0` disables those two while keeping standard INT4.
+The codec depthwise ConvNeXt path is available explicitly with
+`--exp codec_depthwise_q4`. The fused RVQ argmin encoder and RNNT prediction
+LSTM are safety-gated experiments via `MYNAH_INT4_RVQ_ENCODE=1` and
+`MYNAH_INT4_RNNT=1`; they are not enabled by default because Q4 code choices
+and end-to-end latency still need longer target-GPU validation.
 The additional selected `low_mat` MoG kernel is available with
 `MYNAH_INT4_MOG_LOW=1`, but is not enabled by default because its current GB10
 measurement is slower than the BF16 path.

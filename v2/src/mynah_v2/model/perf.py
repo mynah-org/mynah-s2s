@@ -778,36 +778,149 @@ experiment("eartts_rvq_cache")((_rvq_enable, _rvq_disable))
 # distances can change later code selections; a fused quantized encoder is a
 # separate correctness gate.
 def _rvq_q4_enable(engine) -> dict:
-    from mynah_v2.model.rvq_q4 import RVQInt4Embedding
+    from mynah_v2.model.rvq_q4 import RVQInt4Embedding, RVQInt4Encoder
 
     m = _find_eartts(engine)
     if hasattr(m, "_v2_rvq_q4"):
         return {"rvq_q4": "already_enabled"}
     q = RVQInt4Embedding(m.rvq_embs)
     original = m.__dict__.get("depthsum_embedding")
+    use_encoder = os.environ.get("MYNAH_INT4_RVQ_ENCODE", "0") == "1"
 
     def depthsum(self, code):
         return self._v2_rvq_q4(code)
 
     m._v2_rvq_q4 = q
     m._v2_rvq_q4_original = original
+    encoder = None
+    if use_encoder:
+        original_step = m.__dict__.get("_v2_depthsum_step")
+        m._v2_rvq_q4_original_step = original_step
+        encoder = RVQInt4Encoder(q)
+        m._v2_rvq_q4_encoder = encoder
+
+        def encode_step(self, embs, residual, code, depth_str=0, k=72):
+            return self._v2_rvq_q4_encoder(residual, code, depth_str, k)
+
+        m._v2_depthsum_step = types.MethodType(encode_step, m)
     m.depthsum_embedding = types.MethodType(depthsum, m)
     torch.cuda.empty_cache()
     return {"rvq_q4": True, "shape": list(m.rvq_embs.shape), "bytes": q.nbytes(),
-            "encode_table": "BF16"}
+            "encode_table": "Q4_fused" if encoder is not None else "BF16",
+            "encoder_bytes": encoder.nbytes() if encoder is not None else 0}
 
 
 def _rvq_q4_disable(engine) -> None:
     m = _find_eartts(engine)
     original = m.__dict__.pop("_v2_rvq_q4_original", None)
-    m.__dict__.pop("_v2_rvq_q4", None)
+    original_step = m.__dict__.pop("_v2_rvq_q4_original_step", None)
+    # These are assigned nn.Modules and therefore live in ``_modules``;
+    # removing only from __dict__ leaves a stale registered child and makes a
+    # subsequent enable/disable cycle retain the old GPU allocation.
+    m._modules.pop("_v2_rvq_q4", None)
+    m._modules.pop("_v2_rvq_q4_encoder", None)
     if original is not None:
         m.depthsum_embedding = original
     else:
         m.__dict__.pop("depthsum_embedding", None)
+    if original_step is not None:
+        m._v2_depthsum_step = original_step
+    else:
+        m.__dict__.pop("_v2_depthsum_step", None)
 
 
 experiment("eartts_rvq_q4")((_rvq_q4_enable, _rvq_q4_disable))
+
+
+# --- codec_depthwise_q4: fused small-K depthwise convolution -----------------
+# The causal cache supplies the left context, so ConvNeXt's depthwise layer
+# itself is a plain [B,C,T] -> [B,C,T-K+1] convolution.  These filters are too
+# narrow for tinygemm; the dedicated kernel dequantizes each nibble in the
+# K-tap dot product.  Keep this opt-in until waveform parity/RTF is measured on
+# the target GPU: it is a bandwidth reduction, not a promise of a faster
+# launch for every codec chunk size.
+def _codec_depthwise_q4_enable(engine) -> dict:
+    from mynah_v2.model.depthwise_q4 import DepthwiseConv1dQ4
+
+    codec = engine.wrapper.model.tts_model.audio_codec
+    if hasattr(codec, "_v2_depthwise_q4_originals"):
+        return {"codec_depthwise_q4": "already_enabled"}
+    originals = []
+    replaced = 0
+    bytes_q4 = 0
+    for path, block in list(codec.named_modules()):
+        dw = getattr(block, "dwconv", None)
+        if not isinstance(dw, torch.nn.Conv1d):
+            continue
+        if not (dw.in_channels == dw.out_channels == dw.groups and dw.kernel_size[0] <= 15
+                and dw.stride == (1,) and dw.dilation == (1,) and dw.padding == (0,)):
+            continue
+        q4 = DepthwiseConv1dQ4(dw)
+        parent_path, child = path.rsplit(".", 1) if "." in path else ("", path)
+        parent = codec.get_submodule(parent_path) if parent_path else codec
+        originals.append((parent, child, dw))
+        setattr(parent, child, q4)
+        replaced += 1
+        bytes_q4 += q4.nbytes() + (dw.bias.numel() * dw.bias.element_size() if dw.bias is not None else 0)
+    if not replaced:
+        raise RuntimeError("no supported codec ConvNeXt depthwise convolutions found")
+    codec._v2_depthwise_q4_originals = originals
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"codec_depthwise_q4": True, "layers": replaced, "q4_bytes": bytes_q4}
+
+
+def _codec_depthwise_q4_disable(engine) -> None:
+    codec = engine.wrapper.model.tts_model.audio_codec
+    originals = getattr(codec, "_v2_depthwise_q4_originals", None)
+    if originals is None:
+        return
+    for parent, child, original in originals:
+        setattr(parent, child, original)
+    del codec._v2_depthwise_q4_originals
+
+
+experiment("codec_depthwise_q4")((_codec_depthwise_q4_enable, _codec_depthwise_q4_disable))
+
+
+# --- rnnt_decoder_q4: fused inference-only RNNT prediction LSTM -------------
+def _find_rnnt_decoder(engine):
+    stt = engine.wrapper.model.stt_model
+    for name in ("rnnt_decoder", "_rnnt_decoder"):
+        decoder = getattr(stt, name, None)
+        if decoder is not None and hasattr(decoder, "prediction"):
+            return decoder
+    for decoder in stt.modules():
+        if type(decoder).__name__ == "RNNTDecoder" and hasattr(decoder, "prediction"):
+            return decoder
+    raise RuntimeError("RNNTDecoder module not found")
+
+
+def _rnnt_q4_enable(engine) -> dict:
+    from mynah_v2.model.rnnt_q4 import Int4LSTM
+
+    decoder = _find_rnnt_decoder(engine)
+    rnn = decoder.prediction["dec_rnn"]
+    if isinstance(rnn, Int4LSTM):
+        return {"rnnt_decoder_q4": "already_enabled"}
+    q4 = Int4LSTM(rnn)
+    decoder.prediction["dec_rnn"] = q4
+    decoder._v2_rnnt_q4_original = rnn
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"rnnt_decoder_q4": True, "layers": q4.num_layers, "bytes": q4.nbytes(),
+            "fallback": "BF16 LSTM when disabled"}
+
+
+def _rnnt_q4_disable(engine) -> None:
+    decoder = _find_rnnt_decoder(engine)
+    original = getattr(decoder, "_v2_rnnt_q4_original", None)
+    if original is not None:
+        decoder.prediction["dec_rnn"] = original
+        del decoder._v2_rnnt_q4_original
+
+
+experiment("rnnt_decoder_q4")((_rnnt_q4_enable, _rnnt_q4_disable))
 experiment("eartts_fused_rmsnorm_bf16native")((lambda e: {"norms": fuse_rmsnorms(_find_eartts(e).backbone, bf16_native=True)},
                                                _ernorm_disable))
 

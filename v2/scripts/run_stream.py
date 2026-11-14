@@ -193,6 +193,8 @@ def main():
         a.int4_specialized = False
     if a.int4_specialized:
         extra = ["eartts_mog_q4", "eartts_rvq_q4"]
+        if os.environ.get("MYNAH_INT4_RNNT", "0") == "1":
+            extra.append("rnnt_decoder_q4")
         current = [x for x in (a.exp or "").split(",") if x]
         a.exp = ",".join(current + [x for x in extra if x not in current])
     if a.int4_heads and not a.thinker_int4:

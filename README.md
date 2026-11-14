@@ -104,11 +104,16 @@ available for experiments. `--max-backlog 120` can be added when testing a
 slower-than-realtime build so input is not dropped while measuring it.
 
 Dynamic `--int4` also enables the measured selected-MoG Q4 kernel and RVQ
-gather/sum Q4 kernel. Set `MYNAH_INT4_SPECIALIZED=0` alongside
+gather/sum Q4 kernel. The streaming codec's small depthwise ConvNeXt filters
+are available as an additional fused experiment with
+`--exp codec_depthwise_q4`. Set `MYNAH_INT4_SPECIALIZED=0` alongside
 `MYNAH_INT4=1` to keep only the standard INT4 paths. The second selected MoG
 matrix (`low_mat`) is available for experiments with `MYNAH_INT4_MOG_LOW=1`;
 the current GB10 measurement keeps it BF16 because its dequant launch adds
-overhead.
+overhead. The fused RVQ argmin encoder and RNNT LSTM are also opt-in safety
+experiments: use `MYNAH_INT4_RVQ_ENCODE=1` and `MYNAH_INT4_RNNT=1`
+respectively; they can change quantized RVQ codes and are not part of the
+default realtime path until a longer audio parity run validates them.
 
 The legacy `--eartts-int4` flag remains available when testing only the TTS
 backbone. It uses the native tinygemm path; the earlier custom Triton Q4 kernel
