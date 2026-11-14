@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -69,10 +71,11 @@ def _kernels():
         j = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
         valid = j < H
         base = b * H + j
-        gi = tl.load(gates + base, mask=valid, other=0.0).to(tl.float32)
-        gf = tl.load(gates + base + H, mask=valid, other=0.0).to(tl.float32)
-        gg = tl.load(gates + base + 2 * H, mask=valid, other=0.0).to(tl.float32)
-        go = tl.load(gates + base + 3 * H, mask=valid, other=0.0).to(tl.float32)
+        gate_base = b * (4 * H) + j
+        gi = tl.load(gates + gate_base, mask=valid, other=0.0).to(tl.float32)
+        gf = tl.load(gates + gate_base + H, mask=valid, other=0.0).to(tl.float32)
+        gg = tl.load(gates + gate_base + 2 * H, mask=valid, other=0.0).to(tl.float32)
+        go = tl.load(gates + gate_base + 3 * H, mask=valid, other=0.0).to(tl.float32)
         fi = 1.0 / (1.0 + tl.exp(-gi))
         ff = 1.0 / (1.0 + tl.exp(-gf))
         fo = 1.0 / (1.0 + tl.exp(-go))
@@ -84,7 +87,68 @@ def _kernels():
         tl.store(h_new + base, hn.to(h_new.dtype.element_ty), mask=valid)
         tl.store(out + base, hn.to(out.dtype.element_ty), mask=valid)
 
-    _KERNELS = (gate_mm, activate)
+    @triton.jit
+    def fused_lstm(x, h, c, qih, sih, mih, qhh, shh, mhh, bias, out, h_new, c_new,
+                   B, I, H, G: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_K: tl.constexpr):
+        """One launch for all four gates, activation, and state update."""
+        b = tl.program_id(0)
+        j = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        valid = j < H
+        gate = tl.arange(0, 4)[:, None]
+        n = gate * H + j[None, :]
+        acc = tl.load(bias + n, mask=valid[None, :], other=0.0).to(tl.float32)
+        half = I // 2
+        groups = I // G
+        for k0 in tl.range(0, I, BLOCK_K):
+            rh = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+            valid_k = 2 * rh < I
+            packed = tl.load(qih + n[:, :, None] * half + rh[None, None, :],
+                             mask=valid[None, :, None] & valid_k[None, None, :], other=0)
+            xe = tl.load(x + b * I + 2 * rh, mask=valid_k, other=0.0).to(tl.float32)
+            xo = tl.load(x + b * I + 2 * rh + 1, mask=valid_k & (2 * rh + 1 < I), other=0.0).to(tl.float32)
+            gi = (2 * rh) // G
+            sc = tl.load(sih + n[:, :, None] * groups + gi[None, None, :],
+                         mask=valid[None, :, None] & valid_k[None, None, :], other=0.0).to(tl.float32)
+            mn = tl.load(mih + n[:, :, None] * groups + gi[None, None, :],
+                         mask=valid[None, :, None] & valid_k[None, None, :], other=0.0).to(tl.float32)
+            acc += tl.sum((packed & 0xF).to(tl.float32) * sc * xe[None, None, :] +
+                          (packed >> 4).to(tl.float32) * sc * xo[None, None, :] +
+                          mn * (xe[None, None, :] + xo[None, None, :]), axis=2)
+        half = H // 2
+        groups = H // G
+        for k0 in tl.range(0, H, BLOCK_K):
+            rh = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+            valid_k = 2 * rh < H
+            packed = tl.load(qhh + n[:, :, None] * half + rh[None, None, :],
+                             mask=valid[None, :, None] & valid_k[None, None, :], other=0)
+            he = tl.load(h + b * H + 2 * rh, mask=valid_k, other=0.0).to(tl.float32)
+            ho = tl.load(h + b * H + 2 * rh + 1, mask=valid_k & (2 * rh + 1 < H), other=0.0).to(tl.float32)
+            gi = (2 * rh) // G
+            sc = tl.load(shh + n[:, :, None] * groups + gi[None, None, :],
+                         mask=valid[None, :, None] & valid_k[None, None, :], other=0.0).to(tl.float32)
+            mn = tl.load(mhh + n[:, :, None] * groups + gi[None, None, :],
+                         mask=valid[None, :, None] & valid_k[None, None, :], other=0.0).to(tl.float32)
+            acc += tl.sum((packed & 0xF).to(tl.float32) * sc * he[None, None, :] +
+                          (packed >> 4).to(tl.float32) * sc * ho[None, None, :] +
+                          mn * (he[None, None, :] + ho[None, None, :]), axis=2)
+        gate_idx = tl.arange(0, 4)[:, None]
+        gi = tl.sum(tl.where(gate_idx == 0, acc, 0.0), axis=0)
+        gf = tl.sum(tl.where(gate_idx == 1, acc, 0.0), axis=0)
+        gg = tl.sum(tl.where(gate_idx == 2, acc, 0.0), axis=0)
+        go = tl.sum(tl.where(gate_idx == 3, acc, 0.0), axis=0)
+        fi = 1.0 / (1.0 + tl.exp(-gi))
+        ff = 1.0 / (1.0 + tl.exp(-gf))
+        fo = 1.0 / (1.0 + tl.exp(-go))
+        tanh_g = 2.0 / (1.0 + tl.exp(-2.0 * gg)) - 1.0
+        base = b * H + j
+        cn = ff * tl.load(c + base, mask=valid, other=0.0).to(tl.float32) + fi * tanh_g
+        tanh_c = 2.0 / (1.0 + tl.exp(-2.0 * cn)) - 1.0
+        hn = fo * tanh_c
+        tl.store(c_new + base, cn.to(c_new.dtype.element_ty), mask=valid)
+        tl.store(h_new + base, hn.to(h_new.dtype.element_ty), mask=valid)
+        tl.store(out + base, hn.to(out.dtype.element_ty), mask=valid)
+
+    _KERNELS = (gate_mm, activate, fused_lstm)
     return _KERNELS
 
 
@@ -92,9 +156,10 @@ class Int4LSTM(nn.Module):
     """Q4 LSTM matching NeMo's inference-only ``LSTMDropout`` contract.
 
     It supports the actual RNNT configuration (two unprojected layers, batch
-    first only through the public ``[T,B,H]`` call).  The gate matmul and gate
-    update are separate fused Triton kernels; CPU uses a faithful dequantized
-    fallback for tests.
+    first only through the public ``[T,B,H]`` call).  The measured CUDA path
+    uses separate fused gate-matmul and state-update kernels; an experimental
+    one-launch gate/activation path is available with
+    ``MYNAH_INT4_RNNT_FUSED=1``. CPU uses a faithful dequantized fallback.
     """
 
     def __init__(self, rnn_module: nn.Module, group: int = 128):
@@ -173,30 +238,58 @@ class Int4LSTM(nn.Module):
                 outputs[ti].copy_(y)
             return outputs, (torch.stack(hs), torch.stack(cs))
         import triton
-        mm, act = _kernels()
+        _mm, _act, fused = _kernels()
         # Workspace belongs to this invocation, never the module: concurrent
         # sessions/streams cannot overwrite each other's gates or states.
         outputs = x.new_empty((t, b, self.hidden_size))
-        gates_buf = [torch.empty((b, 4 * self.hidden_size), dtype=x.dtype, device=x.device)
-                     for _ in range(self.num_layers)]
-        h_buf = [torch.empty_like(hs[li]) for li in range(self.num_layers)]
-        c_buf = [torch.empty_like(cs[li]) for li in range(self.num_layers)]
-        for ti in range(t):
-            y = x[ti].contiguous()
-            for li in range(self.num_layers):
-                gates = gates_buf[li]
-                hn = h_buf[li]
-                cn = c_buf[li]
-                qi, si, mi, qh, sh, mh, bias = self._weights(li)
-                mm[(b, triton.cdiv(4 * self.hidden_size, 128))](
-                    y, hs[li], qi, si, mi, qh, sh, mh, bias, gates,
-                    b, self.input_size if li == 0 else self.hidden_size, self.hidden_size,
-                    G=self.group, BLOCK_N=128, BLOCK_K=128,
-                )
-                act[(b, triton.cdiv(self.hidden_size, 128))](gates, hs[li], cs[li], hn, hn, cn,
-                                                               self.hidden_size, BLOCK_H=128)
-                hs[li], cs[li], y = hn, cn, hn
-            outputs[ti].copy_(y)
+        if os.getenv("MYNAH_INT4_RNNT_FUSED", "0") == "1":
+            # The fully fused kernel is useful for experimentation, but on
+            # GB10 its four-gate register footprint is currently slower than
+            # the two smaller kernels below. Ping-pong state buffers are
+            # required because this kernel reads and writes state in one launch.
+            h_buf = [[torch.empty_like(hs[li]), torch.empty_like(hs[li])]
+                     for li in range(self.num_layers)]
+            c_buf = [[torch.empty_like(cs[li]), torch.empty_like(cs[li])]
+                     for li in range(self.num_layers)]
+            slots = [0] * self.num_layers
+            for ti in range(t):
+                y = x[ti].contiguous()
+                for li in range(self.num_layers):
+                    slot = slots[li] if ti == 0 else 1 - slots[li]
+                    hn, cn = h_buf[li][slot], c_buf[li][slot]
+                    qi, si, mi, qh, sh, mh, bias = self._weights(li)
+                    fused[(b, triton.cdiv(self.hidden_size, 128))](
+                        y, hs[li], cs[li], qi, si, mi, qh, sh, mh, bias, hn, hn, cn,
+                        b, self.input_size if li == 0 else self.hidden_size, self.hidden_size,
+                        G=self.group, BLOCK_H=128, BLOCK_K=128,
+                    )
+                    hs[li], cs[li], y = hn, cn, hn
+                    slots[li] = slot
+                outputs[ti].copy_(y)
+        else:
+            # Keep the measured fast path: gate matmul and state activation
+            # are separate launches, allowing state-buffer reuse on the same
+            # CUDA stream without a second ping-pong pair.
+            gates_buf = [torch.empty((b, 4 * self.hidden_size), dtype=x.dtype, device=x.device)
+                         for _ in range(self.num_layers)]
+            h_buf = [torch.empty_like(hs[li]) for li in range(self.num_layers)]
+            c_buf = [torch.empty_like(cs[li]) for li in range(self.num_layers)]
+            for ti in range(t):
+                y = x[ti].contiguous()
+                for li in range(self.num_layers):
+                    gates = gates_buf[li]
+                    hn, cn = h_buf[li], c_buf[li]
+                    qi, si, mi, qh, sh, mh, bias = self._weights(li)
+                    _mm[(b, triton.cdiv(4 * self.hidden_size, 128))](
+                        y, hs[li], qi, si, mi, qh, sh, mh, bias, gates,
+                        b, self.input_size if li == 0 else self.hidden_size, self.hidden_size,
+                        G=self.group, BLOCK_N=128, BLOCK_K=128,
+                    )
+                    _act[(b, triton.cdiv(self.hidden_size, 128))](
+                        gates, hs[li], cs[li], hn, hn, cn, self.hidden_size, BLOCK_H=128
+                    )
+                    hs[li], cs[li], y = hn, cn, hn
+                outputs[ti].copy_(y)
         return outputs, (torch.stack(hs), torch.stack(cs))
 
     @staticmethod

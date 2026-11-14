@@ -114,6 +114,9 @@ overhead. The fused RVQ argmin encoder and RNNT LSTM are also opt-in safety
 experiments: use `MYNAH_INT4_RVQ_ENCODE=1` and `MYNAH_INT4_RNNT=1`
 respectively; they can change quantized RVQ codes and are not part of the
 default realtime path until a longer audio parity run validates them.
+The RNNT Q4 path is batch-safe for `B=1` and `B>1`; its optional fully fused
+gate/activation kernel can be profiled with `MYNAH_INT4_RNNT_FUSED=1`, but the
+measured GB10 path keeps the smaller two-launch kernels because they are faster.
 
 The legacy `--eartts-int4` flag remains available when testing only the TTS
 backbone. It uses the native tinygemm path; the earlier custom Triton Q4 kernel
