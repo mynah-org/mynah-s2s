@@ -93,6 +93,11 @@ class DepthwiseConv1dQ4(nn.Module):
             # context.  Match the causal path here; an empty chunk stays
             # empty rather than launching a zero-size Triton grid.
             x = F.pad(x, (self.kernel_size - 1, 0))
+        if x.device.type == "cuda" and not x.is_contiguous():
+            # The Triton ABI is flat [B,C,T].  Batched codec cache assembly
+            # normally returns contiguous tensors; make unusual views safe
+            # without sharing mutable workspace across sessions.
+            x = x.contiguous()
         out_len = x.shape[-1] - self.kernel_size + 1
         if out_len == 0:
             return x[..., :0]

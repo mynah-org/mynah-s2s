@@ -199,11 +199,19 @@ class RVQInt4Encoder(nn.Module):
     def forward(self, residual: torch.Tensor, code: torch.Tensor, depth_str: int = 0, k: int = 72):
         if residual.shape[-1] != self.hidden or code.shape[-1] != self.depth:
             raise ValueError("RVQ Q4 encoder shape mismatch")
+        if residual.device != code.device:
+            raise ValueError("RVQ residual and code must share a device")
+        if code.dtype not in (torch.int32, torch.int64):
+            raise ValueError("RVQ code must be int32 or int64")
+        if depth_str < 0 or depth_str > self.depth or k < 0:
+            raise ValueError("invalid RVQ depth range")
         r = residual.reshape(-1, self.hidden).contiguous()
         flat_code = code.reshape(-1, self.depth).contiguous()
         if r.shape[0] != flat_code.shape[0]:
             raise ValueError("RVQ residual/code leading dimensions differ")
         end = min(self.depth, depth_str + k)
+        if r.shape[0] == 0 or end == depth_str:
+            return code
         if r.device.type != "cuda":
             for qi in range(depth_str, end):
                 q = self.q[qi] & 0xF

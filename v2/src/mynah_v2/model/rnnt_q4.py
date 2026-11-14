@@ -136,36 +136,57 @@ class Int4LSTM(nn.Module):
     def forward(self, x: torch.Tensor, state=None):
         if x.ndim != 3 or x.shape[-1] != self.input_size:
             raise ValueError(f"RNNT Q4 expects [T,B,{self.input_size}], got {tuple(x.shape)}")
+        if not x.is_floating_point():
+            raise ValueError("RNNT Q4 activations must be floating point")
         t, b, _ = x.shape
         if state is None:
             hs = [torch.zeros(b, self.hidden_size, dtype=x.dtype, device=x.device) for _ in range(self.num_layers)]
             cs = [torch.zeros_like(h) for h in hs]
         else:
+            if len(state) != 2 or any(s.ndim != 3 for s in state):
+                raise ValueError("RNNT Q4 state must be (h, c) with [layers,batch,hidden] tensors")
+            if (state[0].shape != (self.num_layers, b, self.hidden_size)
+                    or state[1].shape != (self.num_layers, b, self.hidden_size)):
+                raise ValueError("RNNT Q4 state shape does not match the current batch")
+            if state[0].device != x.device or state[1].device != x.device:
+                raise ValueError("RNNT Q4 state and activations must share a device")
             hs = [state[0][i].contiguous() for i in range(self.num_layers)]
             cs = [state[1][i].contiguous() for i in range(self.num_layers)]
+        if t == 0 or b == 0:
+            return x.new_empty((t, b, self.hidden_size)), (torch.stack(hs), torch.stack(cs))
         if x.device.type != "cuda":
-            outputs = []
+            weights = [(
+                self._dequant(self.qih[li], self.sih[li], self.mih[li], self.input_size if li == 0 else self.hidden_size),
+                self._dequant(self.qhh[li], self.shh[li], self.mhh[li], self.hidden_size),
+                self.bias[li],
+            ) for li in range(self.num_layers)]
+            outputs = x.new_empty((t, b, self.hidden_size))
             for ti in range(t):
                 y = x[ti]
                 for li in range(self.num_layers):
-                    wi = self._dequant(self.qih[li], self.sih[li], self.mih[li], self.input_size if li == 0 else self.hidden_size)
-                    wh = self._dequant(self.qhh[li], self.shh[li], self.mhh[li], self.hidden_size)
-                    gates = F.linear(y, wi) + F.linear(hs[li], wh) + self.bias[li]
+                    wi, wh, bias = weights[li]
+                    gates = F.linear(y, wi) + F.linear(hs[li], wh) + bias
                     i, f, g, o = gates.chunk(4, -1)
                     cs[li] = torch.sigmoid(f) * cs[li] + torch.sigmoid(i) * torch.tanh(g)
                     hs[li] = torch.sigmoid(o) * torch.tanh(cs[li])
                     y = hs[li]
-                outputs.append(y)
-            return torch.stack(outputs), (torch.stack(hs), torch.stack(cs))
+                outputs[ti].copy_(y)
+            return outputs, (torch.stack(hs), torch.stack(cs))
         import triton
         mm, act = _kernels()
-        outputs = []
+        # Workspace belongs to this invocation, never the module: concurrent
+        # sessions/streams cannot overwrite each other's gates or states.
+        outputs = x.new_empty((t, b, self.hidden_size))
+        gates_buf = [torch.empty((b, 4 * self.hidden_size), dtype=x.dtype, device=x.device)
+                     for _ in range(self.num_layers)]
+        h_buf = [torch.empty_like(hs[li]) for li in range(self.num_layers)]
+        c_buf = [torch.empty_like(cs[li]) for li in range(self.num_layers)]
         for ti in range(t):
             y = x[ti].contiguous()
             for li in range(self.num_layers):
-                gates = torch.empty((b, 4 * self.hidden_size), dtype=x.dtype, device=x.device)
-                hn = torch.empty_like(hs[li])
-                cn = torch.empty_like(cs[li])
+                gates = gates_buf[li]
+                hn = h_buf[li]
+                cn = c_buf[li]
                 qi, si, mi, qh, sh, mh, bias = self._weights(li)
                 mm[(b, triton.cdiv(4 * self.hidden_size, 128))](
                     y, hs[li], qi, si, mi, qh, sh, mh, bias, gates,
@@ -175,8 +196,8 @@ class Int4LSTM(nn.Module):
                 act[(b, triton.cdiv(self.hidden_size, 128))](gates, hs[li], cs[li], hn, hn, cn,
                                                                self.hidden_size, BLOCK_H=128)
                 hs[li], cs[li], y = hn, cn, hn
-            outputs.append(y)
-        return torch.stack(outputs), (torch.stack(hs), torch.stack(cs))
+            outputs[ti].copy_(y)
+        return outputs, (torch.stack(hs), torch.stack(cs))
 
     @staticmethod
     def _dequant(q, scale, minimum, k):
