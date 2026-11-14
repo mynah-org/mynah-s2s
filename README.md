@@ -121,13 +121,23 @@ The RNNT Q4 path is batch-safe for `B=1` and `B>1`; its optional fully fused
 gate/activation kernel can be profiled with `MYNAH_INT4_RNNT_FUSED=1`, but the
 measured GB10 path keeps the smaller two-launch kernels because they are faster.
 
+For coverage experiments, the corresponding Q8 preset is available with
+`--int8` or `MYNAH_INT8=1`. It replaces the same standard matrix scopes and also
+provides Q8 adapters for selected MoG, RVQ gather, codec depthwise, and RNNT
+prediction paths; `MYNAH_INT8_RVQ_ENCODE=1` additionally enables the Q8 RVQ
+argmin/update path. Q8 is intentionally not the default: the exact `t02`
+tool-call smoke completed correctly, but the full all-Q8 path measured `RTF
+10.38` on GB10 and is currently a parity/memory path rather than a realtime
+serving candidate.
+
 The legacy `--eartts-int4` flag remains available when testing only the TTS
 backbone. It uses the native tinygemm path; the earlier custom Triton Q4 kernel
 is retained only as a kernel experiment.
 
-Compared with the external GGUF Q8 deployment, our coverage is now aligned on
-the standard matrix paths plus dense codec projections; the remaining pieces
-are temporal convolution/codebook and stateful/custom-kernel paths. The reference project emits
+Compared with the external GGUF Q8 deployment, our coverage now includes the
+standard matrix paths, dense codec projections, and dedicated Q8 adapters for
+the remaining custom paths. Temporal/grouped convolution, codebooks, and
+stateful/custom-kernel paths still require their own validation. The reference project emits
 separate LLM, function-head, perception, and TTS/codec artifacts; its README
 also says Q4 converts but the supported measurements are Q8. See the
 [reference layout](https://github.com/mkotyushev/nemotron-voicechat-realtime-gguf#why-gguf).

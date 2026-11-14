@@ -170,6 +170,10 @@ def main():
                     help="EXPERIMENT: graph-safe native INT4 for the EarTTS Gemma backbone only; requires enhanced mode")
     ap.add_argument("--int4-extended", action="store_true", default=_env_flag("MYNAH_INT4_EXTENDED"),
                     help="EXPERIMENT: also quantize perception Linear, RNNT joint, CAS/fusion/MoG Linear paths")
+    ap.add_argument("--int8", action="store_true", default=_env_flag("MYNAH_INT8"),
+                    help="opt-in Q8 parity preset: Thinker, EarTTS, perception, RNNT joint, codec 1x1, and specialized Q8 paths")
+    ap.add_argument("--int8-specialized", action="store_true", default=_env_flag("MYNAH_INT8_SPECIALIZED"),
+                    help="enable Q8 selected-MoG, RVQ, depthwise codec, and RNNT prediction paths (implied by --int8)")
     a = ap.parse_args()
     preset_info = presets.fill(a, presets.SINGLE, a.preset)
     print("PRESET", a.preset, preset_info, flush=True)
@@ -178,12 +182,19 @@ def main():
     if a.int4_pack is None:
         a.int4_pack = a.thinker_int4_pack
     if a.int4:
+        if a.int8:
+            ap.error("--int4 and --int8 are mutually exclusive")
         a.thinker_int4 = True
         a.int4_heads = True
         a.eartts_int4 = True
         a.int4_extended = True
         if os.environ.get("MYNAH_INT4_SPECIALIZED") != "0":
             a.int4_specialized = True
+    if a.int8:
+        if (a.thinker_int4 or a.eartts_int4 or a.int4_extended or a.int4_pack
+                or a.int4_specialized or a.int4_heads):
+            ap.error("--int4 options and --int8 are mutually exclusive")
+        a.int8_specialized = True
     if a.int4_pack:
         a.thinker_int4_pack = a.int4_pack
         a.thinker_int4 = True
@@ -197,6 +208,10 @@ def main():
             extra.append("rnnt_decoder_q4")
         current = [x for x in (a.exp or "").split(",") if x]
         a.exp = ",".join(current + [x for x in extra if x not in current])
+    if a.int8_specialized:
+        extra = ["eartts_mog_w8", "eartts_rvq_w8", "codec_depthwise_w8", "rnnt_decoder_w8"]
+        current = [x for x in (a.exp or "").split(",") if x]
+        a.exp = ",".join(current + [x for x in extra if x not in current])
     if a.int4_heads and not a.thinker_int4:
         ap.error("--int4-heads requires --thinker-int4")
     if a.thinker_int4 and a.mode == "reference":
@@ -205,6 +220,8 @@ def main():
         ap.error("--eartts-int4 is experimental and never allowed in REFERENCE mode")
     if a.int4_extended and a.mode == "reference":
         ap.error("--int4-extended is experimental and never allowed in REFERENCE mode")
+    if a.int8 and a.mode == "reference":
+        ap.error("--int8 is experimental and never allowed in REFERENCE mode")
     if a.pace == "fast" and a.tools:
         ap.error("--pace fast is invalid with tools: the reference FC fast path runs on wall time while generate_step "
                  "returns at once, so unpaced input/drain closes sessions mid-call (golden v1 incident, 2026-11-11)")
@@ -267,6 +284,12 @@ def main():
     if a.int4_extended:
         from mynah_v2.model.quant import quantize_extended_int4
         print("EXTENDED_QUANT", quantize_extended_int4(eng), flush=True)
+    if a.int8:
+        from mynah_v2.model.quant import quantize_extended_w8, quantize_thinker_w8
+        from mynah_v2.model.eartts_q8 import quantize_eartts_w8
+        print("THINKER_Q8", quantize_thinker_w8(eng, include_heads=True), flush=True)
+        print("EARTTS_Q8", quantize_eartts_w8(eng), flush=True)
+        print("EXTENDED_Q8", quantize_extended_w8(eng), flush=True)
     perf_info = None
     if a.perf_profile or a.exp:
         perf_info = presets.apply(eng, a.perf_profile, a.exp, strict=a.strict)

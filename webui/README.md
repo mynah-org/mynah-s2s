@@ -62,6 +62,12 @@ It quantizes only the Gemma backbone linears. CAS/subword embeddings, MoG
 direct projections, RVQ, codec, and perception remain unchanged. The combined
 `--int4` path has passed a real DGX WebSocket turn with zero dropped audio.
 
+For an explicit Q8 coverage run, use `--int8` (or `MYNAH_INT8=1`). This enables
+Q8 counterparts for the standard matrix paths plus selected MoG, RVQ, codec
+depthwise, and RNNT prediction paths. It is currently an experimental
+parity/memory mode, not the WebUI default: the full all-Q8 corpus smoke is
+semantically correct but measured `RTF 10.38` on GB10.
+
 For repeatable startup, export the native packed weights once and pass the bundle
 instead:
 

@@ -228,6 +228,41 @@ def restore_thinker(originals) -> None:
     torch.cuda.empty_cache()
 
 
+def quantize_thinker_w8(engine, include_heads: bool = False) -> dict:
+    """Replace Thinker projections with the batched Triton Q8 path."""
+    from mynah_v2.model.wo_gemv import WOLinear
+
+    stt = engine.wrapper.model.stt_model
+    llm = stt.llm
+    before = after = n = 0
+    if include_heads:
+        for name in ("lm_head", "function_head"):
+            mod = getattr(stt, name, None)
+            if isinstance(mod, nn.Linear):
+                before += mod.weight.numel() * mod.weight.element_size()
+                q = WOLinear(mod, "w8")
+                after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+                setattr(stt, name, q)
+                n += 1
+    targets = {"in_proj", "out_proj", "up_proj", "down_proj", "q_proj", "k_proj", "v_proj", "o_proj"}
+    for layer in llm.layers:
+        mixer = getattr(layer, "mixer", None)
+        if mixer is None:
+            continue
+        for name, mod in list(mixer.named_children()):
+            if name not in targets or not isinstance(mod, nn.Linear):
+                continue
+            before += mod.weight.numel() * mod.weight.element_size()
+            q = WOLinear(mod, "w8")
+            after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+            setattr(mixer, name, q)
+            n += 1
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"thinker_quant": "w8_batched_gemv", "linears": n, "include_heads": include_heads,
+            "bf16_bytes": before, "w8_bytes": after}
+
+
 def _quantize_linear_tree(root: nn.Module, max_group: int, scope: str,
                           predicate=None) -> dict:
     """Replace ordinary Linear children in one model scope, reporting safe skips."""
@@ -316,6 +351,81 @@ def quantize_extended_int4(engine, max_group: int = 128) -> dict:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return {"extended_int4": True, "scopes": scopes,
+            "linears": sum(v.get("linears", v.get("pointwise_conv1d", 0)) for v in scopes.values()),
+            "skipped": sum(len(v["skipped"]) for v in scopes.values())}
+
+
+def _quantize_linear_tree_w8(root: nn.Module, scope: str, predicate=None) -> dict:
+    """Replace ordinary Linear children with the Triton batched Q8 path."""
+    from mynah_v2.model.wo_gemv import WOLinear
+
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Linear) or (predicate is not None and not predicate(name, mod)):
+            continue
+        before += mod.weight.numel() * mod.weight.element_size()
+        q = WOLinear(mod, "w8")
+        after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "linears": n, "skipped": skipped, "bf16_bytes": before, "w8_bytes": after}
+
+
+def _quantize_pointwise_conv_tree_w8(root: nn.Module, scope: str) -> dict:
+    """Replace dense 1x1 Conv1d children with the Q8 pointwise adapter."""
+    from mynah_v2.model.w8_specialized import W8PointwiseConv1d
+
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Conv1d):
+            continue
+        if tuple(mod.kernel_size) != (1,) or tuple(mod.stride) != (1,) or tuple(mod.padding) != (0,) \
+                or mod.groups != 1 or tuple(mod.dilation) != (1,):
+            continue
+        before += mod.weight.numel() * mod.weight.element_size()
+        q = W8PointwiseConv1d(mod)
+        after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "pointwise_conv1d": n, "skipped": skipped,
+            "bf16_bytes": before, "w8_bytes": after}
+
+
+def quantize_extended_w8(engine) -> dict:
+    """Q8 counterpart of ``quantize_extended_int4`` for standard matrix paths.
+
+    Temporal/grouped convolutions, embeddings/codebooks, the selected MoG
+    projection, and the RNNT prediction LSTM are specialized paths and are
+    enabled by their own Q8 experiments.
+    """
+    model = engine.wrapper.model
+    scopes = {
+        "perception": _quantize_linear_tree_w8(model.stt_model.perception, "perception"),
+        "rnnt_joint": _quantize_linear_tree_w8(model.stt_model.rnnt_joint, "rnnt_joint"),
+    }
+    scopes["perception_pointwise"] = _quantize_pointwise_conv_tree_w8(
+        model.stt_model.perception, "perception_pointwise"
+    )
+    tts = model.tts_model.tts_model
+    scopes["eartts_aux"] = _quantize_linear_tree_w8(
+        tts, "eartts_aux",
+        predicate=lambda name, _mod: (
+            not name.startswith("backbone.") and name != "mog_head.proj_mus"
+        ),
+    )
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        scopes["codec_pointwise"] = _quantize_pointwise_conv_tree_w8(decoder, "codec_pointwise")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"extended_w8": True, "scopes": scopes,
             "linears": sum(v.get("linears", v.get("pointwise_conv1d", 0)) for v in scopes.values()),
             "skipped": sum(len(v["skipped"]) for v in scopes.values())}
 

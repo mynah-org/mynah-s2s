@@ -203,11 +203,15 @@ def gemv(x: torch.Tensor, p, bias: torch.Tensor | None = None) -> torch.Tensor:
     launch (weights read once; MP = next power of two ≥ rows: 1/2/4/8/16 — round 17: with MP capped at 4, B=8 fell back
     to a full dequant per call, 130 ms/step); more rows (e.g. a prompt prefill) go through a dequantized BF16 matmul. w4/nvf4: one launch per row
     (M=1 decode kernels; batched variants not written yet)."""
-    if not _KERNELS:
-        _build()
     f = p["fmt"]
     n = p["q"].shape[0]
     k = x.shape[-1]
+    if x.device.type != "cuda":
+        w = dequant(p).to(x.dtype)
+        b = None if bias is None else bias.to(x.dtype)
+        return torch.nn.functional.linear(x, w, b)
+    if not _KERNELS:
+        _build()
     x2 = x.reshape(-1, k)
     mrows = x2.shape[0]
     if f in ("w8", "f8"):
