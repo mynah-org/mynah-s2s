@@ -90,6 +90,16 @@ The UI is in English and shows the User/Agent conversation, microphone and
 speaker controls, model activity, tool calls, and an optional editable system
 prompt. More details are in [`webui/README.md`](webui/README.md).
 
+If the UI is opened from another machine and the browser does not offer a
+microphone permission, use an SSH port-forward and open the local URL instead:
+
+```bash
+ssh -N -L 8787:127.0.0.1:8787 -L 8788:127.0.0.1:8788 <user>@<host>
+```
+
+Then visit <http://127.0.0.1:8787>. Browsers require `localhost` or HTTPS for
+microphone capture; speakers normally do not show a separate permission prompt.
+
 | goal | command |
 |---|---|
 | one conversation, any corpus item (q03 general knowledge, t13 correction mid-call, s05 small talk) | `make demo ITEM=t13` |

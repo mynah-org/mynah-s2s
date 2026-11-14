@@ -117,7 +117,6 @@ def demo_steps(scenario: dict, sid: str):
     def event(ev, **fields):
         return {"type": "event", "ev": ev, "t_ns": time.monotonic_ns(), **fields}
     return [
-        (0.0, event("session.opened", mode="demo", scenario=scenario["id"])),
         (0.25, event("asr.generated", text=scenario["example_user"], turn_id=1)),
         (0.0, event("turn.started", who="user", turn_id=1)),
         (0.25, event("thinker.step", model_step=18, phase="understand", status="thinking")),
@@ -132,13 +131,22 @@ def demo_steps(scenario: dict, sid: str):
     ]
 
 
-async def simulate(ws, scenario: dict):
+async def simulate(ws, scenario: dict, sid: str | None = None):
     """Play one guided tool-call trace; it is intentionally inspectable, not random."""
-    sid = f"demo-{int(time.time() * 1000) % 100000:05d}"
-    await ws.send(json_line({"type": "session.created", "session_id": sid, "mode": "demo", "input_rate": 16000, "output_rate": 22050}))
+    if sid is None:
+        sid = f"demo-{int(time.time() * 1000) % 100000:05d}"
+        await ws.send(json_line({"type": "session.created", "session_id": sid, "mode": "demo", "input_rate": 16000, "output_rate": 22050}))
     for delay, payload in demo_steps(scenario, sid):
         await asyncio.sleep(delay)
         await ws.send(json_line(payload))
+
+
+async def open_demo(ws, scenario: dict) -> str:
+    """Open an idle demo session; the example starts only after demo.request."""
+    sid = f"demo-{int(time.time() * 1000) % 100000:05d}"
+    await ws.send(json_line({"type": "session.created", "session_id": sid, "mode": "demo", "input_rate": 16000, "output_rate": 22050}))
+    await ws.send(json_line({"type": "event", "ev": "session.opened", "t_ns": time.monotonic_ns(), "mode": "demo", "scenario": scenario["id"]}))
+    return sid
 
 
 def ws_read_frame(conn):
@@ -203,9 +211,7 @@ class FallbackWebSocketHandler(socketserver.BaseRequestHandler):
             return
         sid = f"demo-{int(time.time() * 1000) % 100000:05d}"
         ws_send_frame(conn, json_line({"type": "session.created", "session_id": sid, "mode": "demo", "input_rate": 16000, "output_rate": 22050}).encode())
-        for delay, payload in demo_steps(scenario, sid):
-            time.sleep(delay)
-            ws_send_frame(conn, json_line(payload).encode())
+        ws_send_frame(conn, json_line({"type": "event", "ev": "session.opened", "t_ns": time.monotonic_ns(), "mode": "demo", "scenario": scenario["id"]}).encode())
         while True:
             frame = ws_read_frame(conn)
             if not frame:
@@ -274,7 +280,7 @@ async def websocket_handler(ws, v2_ws: str | None):
             await ws.send(json_line({"type": "error", "error": "GPU bridge is not configured: start with --v2-ws"}))
             return
 
-        await simulate(ws, scenario)
+        sid = await open_demo(ws, scenario)
         async for message in ws:
             if isinstance(message, str):
                 msg = json.loads(message)
@@ -282,7 +288,7 @@ async def websocket_handler(ws, v2_ws: str | None):
                     await ws.send(json_line({"type": "session.closed", "kind": msg["type"].split(".")[1]}))
                     return
                 if msg.get("type") == "demo.request":
-                    await simulate(ws, SCENARIOS.get(msg.get("scenario"), scenario))
+                    await simulate(ws, SCENARIOS.get(msg.get("scenario"), scenario), sid)
     except Exception as exc:  # noqa: BLE001 - bridge errors are sent to the UI
         try:
             await ws.send(json_line({"type": "error", "error": f"{type(exc).__name__}: {exc}"}))
