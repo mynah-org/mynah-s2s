@@ -258,12 +258,28 @@ class AsrShadow:
                 "unfulfilled": [i for i in self.intents if i["fulfilled"] is False]}
 
 
+# Compact refusals (opt-in, response_style="compact"): every refusal token is one FC phase-2 step (~165 ms on GB10);
+# the full repeat refusal is 86 tokens (87 steps, 14.1 s), these are ~30. The earlier result is NOT restated: the model
+# already read it in its own context. Admission rules are identical in both styles.
+COMPACT = {
+    "repeat": {"status": "already_done", "next_step": "Tell the caller."},
+    "in_flight": {"status": "in_progress", "next_step": "Tell the caller you are still checking."},
+    "busy": {"status": "busy", "next_step": "Wait for the current request."},
+    "side_effect_done": {"status": "already_done", "next_step": "Tell the caller it is done."},
+    "side_effect_unknown": {"status": "unknown", "next_step": "Do not repeat. Offer a person."},
+    "ungrounded": {"status": "not_executed", "next_step": "Ask the caller."},
+    "budget": {"status": "not_executed", "next_step": "Ask the caller."},
+    "closed": {"status": "not_executed", "next_step": "Ask the caller."},
+}
+RESPONSE_STYLES = ("full", "compact")
+
+
 class CallGuard:
     def __init__(self, schemas: list[dict] | dict | None = None, session_id: str = "", ledger=None,
                  classify: Callable[[str | None], str] = default_outcome, max_unproductive: int = 2,
                  max_active: int = 1, ttl_s: float = 120.0, max_entries: int = 64,
                  side_effects: dict[str, str | None] | None = None, max_issued: int = 512, clock=time.monotonic_ns,
-                 asr_shadow: AsrShadow | None = None):
+                 asr_shadow: AsrShadow | None = None, response_style: str = "full"):
         """schemas: the registry's tool schemas (``ToolRegistry.schemas`` list, or {name: parameters}).
         side_effects: {tool: idempotency-key parameter or None} for tools that change state (never re-run blindly).
         ledger: the session's ToolLedger (optional) to link call ids and see timed-out backends still running."""
@@ -285,6 +301,9 @@ class CallGuard:
         self.log: collections.deque[dict] = collections.deque(maxlen=max_entries * 4)
         self.closed = False
         self.asr = asr_shadow                    # optional ASR shadow (observe only)
+        if response_style not in RESPONSE_STYLES:
+            raise ValueError(f"response_style must be one of {RESPONSE_STYLES}")
+        self.response_style = response_style
 
     # ---- inputs
     def on_user_text(self, text: str, model_step: int | None = None) -> None:
@@ -406,8 +425,9 @@ class CallGuard:
                 self._neg += 1
         return out
 
-    @staticmethod
-    def _response(d: Decision) -> str:
+    def _response(self, d: Decision) -> str:
+        if self.response_style == "compact":
+            return json.dumps(COMPACT.get(d.rule, COMPACT["budget"]))
         body = {"status": "not_executed", "reason": d.reason}
         if "previous_result" in d.audit:
             prev = d.audit["previous_result"]

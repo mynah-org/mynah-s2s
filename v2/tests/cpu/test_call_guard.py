@@ -406,3 +406,34 @@ def test_asr_shadow_never_changes_a_decision():
     seq = [("user", "where is my order? Q, Q, nine, nine, nine.")] + [("get_order_status", {"order_id": "qgq999"},
                                                                        NF("qgq999"))] * 5
     assert run(CallGuard(), seq) == run(_shadow_guard(), seq)
+
+
+def test_compact_responses_same_decisions_shorter_text():
+    from mynah_v2.agent.call_guard import COMPACT
+    seq = [("user", "where is my order? Q, Q, nine, nine, nine.")] + [("get_order_status", {"order_id": "qgq999"},
+                                                                       NF("qgq999"))] * 6
+    full, comp = CallGuard(), CallGuard(response_style="compact")
+    rules = []
+    for g in (full, comp):
+        out = []
+        for s_ in seq:
+            if s_[0] == "user":
+                g.on_user_text(s_[1])
+                continue
+            d = g.admit(s_[0], s_[1])
+            out.append((d.rule, d.response))
+            if d.allow:
+                g.complete(d, s_[2])
+        rules.append(out)
+    assert [r for r, _ in rules[0]] == [r for r, _ in rules[1]]           # identical admission
+    for (rule, f), (_, c) in zip(*rules):
+        if rule:
+            assert len(c) < 70 and len(c) < len(f) / 2 and json.loads(c)["next_step"]
+    assert json.loads(rules[1][1][1]) == {"status": "already_done", "next_step": "Tell the caller."}
+    assert set(COMPACT) >= {"repeat", "in_flight", "busy", "side_effect_done", "side_effect_unknown", "ungrounded",
+                            "budget", "closed"}
+    try:
+        CallGuard(response_style="tiny")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass

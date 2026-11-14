@@ -112,6 +112,8 @@ def main():
                          "(mynah_v2.agent.call_guard); default off")
     ap.add_argument("--asr-shadow", action="store_true",
                     help="EXPERIMENT (with --call-guard): compare call slots with the caller ASR, observe only")
+    ap.add_argument("--guard-compact", action="store_true",
+                    help="EXPERIMENT (with --call-guard): short refusal responses (fewer FC phase-2 steps)")
     ap.add_argument("--override", action="append", default=[], help="cfg key=value (OmegaConf dotlist)")
     presets.add_determinism_args(ap)
     ap.add_argument("--no-llm-cache", action="store_true",
@@ -261,7 +263,8 @@ def main():
         guard, guard_un = None, None
         if a.call_guard:                       # EXPERIMENT: refusals answer the model, the backend never sees them
             from mynah_v2.agent.call_guard import AsrShadow, CallGuard, install
-            guard = CallGuard(session_id=stem, ledger=led, asr_shadow=AsrShadow() if a.asr_shadow else None)
+            guard = CallGuard(session_id=stem, ledger=led, asr_shadow=AsrShadow() if a.asr_shadow else None,
+                              response_style="compact" if a.guard_compact else "full")
             _emit = tr.emit
 
             def _guard_emit(ev, _emit=_emit, _g=guard, **kw):   # caller speech (RNN-T user text) = new input epoch

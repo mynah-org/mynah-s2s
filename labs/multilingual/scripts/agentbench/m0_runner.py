@@ -254,6 +254,8 @@ def main():
                     help="EXPERIMENT: engine call registry + admission control in front of the executor; default off")
     ap.add_argument("--asr-shadow", action="store_true",
                     help="EXPERIMENT (with --call-guard): compare call slots / intents with the caller ASR, observe only")
+    ap.add_argument("--guard-compact", action="store_true",
+                    help="EXPERIMENT (with --call-guard): short refusal responses (fewer FC phase-2 steps)")
     ap.add_argument("--fc-resume-by-label", default="",
                     help="'label=pad_pad|label=pad_eotr|label=eotr_step|label=off': re-arm the engine fc_ctx_fix per plan label")
     ap.add_argument("--en-dir", default=str(LAB_HOME / "ckpt/asr-en"))
@@ -382,7 +384,7 @@ def main():
                 from mynah_v2.agent.call_guard import AsrShadow, CallGuard
                 guard = CallGuard(TENANT_GUARD["schemas"], session_id=sid, side_effects=TENANT_GUARD["side_effects"],
                                   asr_shadow=AsrShadow(intent_tools={"transfer": "escalate_to_human"})
-                                  if a.asr_shadow else None)
+                                  if a.asr_shadow else None, response_style="compact" if a.guard_compact else "full")
 
             def emit(ev, _emit=_emit, **kw):  # instance-level hook, no V2 code change
                 if ev == "asr.generated" and _re.search(r"[A-Za-z]", kw.get("text", "")):
