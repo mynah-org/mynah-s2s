@@ -111,6 +111,9 @@ def main():
                     help="(legacy, now the ENHANCED default) per-session call registry + admission control")
     ap.add_argument("--no-call-guard", action="store_true",
                     help="ENHANCED without the call guard (and with the engine's own FC resume contract)")
+    ap.add_argument("--guard-resume", choices=["pad_eotr", "pad_pad", "engine"], default="pad_eotr",
+                    help="FC resume contract of a guarded session: (PAD,EOTR) keeps chains (default), (PAD,PAD), "
+                         "or the engine's own")
     ap.add_argument("--asr-shadow", action="store_true",
                     help="EXPERIMENT (with --call-guard): compare call slots with the caller ASR, observe only")
     ap.add_argument("--guard-compact", action="store_true",
@@ -266,6 +269,7 @@ def main():
         if enh is not None:                    # the call guard is the ENHANCED default (Session attaches it)
             enh.call_guard = not a.no_call_guard
             enh.guard_style = "echo" if a.guard_echo else "compact" if a.guard_compact else "full"
+            enh.resume_with_guard = None if a.guard_resume == "engine" else a.guard_resume
         sess.open(prompt)
         if a.asr_shadow and sess.guard is not None:
             from mynah_v2.agent.call_guard import AsrShadow
