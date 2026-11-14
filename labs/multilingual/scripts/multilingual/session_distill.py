@@ -46,6 +46,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from labpaths import resolve  # noqa: E402  (archived clips: absolute symlinks into the historical layout)
 
 PAD, BOS, EOS, SOTC, EOTC = 12, 1, 2, 20, 21
 FRAME = 1280
@@ -369,7 +370,7 @@ def cmd_prep(a):  # pragma: no cover - GPU
         chunk = todo[b:b + a.batch]
         wavs, ends = [], []
         for i in chunk:
-            x = sf.read(root / fam[i]["en"]["path"], dtype="float32")[0]
+            x = sf.read(resolve(root / fam[i]["en"]["path"]), dtype="float32")[0]
             wavs.append(session_wav(x, meta[i]["lead"], a.tail_s))
             ends.append(meta[i]["lead"] + int(math.ceil(len(x) / FRAME)))
         Af, n = feats_A(wavs)
@@ -919,7 +920,7 @@ class SessionML:  # pragma: no cover - GPU
         import soundfile as sf
         import torch
         if key not in self.cache:
-            x = sf.read(self.path[key], dtype="float32")[0]
+            x = sf.read(resolve(self.path[key]), dtype="float32")[0]
             self.cache[key] = torch.from_numpy(session_wav(x, self.items[key[0]]["lead"], self.tail_s))
         return self.cache[key]
 

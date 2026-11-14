@@ -69,6 +69,15 @@ class EnhancedOptions:
     tts_pad_silence: bool = False
     error_on_unknown_tool: bool = True  # inject an error TOOL_RESPONSE instead of nothing (reference)
     rehydrate_after_s: float | None = None  # restart the model stream with a facts summary (needs a controller)
+    # Per-session call registry + admission control in front of the bound tools (agent.call_guard): identical repeats
+    # without new caller speech, in-flight duplicates, invented result-ids, per-turn budgets are answered without
+    # running the backend. Default ON in ENHANCED (owner 2026-11-14, live R0/R1); with it the session resumes FC on
+    # (PAD, EOTR) so the model keeps its chained calls (EN m07) while the guard ends the re-call loops (m02/t14/t13).
+    call_guard: bool = True
+    guard_style: str = "full"                   # "full" (validated) | "echo" (shorter refusals) | "compact"
+    guard_schemas: dict | None = None           # {tool: {"properties": {slot: {"x-source": "result"|"caller"}}}}
+    guard_side_effects: dict | None = None      # {tool: idempotency-key parameter or None}
+    resume_with_guard: str | None = "by_outcome"  # FC resume contract of a guarded session (None = engine default)
 
 
 class Engine(Protocol):
@@ -126,6 +135,8 @@ class Session:
         self.func_ids: list[int] = []
         self.audio_frame = 0
         self.closed = False
+        self.guard = None
+        self.guard_summary = None
         self.text = []
         self.func_text = []
         # application-state authority (observer in REFERENCE; policies such as rehydration only in ENHANCED)
@@ -151,6 +162,16 @@ class Session:
             self.engine.multi_call_handler = (self.controller.execute_calls
                                               if self.enh is not None and self.controller is not None
                                               and getattr(self.controller, "tools", None) else None)
+        self.guard = None
+        if (self.mode == Mode.ENHANCED and self.enh is not None and self.enh.call_guard
+                and hasattr(self.engine, "set_session_guard") and getattr(self.engine.session_tools, "names", None)):
+            from mynah_v2.agent.call_guard import CallGuard
+            ledger = getattr(self.controller, "ledger", None) if self.controller is not None else None
+            self.guard = CallGuard(self.enh.guard_schemas, session_id=str(self.tracer.session_id or ""), ledger=ledger,
+                                   side_effects=self.enh.guard_side_effects, response_style=self.enh.guard_style)
+            self.engine.set_session_guard(self.guard, resume=self.enh.resume_with_guard, tracer=self.tracer)
+            if self.controller is not None and getattr(self.controller, "tools", None):
+                self.controller.tools = dict(self.engine.pipeline.tool_registry)   # multi-call path: guarded too
         self.engine.open(system_prompt)
         self.tracer.emit(E.SESSION_OPENED, mode=self.mode.value, prompt_chars=len(system_prompt or ""),
                          enhanced=vars(self.enh) if self.enh else None,
@@ -191,6 +212,8 @@ class Session:
             jt = join_timeout_s if join_timeout_s is not None else (2.0 if kind == "force" else 60.0)
             released = bool(self.engine.release_fc(join_timeout_s=jt))
         self.engine.close()
+        self.guard_summary = (getattr(self.engine, "_v2_guard_summaries", None) or {}).get(
+            getattr(self.engine, "stream_id", None)) if self.guard is not None else None
         s = self.stats
         self.tracer.emit(E.SESSION_CLOSED, kind=kind, chunks_in=s.chunks_in, chunks_to_engine=s.chunks_to_engine,
                          buffered=s.chunks_buffered, replayed=s.chunks_replayed, dropped=s.chunks_dropped,

@@ -40,7 +40,12 @@ See [`docs/research-summary.md`](docs/research-summary.md) (findings and ideas),
   tools are close (throughput 25.9 session-chunks/s, lag ≤ 1.1 s) but still above the budget at p95.
 - **Function calls work but are slow**: tool name, arguments and order are identical to a single session in our
   multi-session gate, but a call cycle takes ~13-15 s end to end with four sessions (fc_merge, the default, trades
-  the per-call latency for far smaller tail-latency spikes for everyone).
+  the per-call latency for far smaller tail-latency spikes for everyone). Measured before the fast phase 2 below.
+- **Tool-call policy is on by default (ENHANCED)**: a per-session call guard (no repeated identical calls, one call at
+  a time, grounded arguments), a resume contract chosen from each call's outcome (keeps dependent chains such as
+  find → prepare, stops the re-call loops after "not found"), and a fast phase 2 (the tool response is fed to the
+  model in one pass instead of one step per token). Nothing to enable; `--no-call-guard` turns the guard off.
+  Details in `docs/architecture.md` ("Function calls").
 - **Model limits** (NVIDIA's card and our tests): English only; spelled IDs and numbers are often misheard; no
   barge-in while a tool runs; about two minutes of trained context.
 - **All numbers come from specific GPUs and synthetic English test speech**; expect different results elsewhere.

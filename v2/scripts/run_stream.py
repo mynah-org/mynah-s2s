@@ -112,6 +112,20 @@ def main():
                     help="persona / instructions placed in NVIDIA's FC prompt template together with the tool schemas "
                          "(text, or @file.txt); default: NVIDIA's default system message")
     ap.add_argument("--tool-delay", type=float, default=0.0)
+    ap.add_argument("--call-guard", action="store_true",
+                    help="(legacy, now the ENHANCED default) per-session call registry + admission control")
+    ap.add_argument("--no-call-guard", action="store_true",
+                    help="ENHANCED without the call guard (and with the engine's own FC resume contract)")
+    ap.add_argument("--guard-resume", choices=["by_outcome", "pad_eotr", "pad_pad", "engine"], default="by_outcome",
+                    help="FC resume contract of a guarded session: by_outcome (default: (PAD,PAD) after a negative / "
+                         "refused result or new caller speech, else (PAD,EOTR)), a fixed (PAD,EOTR) / (PAD,PAD), or the "
+                         "engine's own")
+    ap.add_argument("--asr-shadow", action="store_true",
+                    help="EXPERIMENT (with --call-guard): compare call slots with the caller ASR, observe only")
+    ap.add_argument("--guard-compact", action="store_true",
+                    help="EXPERIMENT (with --call-guard): short refusal responses (FAILED live: loses the outcome)")
+    ap.add_argument("--guard-echo", action="store_true",
+                    help="EXPERIMENT (with --call-guard): a repeat refusal restates the earlier result + a short note")
     ap.add_argument("--override", action="append", default=[], help="cfg key=value (OmegaConf dotlist)")
     presets.add_determinism_args(ap)
     ap.add_argument("--no-llm-cache", action="store_true",
@@ -348,7 +362,14 @@ def main():
             np.random.seed(a.seed)
             torch.manual_seed(a.seed)
             torch.cuda.manual_seed_all(a.seed)
+        if enh is not None:                    # the call guard is the ENHANCED default (Session attaches it)
+            enh.call_guard = not a.no_call_guard
+            enh.guard_style = "echo" if a.guard_echo else "compact" if a.guard_compact else "full"
+            enh.resume_with_guard = None if a.guard_resume == "engine" else a.guard_resume
         sess.open(prompt)
+        if a.asr_shadow and sess.guard is not None:
+            from mynah_v2.agent.call_guard import AsrShadow
+            sess.guard.asr = AsrShadow()
         stop_hook = None
         if a.fc_interrupt:
             import threading
@@ -378,6 +399,7 @@ def main():
         tt = eng.token_tensors()
         recs = list(eng.fc_records)
         sess.close(a.close_kind)
+        cg = sess.guard_summary
         tr.close()
         agent = np.concatenate(agent_chunks) if agent_chunks else np.zeros(0, np.float32)
         sf.write(od / "agent.wav", agent, T.OUTPUT_SR)
@@ -410,6 +432,14 @@ def main():
             "max_mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2),
             "llm_cache": cache_info, "thinker_quant": quant_info, "perf_profile": perf_info,
             "preset": {"name": a.preset, **preset_info}, "determinism": det_info,
+            "call_guard": cg,
+            "sampling": {k: (sorted(v) if isinstance(v, set) else v) for k, v in (
+                ("temperature", getattr(getattr(eng.wrapper, "model_llm_interface", None), "temperature", None)),
+                ("top_p", getattr(getattr(eng.wrapper, "model_llm_interface", None), "top_p", None)),
+                ("repetition_penalty", getattr(getattr(eng.wrapper, "model_llm_interface", None), "repetition_penalty",
+                                               None)),
+                ("special_token_ids", getattr(getattr(eng.wrapper, "model_llm_interface", None), "special_token_ids",
+                                              None)))},
         }
         summ["token_ids"] = {"text": list(sess.text_ids), "func": list(sess.func_ids)}
         if tt is not None:

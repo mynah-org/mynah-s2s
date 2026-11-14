@@ -33,6 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from labpaths import resolve  # noqa: E402  (archived clips: absolute symlinks into the historical layout)
 from session_distill import BOS, EOTC, FRAME, PAD, SOTC, TOL, rule_call_text, session_wav  # noqa: E402
 
 CALL_RE = re.compile(r"<TOOLCALL>(.*)</TOOLCALL>", re.S)
@@ -319,7 +320,7 @@ def main():  # pragma: no cover - GPU
             chunk = sel[b:b + a.batch]
             embs, ends, nfr, uts = [], [], [], []
             for r in chunk:
-                x = sf.read(Path(a.glex_data if r["data"] == "glex" else a.val_data) / r["path"], dtype="float32")[0]
+                x = sf.read(resolve(Path(a.glex_data if r["data"] == "glex" else a.val_data) / r["path"]), dtype="float32")[0]
                 w = session_wav(x, cs, a.tail_s)
                 if audio_mode == "zero":
                     w = w * 0.0

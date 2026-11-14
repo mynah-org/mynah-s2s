@@ -328,3 +328,275 @@ def test_close_frees_everything_and_refuses_late_calls():
     assert g.reg.entries() == [] and not g.issued
     d = g.admit("prepare_return", {"item": "x", "customer_id": "C1002"})
     assert d.rule == "closed" and json.loads(d.response)["status"] == "not_executed"
+
+
+def test_install_wraps_and_restores_the_engine_executor():
+    from types import SimpleNamespace
+
+    from mynah_v2.agent.call_guard import install, summary
+    from mynah_v2.tracing.events import Tracer
+    ran = []
+    pipe = SimpleNamespace(_execute_tool_call=lambda t: (ran.append(t), NF("qgq999"))[1])
+    orig = pipe._execute_tool_call
+    eng = SimpleNamespace(pipeline=pipe)
+    tr = Tracer(None, session_id="s")
+    g = CallGuard(session_id="s")
+    un = install(eng, g, tracer=tr)
+    assert pipe._execute_tool_call is not orig
+    g.on_user_text("order Q Q nine nine nine")
+    c = ct("get_order_status", {"order_id": "qgq999"})
+    pipe._execute_tool_call(c)
+    refused = json.loads(pipe._execute_tool_call(c))
+    assert refused["status"] == "not_executed" and len(ran) == 1
+    ev = [e for e in tr.events if e.name == "tool.guard"]
+    assert [e.fields["allow"] for e in ev] == [True, False] and ev[1].fields["rule"] == "repeat"
+    s = summary(g)
+    assert s["admitted"] == 1 and s["refused"] == {"repeat": 1}
+    un()
+    assert pipe._execute_tool_call is orig and g.closed
+
+
+# ------------------------------------------------------------------ ASR shadow (observe only), ASR text from the traces
+def _shadow_guard(**kw):
+    from mynah_v2.agent.call_guard import AsrShadow
+    return CallGuard(asr_shadow=AsrShadow(intent_tools={"transfer": "escalate_to_human"}), **kw)
+
+
+def test_asr_shadow_slot_checks_on_measured_sessions():
+    cases = [  # (caller ASR as traced, call args, expected per-slot verdict)        live truth
+        ("you check order Wxy six one five.", {"order_id": "WXYY615"}, "mismatch"),   # spoken WXY615: call wrong
+        ("you check order Wxy six one five.", {"order_id": "WXY615"}, "match"),
+        ("my name is Marco Ricci,postcode two zero one two one.", {"postcode": "20012-001"}, "mismatch"),  # call wrong
+        ("my name is Mario Rossi and my postcode is one hundred one two one.", {"postcode": "10121"}, "mismatch"),
+        ("I want to return the bookcase eyebought.Mario Rosie, postcode two zero one three five.",
+         {"postcode": "20135"}, "match"),
+    ]
+    for asr, args, want in cases:
+        g = _shadow_guard()
+        g.on_user_text(asr, model_step=100)
+        d = g.admit("get_order_status", args)
+        assert d.allow                                              # shadow never refuses
+        assert list(g.log[-1]["asr_slots"].values()) == [want], (asr, args)
+    g = _shadow_guard()
+    g.on_user_text("Mario Rossi")
+    g.admit("find_customer", {"full_name": "Mario Rossi"})
+    assert g.log[-1]["asr_slots"] == {}                             # names are not id-like: not checked
+
+
+def test_asr_shadow_transfer_intent_fulfilled_negated_and_absent():
+    from mynah_v2.agent.call_guard import summary
+    g = _shadow_guard()
+    g.on_user_text("I'd like to speak to an operator, please.", model_step=60)
+    r = summary(g)["asr_shadow"]
+    assert [i["intent"] for i in r["unfulfilled"]] == ["transfer"]          # m04: promised, never called
+    g.admit("escalate_to_human", {"reason": "operator"})
+    assert summary(g)["asr_shadow"]["unfulfilled"] == []
+    n = _shadow_guard()
+    n.on_user_text("I don't want to talk to an operator, just check my order.")
+    i = summary(n)["asr_shadow"]["intents"]
+    assert i and i[0]["negated"] and i[0]["fulfilled"] is None and not summary(n)["asr_shadow"]["unfulfilled"]
+    for text in ("I want to know where my order is, but I don't remember the order number",
+                 "I was going to ask about an order, but never mind. Give me a random number between one and five."):
+        o = _shadow_guard()
+        o.on_user_text(text)
+        assert summary(o)["asr_shadow"]["intents"] == []
+
+
+def test_asr_shadow_never_changes_a_decision():
+    seq = [("user", "where is my order? Q, Q, nine, nine, nine.")] + [("get_order_status", {"order_id": "qgq999"},
+                                                                       NF("qgq999"))] * 5
+    assert run(CallGuard(), seq) == run(_shadow_guard(), seq)
+
+
+def test_compact_responses_same_decisions_shorter_text():
+    from mynah_v2.agent.call_guard import COMPACT
+    seq = [("user", "where is my order? Q, Q, nine, nine, nine.")] + [("get_order_status", {"order_id": "qgq999"},
+                                                                       NF("qgq999"))] * 6
+    full, comp = CallGuard(), CallGuard(response_style="compact")
+    rules = []
+    for g in (full, comp):
+        out = []
+        for s_ in seq:
+            if s_[0] == "user":
+                g.on_user_text(s_[1])
+                continue
+            d = g.admit(s_[0], s_[1])
+            out.append((d.rule, d.response))
+            if d.allow:
+                g.complete(d, s_[2])
+        rules.append(out)
+    assert [r for r, _ in rules[0]] == [r for r, _ in rules[1]]           # identical admission
+    for (rule, f), (_, c) in zip(*rules):
+        if rule:
+            assert len(c) < 70 and len(c) < len(f) / 2 and json.loads(c)["next_step"]
+    assert json.loads(rules[1][1][1]) == {"status": "already_done", "next_step": "Tell the caller."}
+    assert set(COMPACT) >= {"repeat", "in_flight", "busy", "side_effect_done", "side_effect_unknown", "ungrounded",
+                            "budget", "closed"}
+    try:
+        CallGuard(response_style="tiny")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+def test_spoken_spans_whole_runs_only():
+    from mynah_v2.agent.call_guard import spoken_spans
+    assert "XYZ123" in spoken_spans("Hi, where is my order X Y Z one two three?")
+    assert "WXY615" in spoken_spans("you check order Wxy six one five.")
+    assert "20135" in spoken_spans("I'm Mario Rosie, postcode two zero one three five.")
+    assert "99999999" in spoken_spans("I'm Anna, post code nine nine nine nine nine nine nine nine.")
+    assert "9999" not in spoken_spans("post code nine nine nine nine nine nine nine nine.")
+    g = _shadow_guard()
+    g.on_user_text("morning. I'm anniverspost code nine nine nine nine nine nine nine nine.has my order shipped")
+    g.admit("find_customer", {"postcode": "9999"})
+    assert g.log[-1]["asr_slots"] == {"postcode": "mismatch"}            # m11: the old substring rule said match
+
+
+def test_transfer_intent_labelled_sentences():
+    """Synthetic labelled set (negations and look-alikes): transfer / negated / none."""
+    from mynah_v2.agent.call_guard import summary
+    cases = {
+        "I'd like to speak to an operator, please.": "transfer",
+        "Can you transfer me to a real person?": "transfer",
+        "Put me through to someone who can help.": "transfer",
+        "I want to talk to a human.": "transfer",
+        "Connect me with a representative.": "transfer",
+        "I don't want to speak to an operator, just tell me the status.": "negated",
+        "No need to transfer me to anyone, I'm fine.": "none",
+        "Please do not connect me to an agent.": "negated",
+        "Never mind the operator, where is my order?": "none",
+        "My order number is X Y Z one two three.": "none",
+        "The courier said someone would call me.": "none",
+        "Is a human going to deliver it or a drone?": "none",
+    }
+    for text, want in cases.items():
+        g = _shadow_guard()
+        g.on_user_text(text)
+        intents = summary(g)["asr_shadow"]["intents"]
+        got = "none" if not intents else ("negated" if intents[0]["negated"] else "transfer")
+        assert got == want or (want == "none" and got == "negated"), (text, got)
+
+
+def test_echo_refusal_restates_the_earlier_outcome():
+    from mynah_v2.agent.call_guard import ECHO_NOTE
+    g = CallGuard(response_style="echo")
+    g.on_user_text("check order W x y six one five.")
+    a = {"order_id": "WXYY615"}
+    g.complete(g.admit("get_order_status", a), NF("WXYY615"))
+    r = g.admit("get_order_status", a)
+    assert r.rule == "repeat"
+    assert json.loads(r.response) == {"order_id": "WXYY615", "found": False, "note": ECHO_NOTE}   # outcome kept
+    assert len(r.response) < 100
+    full = CallGuard()
+    full.on_user_text("x")
+    full.complete(full.admit("get_order_status", a), NF("WXYY615"))
+    assert full.admit("get_order_status", a).rule == r.rule                                   # same admission
+    for _ in range(3):                                   # past the budget: the compact budget text, still a response
+        r = g.admit("get_order_status", a)
+    assert json.loads(r.response)["next_step"]
+
+
+def test_attach_session_guard_wraps_bound_tools_and_detach_clears():
+    from types import SimpleNamespace
+
+    from mynah_v2.agent.call_guard import attach_session_guard, detach_session_guard
+    from mynah_v2.model.session_tools import SessionToolBinding
+    ran = []
+    reg = {"builtin": lambda a: "b"}
+    binding = SessionToolBinding(reg)
+    binding.bind({"get_order_status": lambda a: (ran.append(a), NF("qgq999"))[1]})
+    eng = SimpleNamespace(session_tools=binding, stream_id=7)
+    g = CallGuard(session_id="s")
+    attach_session_guard(eng, g)
+    from mynah_v2.agent.call_guard import session_guard
+    assert session_guard(eng) is g and eng._v2_resume_by_stream == {7: "by_outcome"}
+    assert not hasattr(reg["builtin"], "__v2_call_guard__")           # only the session's own tools are guarded
+    g.on_user_text("order Q Q nine")
+    assert json.loads(reg["get_order_status"]({"order_id": "qgq999"}))["found"] is False
+    assert json.loads(reg["get_order_status"]({"order_id": "qgq999"}))["status"] == "not_executed"
+    assert len(ran) == 1
+    attach_session_guard(eng, g)                                       # idempotent: not wrapped twice
+    assert reg["get_order_status"].__wrapped__.__wrapped__ is not None
+    s = detach_session_guard(eng)
+    assert s["admitted"] == 1 and s["refused"] == {"repeat": 1}
+    assert session_guard(eng) is None and eng._v2_resume_by_stream == {} and eng._v2_guard_summaries[7] == s
+    binding.unbind()
+    assert set(reg) == {"builtin"}
+
+
+def test_session_attaches_the_guard_by_default_in_enhanced_only():
+    from types import SimpleNamespace
+
+    import torch
+
+    from mynah_v2.model.session_tools import SessionToolBinding
+    from mynah_v2.runtime.session import EnhancedOptions, Mode, Session
+    from mynah_v2.tracing.events import Tracer
+
+    class Eng:
+        chunk_samples = 2560
+
+        def __init__(self):
+            self.pipeline = SimpleNamespace(tool_registry={})
+            self.session_tools = SessionToolBinding(self.pipeline.tool_registry)
+            self.session_tools.bind({"t": lambda a: "{}"})
+            self.stream_id = 0
+            self.opened = 0
+
+        def set_session_guard(self, guard, resume="pad_eotr", tracer=None):
+            from mynah_v2.agent.call_guard import attach_session_guard
+            attach_session_guard(self, guard, resume=resume, tracer=tracer)
+
+        def open(self, p):
+            self.opened += 1
+
+        def close(self):
+            from mynah_v2.agent.call_guard import detach_session_guard
+            detach_session_guard(self)
+
+        def fc_active(self):
+            return False
+
+        def step(self, x, is_last=False):
+            raise AssertionError
+
+    e = Eng()
+    s = Session(e, Tracer(None, session_id="x"), Mode.ENHANCED, EnhancedOptions())
+    s.open(None)
+    assert s.guard is not None and e._v2_resume_by_stream == {0: "by_outcome"}
+    s.close("cancel")
+    assert s.guard_summary is not None and e._v2_resume_by_stream == {}
+    e2 = Eng()
+    r = Session(e2, Tracer(None, session_id="y"), Mode.REFERENCE, None)
+    r.open(None)
+    assert r.guard is None and not getattr(e2, "_v2_resume_by_stream", None)   # REFERENCE stays NVIDIA's behaviour
+    e3 = Eng()
+    o = Session(e3, Tracer(None, session_id="z"), Mode.ENHANCED, EnhancedOptions(call_guard=False))
+    o.open(None)
+    assert o.guard is None
+
+
+# ------------------------------------------------------------------ resume "by_outcome" (EXPERIMENT)
+def test_resume_by_outcome_follows_the_last_call():
+    """(PAD, EOTR) after a positive result (a chain may follow), (PAD, PAD) after a negative or refused one or when the
+    caller spoke after the call; (PAD, EOTR) while a call is in flight or before any call."""
+    g = CallGuard()
+    assert g.resume_contract() == "pad_eotr"                        # no call yet
+    g.on_user_text("find me, Mario Rossi, 20135")
+    d = g.admit("find_customer", {"full_name": "Mario Rossi"})
+    assert g.resume_contract() == "pad_eotr"                        # in flight (phase-1 hand-back)
+    g.complete(d, json.dumps({"status": "found", "customer_id": "C1002"}))
+    assert g.resume_contract() == "pad_eotr"                        # positive: the chain stays possible
+    d = g.admit("prepare_return", {"customer_id": "C1002"})
+    g.complete(d, json.dumps({"status": "not_found"}))
+    assert g.resume_contract() == "pad_pad"                         # negative
+    r = g.admit("prepare_return", {"customer_id": "C1002"})
+    assert not r.allow and g.resume_contract() == "pad_pad"         # refused repeat
+    g.on_user_text("ok try order X Y Z")
+    d = g.admit("get_order_status", {"order_id": "XYZ"})
+    g.complete(d, json.dumps({"order_id": "XYZ", "found": True}))
+    g.on_user_text("and also")                                      # the caller spoke after the call
+    assert g.resume_contract() == "pad_pad"
+    assert [x["contract"] for x in g.resume_log] == ["pad_eotr"] * 3 + ["pad_pad"] * 3
+    from mynah_v2.agent.call_guard import summary
+    assert summary(g)["resume"][-1]["contract"] == "pad_pad"

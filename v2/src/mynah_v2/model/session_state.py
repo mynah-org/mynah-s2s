@@ -518,7 +518,7 @@ class MultiSessionEngine:
         self.store.restore(sid)
 
     def open(self, sid: SessionId, system_prompt: str | None, tools: dict | None = None, seed: int | None = None,
-             fc_wait_s: float = 10.0) -> int:
+             fc_wait_s: float = 10.0, guard: bool | dict = True) -> int:
         self._check_eartts_slots()
         if sid in self.store.sids():
             raise SessionStateError(f"session {sid!r} already open")
@@ -531,6 +531,9 @@ class MultiSessionEngine:
         self.store.restore(sid)
         if tools:
             self.engine.bind_session_tools(tools)
+            if guard:                                    # default ON: every session's tools behind its own guard
+                from mynah_v2.agent.call_guard import CallGuard
+                self.engine.set_session_guard(CallGuard(session_id=str(sid), **(guard if isinstance(guard, dict) else {})))
         self.engine.open(system_prompt, fc_wait_s=fc_wait_s)
         return stream
 

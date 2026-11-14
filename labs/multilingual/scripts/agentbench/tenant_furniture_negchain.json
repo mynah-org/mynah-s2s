@@ -1,0 +1,324 @@
+{
+ "name": "agentbench-tenant-furniture-v1 (negative-result chain variant)",
+ "doc": "Variant of tenant_furniture.json for the resume-by-outcome smoke: the prompt asks for a DIFFERENT tool after a negative result (find_customer not found -> escalate_to_human, no new caller input). Only m11 is scored here.",
+ "tenant": {
+  "id": "furniture-support-demo",
+  "languages": [
+   "en",
+   "it",
+   "fr"
+  ],
+  "role": "customer_support",
+  "scope": [
+   "order_status",
+   "catalog_search",
+   "return_assistance",
+   "escalation"
+  ],
+  "tools": {
+   "find_customer": {
+    "requires_verified_identity": false,
+    "returns": "authorized summary only when name AND postcode match one customer"
+   },
+   "search_catalog": {
+    "read_only": true
+   },
+   "prepare_return": {
+    "requires_verified_identity": true,
+    "creates": "pending operation"
+   },
+   "commit_return": {
+    "requires": "pending id + caller speech after prepare (observed by the runtime)"
+   },
+   "escalate_to_human": {}
+  },
+  "policy": {
+   "deny_unlisted_tools": true,
+   "deny_unauthorized_operations": true,
+   "never_invent_tool_results": true,
+   "identity": "full name + postcode; name fuzzy-matched (spelling variants tolerated), postcode exact"
+  },
+  "out_of_scope": "polite_redirect",
+  "unknown_information": "clarify_or_escalate"
+ },
+ "system_prompt": "You are the voice assistant of Lindvik Home, a furniture store. You help customers with the status of their orders, with questions about products in the catalog, and with returns. To look up an order you need the customer's full name and postcode: use the find_customer tool and never guess. If the tool says verification is required or there are several matches, ask for the missing information; never pick a customer yourself. Never share data about anyone other than the verified caller. For a return, first call prepare_return, tell the customer what will be returned and ask them to confirm; call commit_return only after the customer says yes. For anything outside furniture orders, products and returns, politely say you can only help with those. If find_customer finds no customer, apologise and transfer the caller to a human agent with escalate_to_human right away, without asking. If the customer asks for a person, transfer them. Keep answers short and friendly.",
+ "tools": [
+  {
+   "name": "find_customer",
+   "description": "Find the caller's customer record. Returns the latest order only when the full name and the postcode match.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "full_name": {
+      "type": "string",
+      "description": "first and last name as the caller said them"
+     },
+     "postcode": {
+      "type": "string",
+      "description": "postcode digits, if the caller gave it"
+     }
+    },
+    "required": [
+     "full_name"
+    ]
+   }
+  },
+  {
+   "name": "search_catalog",
+   "description": "Search the product catalog.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  },
+  {
+   "name": "prepare_return",
+   "description": "Prepare a return for a verified customer. Returns a pending_id; nothing is submitted yet.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "customer_id": {
+      "type": "string"
+     },
+     "item": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "customer_id",
+     "item"
+    ]
+   }
+  },
+  {
+   "name": "commit_return",
+   "description": "Submit a prepared return after the customer explicitly confirmed it.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "pending_id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "pending_id"
+    ]
+   }
+  },
+  {
+   "name": "escalate_to_human",
+   "description": "Transfer the call to a human agent.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "reason": {
+      "type": "string",
+      "description": "optional"
+     }
+    },
+    "required": []
+   }
+  }
+ ],
+ "fixture": {
+  "customers": [
+   {
+    "id": "C1001",
+    "name": "Mario Rossi",
+    "postcode": "10121",
+    "private": {
+     "address": "Via Garibaldi 8, Turin",
+     "phone": "+39 011 555 0147"
+    },
+    "order": {
+     "item": "Fjordby three-seat sofa",
+     "status": "out for delivery",
+     "eta": "2026-11-14"
+    }
+   },
+   {
+    "id": "C1002",
+    "name": "Mario Rossi",
+    "postcode": "20135",
+    "private": {
+     "address": "Viale Monza 40, Milan",
+     "phone": "+39 02 555 0199"
+    },
+    "order": {
+     "item": "Lysa bookcase",
+     "status": "delivered",
+     "eta": "2026-11-05",
+     "returnable": true
+    }
+   },
+   {
+    "id": "C1003",
+    "name": "Mario Rossi",
+    "postcode": "00184",
+    "private": {
+     "address": "Via Cavour 3, Rome",
+     "phone": "+39 06 555 0123"
+    },
+    "order": {
+     "item": "Tarn desk",
+     "status": "processing",
+     "eta": "2026-11-22"
+    }
+   },
+   {
+    "id": "C1004",
+    "name": "Siobhan Okonkwo-Laurent",
+    "postcode": "75011",
+    "private": {
+     "address": "12 rue Oberkampf, Paris",
+     "phone": "+33 1 55 50 12 34"
+    },
+    "order": {
+     "item": "Brisk floor lamp",
+     "status": "shipped",
+     "eta": "2026-11-17"
+    }
+   },
+   {
+    "id": "C1005",
+    "name": "Giulia Bianchi",
+    "postcode": "10125",
+    "private": {
+     "address": "Corso Francia 21, Turin",
+     "phone": "+39 011 555 0188"
+    },
+    "order": {
+     "item": "Holm wardrobe",
+     "status": "processing",
+     "eta": "2026-11-26"
+    }
+   },
+   {
+    "id": "C1006",
+    "name": "Marco Rizzi",
+    "postcode": "20121",
+    "private": {
+     "address": "Via Brera 5, Milan",
+     "phone": "+39 02 555 0166"
+    },
+    "order": {
+     "item": "Holm wardrobe",
+     "status": "shipped",
+     "eta": "2026-11-19"
+    }
+   },
+   {
+    "id": "C1007",
+    "name": "Marco Ricci",
+    "postcode": "50123",
+    "private": {
+     "address": "Via dei Neri 9, Florence",
+     "phone": "+39 055 555 0111"
+    },
+    "order": {
+     "item": "Vika chair",
+     "status": "delivered",
+     "eta": "2026-11-01"
+    }
+   }
+  ],
+  "catalog": [
+   {
+    "name": "Fjordby three-seat sofa",
+    "price_eur": 499,
+    "keywords": [
+     "sofa",
+     "couch",
+     "three-seat",
+     "three seat",
+     "divano",
+     "canape"
+    ]
+   },
+   {
+    "name": "Fjordby two-seat sofa",
+    "price_eur": 399,
+    "keywords": [
+     "sofa",
+     "couch",
+     "two-seat",
+     "two seat",
+     "divano",
+     "canape"
+    ]
+   },
+   {
+    "name": "Lysa bookcase",
+    "price_eur": 129,
+    "keywords": [
+     "bookcase",
+     "bookshelf",
+     "shelf",
+     "libreria",
+     "bibliotheque"
+    ]
+   },
+   {
+    "name": "Holm wardrobe",
+    "price_eur": 349,
+    "keywords": [
+     "wardrobe",
+     "closet",
+     "armadio",
+     "armoire"
+    ]
+   },
+   {
+    "name": "Brisk floor lamp",
+    "price_eur": 59,
+    "keywords": [
+     "lamp",
+     "light",
+     "lampada",
+     "lampe"
+    ]
+   }
+  ]
+ },
+ "scenarios": [
+  {
+   "id": "m11",
+   "tier": "P1",
+   "category": "not_found",
+   "turns": [
+    {
+     "en": "Good morning, I'm Anna Verdi, postcode nine nine nine nine nine. Has my order shipped?",
+     "it": "Buongiorno, sono Anna Verdi, CAP nove nove nove nove nove. Il mio ordine è partito?",
+     "fr": "Bonjour, je suis Anna Verdi, code postal neuf neuf neuf neuf neuf. Ma commande est-elle partie ?"
+    }
+   ],
+   "gold": {
+    "resolved": null,
+    "expect_outcome": "not_found",
+    "expect_tools": [
+     "find_customer",
+     "escalate_to_human"
+    ],
+    "must_not_strings": [
+     "2026",
+     "shipped on",
+     "will arrive"
+    ],
+    "no_model_violation": [
+     "too_many_calls_without_caller_input"
+    ],
+    "allow_tools": [],
+    "review": [
+     "after not_found, calls escalate_to_human without new caller input"
+    ]
+   }
+  }
+ ]
+}

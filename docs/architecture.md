@@ -54,7 +54,30 @@ also runs one EarTTS step and one codec decode to keep the speech caches aligned
   default on; `--fc-merge off` restores the batch-size-1 service). This removed the tail-latency bursts that
   occurred when a whole call cycle was served inside a few rounds (see `benchmarks.md`); the trade-off is a longer
   call cycle (~3 s on L40S in our workload);
-- a tool controller keeps a call ledger, call/session epochs, timeouts, cancellation and a grounding audit.
+- a tool controller keeps a call ledger, call/session epochs, timeouts, cancellation and a grounding audit;
+- a **call guard** per session (`v2/src/mynah_v2/agent/call_guard.py`, ENHANCED default) sits in front of the bound
+  tool handlers, for one session and for several (the routed per-session registry). It keys every call by
+  (session, caller-speech epoch, tool, canonical arguments) and refuses, with a structured tool response the model
+  reads, a call that is identical to one already answered while the caller has not spoken since (`repeat`), the same
+  call still running (`in_flight`), a second call while one runs (`busy`), further calls after repeated unproductive
+  results without new caller input (`budget`), a repeated side-effecting call without an idempotency key, and an
+  argument that must come from an earlier tool result but does not (`x-source: result`). Refused calls never reach
+  the backend. The decisions are traced (`tool.guard`) and summarised per session;
+- the **resume contract** after a call (what the function channel is fed when the model resumes) is chosen per call
+  by the guard (`by_outcome`, default): the end-of-tool-response token after a productive result, so a dependent call
+  can follow (e.g. `find_customer` → `prepare_return`), padding after a negative, timed-out or refused result or
+  when the caller spoke after the call. With the end-of-response token after every call the official checkpoint
+  re-issued the identical call after 10 of 11 negative results (0 of 13 positive ones) and could then miss the
+  caller's next request; with padding after every call it lost the dependent chain. `--guard-resume
+  pad_eotr|pad_pad|engine` fixes one contract;
+- **fast phase 2** (perf experiments `fc_phase2_notts`, `fc_phase2_prefill`, in the `release` presets): the forced
+  tool-response tokens (one Thinker step each in the reference, plus one EarTTS step and one codec decode whose audio
+  nobody plays) run without the speech work and as one Thinker continuation over all positions (Mamba recurrence per
+  position with the same kernels, attention with an explicit causal mask, chunks of 16 rows). The decisions are the
+  same as the step-by-step reference (replay gate); the spoken answer starts sooner after a call. Multi-session
+  presets use the continuation only: with both pieces the other session's rounds slowed down while one session was
+  in a call (cause not identified). The int8 MLP kernel used by the continuation is tuned once and the result is
+  cached on disk.
 
 ## Correctness checks
 

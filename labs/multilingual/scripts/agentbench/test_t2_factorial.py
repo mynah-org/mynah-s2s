@@ -85,8 +85,13 @@ def test_variant_prompt_and_plan():
     base = "You are the voice assistant."
     assert F.variant_prompt(base, "base") == base and F.variant_prompt(base, "p3") == base
     assert F.variant_prompt(base, "p1").endswith(F.P1_RULE) and F.variant_prompt(base, "p1p3") == F.variant_prompt(base, "p1")
-    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1", "orig", "orig"]
-    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3", "orig", "typed"]
+    assert [F.prompt_variant(v) for v in F.VARIANTS] == ["orig", "p1", "orig", "p1", "orig", "orig", "app", "appnt",
+                                                         "orig"]
+    assert [F.result_variant(v) for v in F.VARIANTS] == ["orig", "orig", "p3", "p3", "orig", "typed", "orig", "orig",
+                                                         "orig"]
+    assert F.variant_prompt(base, "app").endswith(F.APP_CONTRACT)
+    assert F.variant_prompt(base, "appnt").endswith(F.APP_CONTRACT + " /no_think")
+    assert "at most one tool call at a time" in F.APP_CONTRACT and "Never invent" in F.APP_CONTRACT
     assert "do not retry the tool call for the same request" in F.P1_RULE and F.SOTC_BIAS < 0
     assert F.parse_plan("m08_vr:A:p1,m07_chain:A", [], [], []) == [("m08_vr", "A", "p1"), ("m07_chain", "A", "base")]
     assert F.parse_plan("", ["m08_vr", "m07_chain"], ["A"], ["base", "p3"]) == [
@@ -141,3 +146,15 @@ def test_gate_reply_state():
     g = F.gate("t13_found", _cell("reply"), call)
     assert g["reply"] and g["variant_pass"]
     assert F.gate("t14_nf", _cell("new_call", call, 176), call)["identical_recall"]
+
+
+def test_gpu_only_main_has_no_undefined_names():
+    """main() runs only on the GPU: a static check catches a broken edit before a GPU job does (job 129: NameError)."""
+    import pytest
+    api = pytest.importorskip("pyflakes.api")
+    from pyflakes import reporter
+    import io
+    out, err = io.StringIO(), io.StringIO()
+    api.checkPath(str(Path(__file__).resolve().parent / "t2_factorial.py"), reporter.Reporter(out, err))
+    bad = [l for l in out.getvalue().splitlines() if "undefined name" in l or "referenced before assignment" in l]
+    assert not bad, bad

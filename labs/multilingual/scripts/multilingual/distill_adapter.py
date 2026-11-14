@@ -30,6 +30,7 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from labpaths import resolve  # noqa: E402  (archived clips: absolute symlinks into the historical layout)
 
 FRAME = 1280  # samples per 80 ms frame
 
@@ -119,7 +120,7 @@ def cmd_prep(a):
     t0 = time.monotonic()
     for b in range(0, len(ids), a.batch):
         chunk = ids[b:b + a.batch]
-        wavs = [sf.read(root / by[i]["en"]["path"], dtype="float32")[0] for i in chunk]
+        wavs = [sf.read(resolve(root / by[i]["en"]["path"]), dtype="float32")[0] for i in chunk]
         L = int(math.ceil((max(len(w) for w in wavs) + tail) / FRAME) * FRAME)
         embs, ends = [], []
         for w in wavs:
@@ -138,7 +139,7 @@ def cmd_prep(a):
               f"{out['items'][chunk[0]]['teacher_text'][:90]!r}", flush=True)
     for i in ids:
         for lang, r in by[i].items():
-            w = sf.read(root / r["path"], dtype="float32")[0]
+            w = sf.read(resolve(root / r["path"]), dtype="float32")[0]
             L = int(math.ceil((len(w) + tail + 2 * FRAME) / FRAME) * FRAME)
             f = ml(torch.from_numpy(pad_to(w, L)))["out"].half().cpu()
             feats[f"{i}|{lang}"] = f
@@ -236,7 +237,7 @@ class LiveML:
 
     def _wav(self, key):
         if key not in self.wav:
-            w = sf.read(self.path[key], dtype="float32")[0]
+            w = sf.read(resolve(self.path[key]), dtype="float32")[0]
             L = int(math.ceil((len(w) + self.tail + 2 * FRAME) / FRAME) * FRAME)
             self.wav[key] = torch.from_numpy(pad_to(w, L))
         return self.wav[key]

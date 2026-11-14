@@ -25,8 +25,13 @@ from __future__ import annotations
 import sys
 import traceback
 
-_SINGLE_EXP = "thinker_graph,wor:w8:mlp,codec_nosync,codec_fc_d2h,codec_fc_2codes,eartts_rvq_cache"
-_MULTI_EXP = "wor:w8:mlp,codec_nosync,codec_fc_d2h,codec_fc_2codes,eartts_rvq_cache"
+# fc_phase2_notts + fc_phase2_prefill: FC phase 2 (the forced tool-response tokens) without EarTTS / codec work and as
+# one Thinker continuation forward (replay gate: same decisions; live: same tool calls, the answer starts sooner).
+# Several sessions use the continuation only: with both pieces the other session's rounds slowed down while one
+# session was in a tool call (pair latency p95 up), with the continuation alone they did not (measured, cause open).
+_FC_FAST = "fc_phase2_notts,fc_phase2_prefill"
+_SINGLE_EXP = "thinker_graph,wor:w8:mlp,codec_nosync,codec_fc_d2h,codec_fc_2codes,eartts_rvq_cache," + _FC_FAST
+_MULTI_EXP = "wor:w8:mlp,codec_nosync,codec_fc_d2h,codec_fc_2codes,eartts_rvq_cache,fc_phase2_prefill"
 _MULTI_COMMON = {"graphs": 1, "profile": "optimized-graph-s4", "perc_batch": "graph", "codec_batch": "on",
                  "eartts_batch": "on", "eartts_rng": "session", "capture_policy": "precapture", "fc_merge": "on",
                  "rnnt_overlap": "on", "breakdown": True}

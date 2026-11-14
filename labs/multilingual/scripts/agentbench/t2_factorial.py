@@ -45,8 +45,9 @@ from t1_probe import BOS, EOS, EOTC, PAD, SOTC, Thinker, fc_call, frame_tokens, 
 
 EOTR = 22
 CONTRACTS = "0/0,12/12,12/0,0/22,12/22,12/22s"
-# first-cell wall estimates for the budget guard (job 278: m08 41 s = 225 forced steps + 5 re-call decodes, ~85 ms/step)
-FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 55.0, "m03_empty": 40.0, "m02_nf": 35.0, "t14_nf": 32.0,
+# first-cell wall estimates for the budget guard (job 278: m08 41 s = 225 forced steps + 5 re-call decodes, ~85 ms/step;
+# m07 measured 29.4-29.5 s in jobs 111/112)
+FIRST_CELL_S = {"m08_vr": 42.0, "m07_chain": 32.0, "m03_empty": 40.0, "m02_nf": 35.0, "t14_nf": 32.0,
                 "t13_found": 35.0}
 FX1 = MYNAH_HOME / "results/v2/fcfix/FX1-fix"
 RES = LAB_HOME / "results/agentbench"
@@ -113,7 +114,19 @@ SCEN["m07_chain"]["live_outcome"] = "chain"
 #         (fc_sotc_boost is read and logged, never applied); this measures whether one would separate the cases.
 # The teacher-forced history was recorded under the original prompt: for p1 the cell measures the post-result
 # decision on that history, not whether the model would have reached it (own_text_mismatch_0_s reports that).
-VARIANTS = ("base", "p1", "p3", "p1p3", "b2", "typed")
+VARIANTS = ("base", "p1", "p3", "p1p3", "b2", "typed", "app", "appnt", "p2pre")
+# p2pre (owner GO 2026-11-14, FC fast path (ii)): the same cell also consumes FC phase 2 with ONE continuation forward
+# (mynah_v2.model.fc_phase2_prefill) from a clone of the cache taken before phase 2; EOTR logits, the first resume frame
+# and every contract outcome are reported for both (sequential = "contracts", prefill = "contracts_p2pre").
+# explicit application contract for tools (owner 2026-11-14, configurability workstream B), appended to the tenant
+# system message or to NVIDIA's default message; "appnt" adds the text "/no_think" (a plain prompt string here: the
+# VoiceChat checkpoint has no reasoning mode, this only tests whether the string changes behaviour)
+APP_CONTRACT = ("Rules for tools: make at most one tool call at a time and wait for its result. You may call another "
+                "tool when it needs the result of the previous one, for example an id the previous tool returned. "
+                "Never repeat a call with the same arguments unless the caller gives new information. Never invent "
+                "ids or required details; if one is missing or unclear, ask the caller. If a tool finds nothing, tell "
+                "the caller and ask what to do next. Only help with the tasks your tools support; politely decline "
+                "anything else.")
 P1_RULE = ("Tool-call arguments must be values the user spoke. If a required argument is missing, ask the user; never "
            "guess. If a tool call fails or returns an error, do not retry the tool call for the same request.")
 SOTC_BIAS = -2.0
@@ -121,7 +134,11 @@ NEGATIVE_STATUS = {"not_found", "no_results", "verification_required", "denied"}
 
 
 def variant_prompt(system_prompt: str, variant: str) -> str:
-    return system_prompt + " " + P1_RULE if variant in ("p1", "p1p3") else system_prompt
+    if variant in ("p1", "p1p3"):
+        return system_prompt + " " + P1_RULE
+    if variant in ("app", "appnt"):
+        return system_prompt + "\n\n" + APP_CONTRACT + (" /no_think" if variant == "appnt" else "")
+    return system_prompt
 
 
 def is_negative(r) -> bool:
@@ -186,7 +203,7 @@ def gate(sc: str, cell: dict, call_text: str, contract: str = "12/22") -> dict:
 
 
 def prompt_variant(variant: str) -> str:
-    return "p1" if variant in ("p1", "p1p3") else "orig"
+    return "p1" if variant in ("p1", "p1p3") else variant if variant in ("app", "appnt") else "orig"
 
 
 def parse_plan(plan: str, scenarios, arms, variants) -> list[tuple[str, str, str]]:
@@ -319,10 +336,12 @@ def main():  # pragma: no cover - GPU
     reg_e.schemas += fcmod.DEFAULT_TOOLS
     prompts, ths = {}, {}
     for f_, pv in sorted({(fam(sc), prompt_variant(v)) for sc, _, v in plan} | {("tenant", "orig")}):
-        prompts[(f_, pv)] = (render_prompt(reg.schemas, variant_prompt(spec["system_prompt"], "p1" if pv == "p1" else "base"))
-                             if f_ == "tenant" else render_prompt(reg_e.schemas, fcmod.DEFAULT_SYSTEM_MESSAGE))
+        pvar = pv if pv in ("p1", "app", "appnt") else "base"
+        prompts[(f_, pv)] = (render_prompt(reg.schemas, variant_prompt(spec["system_prompt"], pvar)) if f_ == "tenant"
+                             else render_prompt(reg_e.schemas, variant_prompt(fcmod.DEFAULT_SYSTEM_MESSAGE, pvar)))
         ths[(f_, pv)] = Thinker(eng, prompts[(f_, pv)])   # own prefill embeddings; cache rebuilt per cell (prefill())
     assert len(prompts[("tenant", "orig")]) == 2738, len(prompts[("tenant", "orig")])
+    rep["prompt_text_tail"] = {f"{f_}:{pv}": p[-700:] for (f_, pv), p in prompts.items()}
     if ("engine", "orig") in prompts:                      # = the live FX1 prompt (session.opened / NeMo log)
         assert len(prompts[("engine", "orig")]) == 3366 and ths[("engine", "orig")].P == 789, (
             len(prompts[("engine", "orig")]), ths[("engine", "orig")].P)
@@ -357,7 +376,7 @@ def main():  # pragma: no cover - GPU
         else:
             resp = list(w._build_fc_response_tokens(wrapped))
         tlen = trace_lengths(sess)
-        call_text = ths[(fam(sc), "orig")].decode(call[:-1])
+        call_text = th.decode(call[:-1])               # tokenizer only: any Thinker decodes the same
         v0 = {"call_steps": [len(call), tlen.get("call_steps")], "result_steps": [len(resp) + 1, tlen.get("result_steps")],
               "result_chars": [len(conv), tlen.get("result_chars")],
               "call_has_args": all(str(v) in call_text for v in cfg["args"].values())}
@@ -472,8 +491,13 @@ def main():  # pragma: no cover - GPU
         s, sched = st["s"], st["sched"]
         cache = th.prefill()
         main_pred, fc1, agree, nat, lp_eotr = [], [], [], None, None
+        p2 = {"cache": None, "rows": [], "fl_seq": None}
         for r in sched:
             audio = f[r["audio"][1]] if r["audio"][0] == "feat" else sil
+            if v == "p2pre" and r["kind"] == "fc2":
+                if p2["cache"] is None:
+                    p2["cache"] = th.clone(cache)          # the state right before phase 2
+                p2["rows"].append((audio, r["agent_in"], r["func_in"]))
             tl, fl, cache = th.step(cache, audio, r["agent_in"], r["func_in"])
             if r["kind"] == "main":
                 main_pred.append((int(tl.argmax()), int(fl.argmax())))
@@ -484,6 +508,23 @@ def main():  # pragma: no cover - GPU
             else:
                 lf = logp_rows(fl)
                 nat, lp_eotr = int(lf.argmax()), round(float(lf[EOTR]), 3)
+                p2["fl_seq"] = fl
+        p2res = None
+        if v == "p2pre" and p2["rows"]:
+            from mynah_v2.model.fc_phase2_prefill import continuation_forward
+            tp = time.monotonic()
+            x = th.frames(torch.stack([a_.reshape(-1) for a_, _, _ in p2["rows"]]),
+                          [ag for _, ag, _ in p2["rows"]], [fu for _, _, fu in p2["rows"]])
+            with torch.no_grad():
+                hp = continuation_forward(th.stt.llm, x.contiguous(), p2["cache"])
+                flp = th.stt.function_head(hp[:, -1:])[0, -1]
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            lfp, lfs = logp_rows(flp), logp_rows(p2["fl_seq"])
+            p2res = {"positions": len(p2["rows"]), "prefill_s": round(time.monotonic() - tp, 3),
+                     "nat_last": int(lfp.argmax()), "lp_EOTR_last": round(float(lfp[EOTR]), 3),
+                     "max_abs_dlogp_last": round(float((lfp - lfs).abs().max()), 4),
+                     "same_nat": int(lfp.argmax()) == nat}
         hm = [t_ for t_ in range(s + 1) if main_pred[t_][0] != st["rec"].get(t_, PAD)]
         res = {"arm": arm, "scenario": sc, "variant": v, "prompt": rep["prompts"][f"{fam(sc)}:{prompt_variant(v)}"],
                "n_resp": len(st["resp"]), "schedule_sha": st["sha"], "nat_last": nat, "lp_EOTR_last": lp_eotr,
@@ -494,7 +535,10 @@ def main():  # pragma: no cover - GPU
             res["V1"] = {"text_mismatch": hm[:20], "sotc_at_s": main_pred[s][1] == SOTC,
                          "call_match": fc1 == st["call"], "pass": not hm and main_pred[s][1] == SOTC and fc1 == st["call"]}
         tail = f[s + 1:s + 1 + a.n_free]        # continuation: the live main loop resumes on frame s+1 of the audio
-        for pr in a.contracts.split(","):
+        res["p2pre"] = p2res
+        for cache, key in ([(cache, "contracts")] + ([(p2["cache"], "contracts_p2pre")] if p2res else [])):
+          res.setdefault(key, {})
+          for pr in a.contracts.split(","):  # noqa: E111 (one extra level: sequential and prefilled caches)
             biased = pr.endswith("b")               # "12/22b" = the same contract + the b2 bias, same history/cache
             ta, fa, silent = parse_pair(pr.rstrip("b"))
             bc, pre = th.clone(cache), None
@@ -525,8 +569,8 @@ def main():  # pragma: no cover - GPU
             if o["first"] == "new_call":
                 o["new_call_ids"], o["new_call_text"] = decode_call(th, bc, sil)
             o["reply_text"] = th.decode(o.pop("reply_ids"))
-            res["contracts"][pr] = {"silent_step": pre, "first_frame": rows[0] if rows else pre, "frames": rows[:6],
-                                    "outcome": o}
+            res[key][pr] = {"silent_step": pre, "first_frame": rows[0] if rows else pre, "frames": rows[:6],
+                            "outcome": o}
         res["s"] = round(time.monotonic() - t, 1)
         return res
 
