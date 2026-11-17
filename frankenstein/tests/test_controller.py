@@ -184,3 +184,15 @@ def test_idempotent_and_traced():
                 I("TOOL_CALL", "nano", 5, request_id=1, epoch=0, call_id="c1", uid="x")]}, 6)
     assert [a.kind for a in c.actions].count("CALL_TOOL") == 1
     assert len(tr.of("ctl.intent")) == 4 and all("epoch" in e for e in tr.of("ctl.action"))
+
+
+def test_tokens_of_one_frame_keep_their_order():
+    # E1j regression: several REPLY_TOKENS delivered in the same frame must be spoken in arrival order
+    c = Controller()
+    run(c, {1: [I("WORDS", "asr", 1)], 4: [I("TAKE_TURN", "thinker", 4)]}, 4)
+    for tid in (900001, 12, 5000, 7):
+        c.post(I("REPLY_TOKENS", "nano", 5, payload=[tid], request_id=1, epoch=0))
+    c.post(I("REPLY_DONE", "nano", 5, request_id=1, epoch=0))
+    acts = c.tick(5)
+    assert [a.data["ids"][0] for a in acts if a.kind == "SPEAK"] == [900001, 12, 5000, 7]
+    assert acts[-1].kind == "CLOSE_TURN"

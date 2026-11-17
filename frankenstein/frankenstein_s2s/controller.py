@@ -61,8 +61,11 @@ class Intent:
         if self.source not in SOURCE_RANK:
             raise ValueError(f"unknown source {self.source!r}")
 
-    def sort_key(self):
-        return (PRIORITY[self.kind], SOURCE_RANK[self.source], self.k, str(self.uid or ""), str(self.payload))
+    def sort_key(self, seq: int = 0):
+        # seq = arrival order WITHIN the same source: each source is one ordered stream (E1j: several REPLY_TOKENS
+        # delivered in one frame were reordered when the payload broke the tie). Across sources the order is fixed
+        # by priority and source rank, so arrival order between sources never matters.
+        return (PRIORITY[self.kind], SOURCE_RANK[self.source], self.k, seq)
 
 
 @dataclass
@@ -99,6 +102,7 @@ class Controller:
         self.turn = 0
         self.request_id = 0
         self.inbox: list = []
+        self._seq: dict = {}
         self.applied: set = set()
         self.actions: list = []
         self.calls: dict = {}            # call_id -> status
@@ -117,12 +121,13 @@ class Controller:
     def post(self, it: Intent) -> None:
         self.tr.emit("ctl.intent", it.k, kind=it.kind, source=it.source, epoch=it.epoch, request_id=it.request_id,
                      call_id=it.call_id, uid=it.uid)
-        self.inbox.append(it)
+        self._seq[it.source] = self._seq.get(it.source, 0) + 1
+        self.inbox.append((it, self._seq[it.source]))
 
     def tick(self, k: int) -> list:
         """Apply every intent posted for frames <= k, in priority order; then the per-frame timers."""
-        due = sorted([i for i in self.inbox if i.k <= k], key=Intent.sort_key)
-        self.inbox = [i for i in self.inbox if i.k > k]
+        due = [i for i, _ in sorted([x for x in self.inbox if x[0].k <= k], key=lambda x: x[0].sort_key(x[1]))]
+        self.inbox = [x for x in self.inbox if x[0].k > k]
         out_start = len(self.actions)
         speech_now = any(i.kind in ("USER_SPEECH_START", "USER_SPEECH") for i in due)
         for it in due:
