@@ -96,6 +96,8 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--max-session-s", type=float, default=1200.0)
     ap.add_argument("--idle-timeout", type=float, default=60.0)
     ap.add_argument("--no-gpu-gate", action="store_true", help="do not time-slice frames and text-LLM work (G7)")
+    ap.add_argument("--nano-graph-reply", action="store_true",
+                    help="text-LLM decode graph for the spoken reply (G8; the tool step stays eager)")
     ap.add_argument("--gate-budget-ms", type=float, default=50.0,
                     help="text-LLM time after each frame (G7b policy, the default); 0 = strict frame priority")
     a = ap.parse_args()
@@ -146,12 +148,18 @@ def main():  # pragma: no cover - GPU
     loads["mem_after_all_gb"] = round(mem_available_gb(), 1)
     spec = json.load(open(lab / "agentbench" / "tenant_furniture.json"))
     brief = {"it": BRIEF_IT, "en": "Answer as on a phone call: at most two short sentences, no lists, no markdown."}
+    nano_graph = None
+    if a.nano_graph_reply:
+        from e1.g3b import warm_graph
+        from e1.nano_graph import NanoGraph
+        nano_graph = NanoGraph(nano.backbone, lmax=4096)
+        loads["nano_graph"] = warm_graph(nano_graph, spec, tok, nano, B2)["stats"]
     gate = None
     if not a.no_gpu_gate:
         from e1.gpu_gate import GpuGate
         gate = GpuGate(sync=torch.cuda.synchronize, unit_budget_ms=a.gate_budget_ms)
     eng = FrankensteinEngine(ref, tok, nano, spec, live, proc, lab / "agentbench", POLICY, brief,
-                             max_session_s=a.max_session_s, gate=gate)
+                             max_session_s=a.max_session_s, gate=gate, nano_graph=nano_graph)
     cfg = ServerConfig(host=a.host, port=a.port, trace_dir=str(td), idle_timeout_s=a.idle_timeout)
     cfg.backend_profile = "frankenstein-int4"
     srv = make_server(eng, cfg)

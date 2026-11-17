@@ -189,6 +189,7 @@ class FrankensteinEngine:  # pragma: no cover - GPU (the model-free parts are te
         worker = NanoWorker(self.tok, self.nano, system, tool_schemas(reg), bound, backend, B2.parse_toolcall,
                             max_new=60, tool_step=True, constrained=True)
         worker.reply_soft_cap, worker.graph, worker.gate = 24, self.nano_graph, self.gate
+        worker.graph_reply_only = self.nano_graph is not None      # the tool step always eager (G8)
         worker.start()
         out = _Out()
         player = Player(sr=TALKER_SR, prebuffer_s=0.0)
