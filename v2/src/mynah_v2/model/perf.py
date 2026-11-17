@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import sys
 import types
+import os
 from typing import Callable
 
 import torch
@@ -434,7 +435,10 @@ def _bf16_enable(engine) -> dict:
     bb = m.backbone
     if hasattr(bb, "_v2_fp32_state"):
         return {"already": True}
-    bb._v2_fp32_state = {k: v.detach().clone() for k, v in bb.state_dict().items()}
+    # Keep the reversible A/B snapshot on the host.  Keeping the clone on the
+    # GPU made this experiment look BF16-sized in the module tree while still
+    # retaining the full FP32 backbone allocation during the measurement.
+    bb._v2_fp32_state = {k: v.detach().cpu().clone() for k, v in bb.state_dict().items()}
     bb.to(torch.bfloat16)
     orig = bb.forward
 
@@ -464,6 +468,49 @@ def _bf16_disable(engine) -> None:
 
 
 experiment("eartts_bf16_backbone")((_bf16_enable, _bf16_disable))
+
+
+def _bf16_fused_enable(engine) -> dict:
+    """Compose the validated BF16 EarTTS pieces in graph-safe order.
+
+    The backbone conversion must happen before any EarTTS CUDA graph is
+    captured.  Norm/RVQ patches are reversible and keep the non-backbone
+    modules in their reference FP32 dtype.  This is deliberately a named
+    experiment rather than a default profile: NVIDIA's checkpoint notes that
+    FP32 EarTTS is the quality reference.
+    """
+    info = {"backbone": _bf16_enable(engine)}
+    try:
+        info["backbone_norm"] = _ernorm_enable(engine)
+        info["mog_norm"] = _mognorm_enable(engine)
+        info["rvq_cache"] = _rvq_enable(engine)
+    except Exception:
+        # Keep enable atomic for callers using --strict: undo only patches
+        # installed by this composition before re-raising the real error.
+        try:
+            _rvq_disable(engine)
+        finally:
+            try:
+                _mognorm_disable(engine)
+            finally:
+                try:
+                    _ernorm_disable(engine)
+                finally:
+                    _bf16_disable(engine)
+        raise
+    return {"eartts_bf16_fused": info}
+
+
+def _bf16_fused_disable(engine) -> None:
+    # Reverse the dependency order: restore the dynamic generate_step and
+    # norm forwards before moving the backbone parameters back to FP32.
+    _rvq_disable(engine)
+    _mognorm_disable(engine)
+    _ernorm_disable(engine)
+    _bf16_disable(engine)
+
+
+experiment("eartts_bf16_fused")((_bf16_fused_enable, _bf16_fused_disable))
 
 
 # ------------------------------------------------------------------------------------------------ weight-only formats
@@ -581,6 +628,7 @@ experiment("fc_phase2_prefill")((lambda e: __import__("mynah_v2.model.fc_phase2_
 # multi-session: 2 slots per session (main loop + FC fast path); same graphs/numerics, only the slot pool is larger
 experiment("eartts_graph_full_s4")((lambda e: _full_enable(e, slots=4), _full_disable))
 PROFILES["optimized-graph"] = ("mamba_host_pos", "no_timer_sync", "eartts_graph_full", "eartts_fused_rmsnorm")
+PROFILES["optimized-bf16"] = ("mamba_host_pos", "no_timer_sync", "eartts_bf16_fused", "eartts_graph_full")
 PROFILES["optimized-graph-s4"] = ("mamba_host_pos", "no_timer_sync", "eartts_graph_full_s4", "eartts_fused_rmsnorm")
 experiment("eartts_graph_full_s8")((lambda e: _full_enable(e, slots=8), _full_disable))
 PROFILES["optimized-graph-s8"] = ("mamba_host_pos", "no_timer_sync", "eartts_graph_full_s8", "eartts_fused_rmsnorm")
@@ -776,8 +824,512 @@ def _rvq_disable(engine) -> None:
 
 
 experiment("eartts_rvq_cache")((_rvq_enable, _rvq_disable))
+
+
+# ``eartts_rvq_q4`` only replaces the hot depth-sum gather. The residual
+# argmin encoder still consumes the original BF16 table, because changing its
+# distances can change later code selections; a fused quantized encoder is a
+# separate correctness gate.
+def _rvq_q4_enable(engine) -> dict:
+    from mynah_v2.model.rvq_q4 import RVQInt4Embedding, RVQInt4Encoder
+
+    m = _find_eartts(engine)
+    if hasattr(m, "_v2_rvq_q4"):
+        return {"rvq_q4": "already_enabled"}
+    q = RVQInt4Embedding(m.rvq_embs)
+    original = m.__dict__.get("depthsum_embedding")
+    use_encoder = os.environ.get("MYNAH_INT4_RVQ_ENCODE", "0") == "1"
+
+    def depthsum(self, code):
+        return self._v2_rvq_q4(code)
+
+    m._v2_rvq_q4 = q
+    m._v2_rvq_q4_original = original
+    encoder = None
+    if use_encoder:
+        original_step = m.__dict__.get("_v2_depthsum_step")
+        m._v2_rvq_q4_original_step = original_step
+        encoder = RVQInt4Encoder(q)
+        m._v2_rvq_q4_encoder = encoder
+
+        def encode_step(self, embs, residual, code, depth_str=0, k=72):
+            return self._v2_rvq_q4_encoder(residual, code, depth_str, k)
+
+        m._v2_depthsum_step = types.MethodType(encode_step, m)
+    m.depthsum_embedding = types.MethodType(depthsum, m)
+    torch.cuda.empty_cache()
+    return {"rvq_q4": True, "shape": list(m.rvq_embs.shape), "bytes": q.nbytes(),
+            "encode_table": "Q4_fused" if encoder is not None else "BF16",
+            "encoder_bytes": encoder.nbytes() if encoder is not None else 0}
+
+
+def _rvq_q4_disable(engine) -> None:
+    m = _find_eartts(engine)
+    original = m.__dict__.pop("_v2_rvq_q4_original", None)
+    original_step = m.__dict__.pop("_v2_rvq_q4_original_step", None)
+    # These are assigned nn.Modules and therefore live in ``_modules``;
+    # removing only from __dict__ leaves a stale registered child and makes a
+    # subsequent enable/disable cycle retain the old GPU allocation.
+    m._modules.pop("_v2_rvq_q4", None)
+    m._modules.pop("_v2_rvq_q4_encoder", None)
+    if original is not None:
+        m.depthsum_embedding = original
+    else:
+        m.__dict__.pop("depthsum_embedding", None)
+    if original_step is not None:
+        m._v2_depthsum_step = original_step
+    else:
+        m.__dict__.pop("_v2_depthsum_step", None)
+
+
+experiment("eartts_rvq_q4")((_rvq_q4_enable, _rvq_q4_disable))
+
+
+# --- codec_depthwise_q4: fused small-K depthwise convolution -----------------
+# The causal cache supplies the left context, so ConvNeXt's depthwise layer
+# itself is a plain [B,C,T] -> [B,C,T-K+1] convolution.  These filters are too
+# narrow for tinygemm; the dedicated kernel dequantizes each nibble in the
+# K-tap dot product.  Keep this opt-in until waveform parity/RTF is measured on
+# the target GPU: it is a bandwidth reduction, not a promise of a faster
+# launch for every codec chunk size.
+def _codec_depthwise_q4_enable(engine) -> dict:
+    from mynah_v2.model.depthwise_q4 import DepthwiseConv1dQ4
+
+    codec = engine.wrapper.model.tts_model.audio_codec
+    if hasattr(codec, "_v2_depthwise_q4_originals"):
+        return {"codec_depthwise_q4": "already_enabled"}
+    originals = []
+    replaced = 0
+    bytes_q4 = 0
+    for path, block in list(codec.named_modules()):
+        dw = getattr(block, "dwconv", None)
+        if not isinstance(dw, torch.nn.Conv1d):
+            continue
+        if not (dw.in_channels == dw.out_channels == dw.groups and dw.kernel_size[0] <= 15
+                and dw.stride == (1,) and dw.dilation == (1,) and dw.padding == (0,)):
+            continue
+        q4 = DepthwiseConv1dQ4(dw)
+        parent_path, child = path.rsplit(".", 1) if "." in path else ("", path)
+        parent = codec.get_submodule(parent_path) if parent_path else codec
+        originals.append((parent, child, dw))
+        setattr(parent, child, q4)
+        replaced += 1
+        bytes_q4 += q4.nbytes() + (dw.bias.numel() * dw.bias.element_size() if dw.bias is not None else 0)
+    if not replaced:
+        raise RuntimeError("no supported codec ConvNeXt depthwise convolutions found")
+    codec._v2_depthwise_q4_originals = originals
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"codec_depthwise_q4": True, "layers": replaced, "q4_bytes": bytes_q4}
+
+
+def _codec_depthwise_q4_disable(engine) -> None:
+    codec = engine.wrapper.model.tts_model.audio_codec
+    originals = getattr(codec, "_v2_depthwise_q4_originals", None)
+    if originals is None:
+        return
+    for parent, child, original in originals:
+        setattr(parent, child, original)
+    del codec._v2_depthwise_q4_originals
+
+
+experiment("codec_depthwise_q4")((_codec_depthwise_q4_enable, _codec_depthwise_q4_disable))
+
+
+# --- rnnt_decoder_q4: fused inference-only RNNT prediction LSTM -------------
+def _find_rnnt_decoder(engine):
+    stt = engine.wrapper.model.stt_model
+    for name in ("rnnt_decoder", "_rnnt_decoder"):
+        decoder = getattr(stt, name, None)
+        if decoder is not None and hasattr(decoder, "prediction"):
+            return decoder
+    for decoder in stt.modules():
+        if type(decoder).__name__ == "RNNTDecoder" and hasattr(decoder, "prediction"):
+            return decoder
+    raise RuntimeError("RNNTDecoder module not found")
+
+
+def _rnnt_q4_enable(engine) -> dict:
+    from mynah_v2.model.rnnt_q4 import Int4LSTM
+
+    decoder = _find_rnnt_decoder(engine)
+    rnn = decoder.prediction["dec_rnn"]
+    if isinstance(rnn, Int4LSTM):
+        return {"rnnt_decoder_q4": "already_enabled"}
+    q4 = Int4LSTM(rnn)
+    decoder.prediction["dec_rnn"] = q4
+    decoder._v2_rnnt_q4_original = rnn
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"rnnt_decoder_q4": True, "layers": q4.num_layers, "bytes": q4.nbytes(),
+            "fallback": "BF16 LSTM when disabled"}
+
+
+def _rnnt_q4_disable(engine) -> None:
+    decoder = _find_rnnt_decoder(engine)
+    original = getattr(decoder, "_v2_rnnt_q4_original", None)
+    if original is not None:
+        decoder.prediction["dec_rnn"] = original
+        del decoder._v2_rnnt_q4_original
+
+
+experiment("rnnt_decoder_q4")((_rnnt_q4_enable, _rnnt_q4_disable))
 experiment("eartts_fused_rmsnorm_bf16native")((lambda e: {"norms": fuse_rmsnorms(_find_eartts(e).backbone, bf16_native=True)},
                                                _ernorm_disable))
+
+
+# --- eartts_mog_q4: selected-mixture INT4 projection -----------------------------------------------
+# ``MoGHead.infer`` indexes proj_mus.weight directly instead of calling the
+# Linear module. A normal Linear replacement would therefore be dead weight;
+# the optional kernel preserves the selected-matrix contract and dequantizes
+# nibbles inside the selected GEMV. It is kept out of the default exact profile
+# until the GB10 round-trip confirms both quality and latency.
+def _mog_q4_enable(engine) -> dict:
+    from mynah_v2.model.mog_q4 import SelectedMoGQ4
+
+    m = _find_eartts(engine)
+    head = m.mog_head
+    if not hasattr(head, "proj_mus") or not hasattr(head, "num_predictions"):
+        raise RuntimeError("EarTTS MoG head not found")
+    if isinstance(head.proj_mus, SelectedMoGQ4):
+        return {"mog_q4": "already_enabled"}
+    if not isinstance(head.proj_mus, torch.nn.Linear):
+        raise RuntimeError("MoG proj_mus is not an ordinary Linear")
+    original = head.proj_mus
+    proj_state = (original.in_features, original.out_features, original.weight.detach().cpu(),
+                  original.bias.detach().cpu() if original.bias is not None else None,
+                  original.weight.device, original.weight.dtype)
+    head.proj_mus = SelectedMoGQ4(original, head.num_predictions, head.low_rank or head.out_size)
+    low_q = None
+    low_state = None
+    use_low_q4 = os.environ.get("MYNAH_INT4_MOG_LOW", "0") == "1"
+    if getattr(head, "low_rank", None) and use_low_q4:
+        low = head.low_mat
+        low_state = (low.detach().cpu(), low.device, low.dtype)
+        low_q = SelectedMoGQ4.from_tensor(low.detach(), group=128)
+        # The serving infer path below no longer reads the BF16 parameter. Keep
+        # its A/B copy on host memory so the quantized experiment really frees
+        # the large GPU matrix instead of retaining it through a closure.
+        head.low_mat = torch.nn.Parameter(torch.empty(0, device=low.device, dtype=low.dtype), requires_grad=False)
+    old_infer = head.infer
+    ns = type(head).infer.__globals__
+    F = ns["F"]
+    TopP, TopK = ns["TopPLogitsWarper"], ns["TopKLogitsWarper"]
+    gumbel_like = ns["gumbel_like"]
+    batch_matmul = ns["batch_matmul"]
+
+    def infer(self, x, guidance_scale: float = 0.0, top_p_or_k: float | int = 1.0):
+        b, t, _ = x.size()
+        n, d = self.num_predictions, self.low_rank or self.out_size
+        x = self.mlp_stack(x)
+        if guidance_scale > 0:
+            b //= 2
+            x_cond, x_uncond = x.chunk(2, dim=0)
+            x = x_cond + guidance_scale * (x_cond - x_uncond)
+        logits = self.proj_logits(x)
+        if top_p_or_k is not None:
+            logits = (TopP(top_p_or_k)(None, logits.view(-1, n)).view_as(logits)
+                      if isinstance(top_p_or_k, float)
+                      else TopK(top_p_or_k)(None, logits.view(-1, n)).view_as(logits))
+        mixture_indices = (F.log_softmax(logits, dim=-1) + gumbel_like(logits)).argmax(-1)
+        mu = self.proj_mus.selected(x.view(b * t, -1), mixture_indices.view(b * t)).view(b, t, d)
+        if self.low_rank:
+            if self._v2_mog_q4_low is not None:
+                mu = self._v2_mog_q4_low.selected(mu.view(b * t, -1), mixture_indices.view(b * t)).view(
+                    b, t, self.out_size
+                )
+            else:
+                mu = batch_matmul(
+                    mu.view(b * t, -1), self.low_mat.detach().view(n, self.out_size, -1),
+                    mixture_indices.view(b * t), BLOCK_SIZE_DIN=d, BLOCK_SIZE_DOUT=self.out_size,
+                ).view(b, t, self.out_size)
+            mu_res = self.proj_else(x)
+        else:
+            mu_res = torch.zeros((b, t, d), device=x.device)
+        logs = self.proj_logs(x).clamp_min(self.min_log_std)
+        return mu * torch.exp(logs) + mu_res, logs
+
+    # Keep the bound method for reversible A/B runs. ``old_infer`` is retained
+    # as an object attribute so disabling does not depend on class mutation.
+    head.__dict__["_v2_mog_q4_original"] = old_infer
+    head.__dict__["_v2_mog_q4_original_proj_state"] = proj_state
+    head.__dict__["_v2_mog_q4_original_low_state"] = low_state
+    head._v2_mog_q4_low = low_q
+    head.infer = types.MethodType(infer, head)
+    torch.cuda.empty_cache()
+    return {"mog_q4": True, "group": head.proj_mus.group, "bytes": head.proj_mus.nbytes() + (low_q.nbytes() if low_q else 0),
+            "num_predictions": head.num_predictions, "out_size": head.low_rank or head.out_size,
+            "low_mat_q4": use_low_q4}
+
+
+def _mog_q4_disable(engine) -> None:
+    m = _find_eartts(engine)
+    head = m.mog_head
+    old = head.__dict__.pop("_v2_mog_q4_original", None)
+    proj_state = head.__dict__.pop("_v2_mog_q4_original_proj_state", None)
+    low_state = head.__dict__.pop("_v2_mog_q4_original_low_state", None)
+    head.__dict__.pop("_v2_mog_q4_low", None)
+    if proj_state is not None:
+        in_features, out_features, weight, bias, device, dtype = proj_state
+        lin = torch.nn.Linear(in_features, out_features, bias=bias is not None, device=device, dtype=dtype)
+        with torch.no_grad():
+            lin.weight.copy_(weight.to(device=device, dtype=dtype))
+            if bias is not None:
+                lin.bias.copy_(bias.to(device=device, dtype=dtype))
+        head.proj_mus = lin
+    if low_state is not None:
+        weight, device, dtype = low_state
+        head.low_mat = torch.nn.Parameter(weight.to(device=device, dtype=dtype), requires_grad=False)
+    if old is not None:
+        head.infer = old
+
+
+experiment("eartts_mog_q4")((_mog_q4_enable, _mog_q4_disable))
+
+
+# ------------------------------------------------------------------------------------------------ Q8 counterparts
+# These are explicit opt-ins.  Q8 is a parity path for coverage and memory
+# experiments, not a promise of lower decode latency on GB10 (the measured
+# Thinker Q8 GEMV is slower than the native INT4 tinygemm path).
+def _eartts_w8_enable(engine) -> dict:
+    from mynah_v2.model.eartts_q8 import quantize_eartts_w8
+    return quantize_eartts_w8(engine)
+
+
+def _w8_noop_disable(_engine) -> None:
+    return None
+
+
+experiment("eartts_w8")((_eartts_w8_enable, _w8_noop_disable))
+
+
+def _extended_w8_enable(engine) -> dict:
+    from mynah_v2.model.quant import quantize_extended_w8
+    return quantize_extended_w8(engine)
+
+
+experiment("extended_w8")((_extended_w8_enable, _w8_noop_disable))
+
+
+def _rvq_w8_enable(engine) -> dict:
+    from mynah_v2.model.w8_specialized import RVQInt8Embedding, RVQInt8Encoder
+
+    m = _find_eartts(engine)
+    if hasattr(m, "_v2_rvq_w8"):
+        return {"rvq_w8": "already_enabled"}
+    q = RVQInt8Embedding(m.rvq_embs)
+    original = m.__dict__.get("depthsum_embedding")
+    m._v2_rvq_w8 = q
+    m._v2_rvq_w8_original = original
+    use_encoder = os.environ.get("MYNAH_INT8_RVQ_ENCODE", "0") == "1"
+    encoder = None
+    if use_encoder:
+        original_step = m.__dict__.get("_v2_depthsum_step")
+        m._v2_rvq_w8_original_step = original_step
+        encoder = RVQInt8Encoder(q)
+        m._v2_rvq_w8_encoder = encoder
+
+        def encode_step(self, embs, residual, code, depth_str=0, k=72):
+            return self._v2_rvq_w8_encoder(residual, code, depth_str, k)
+
+        m._v2_depthsum_step = types.MethodType(encode_step, m)
+
+    def depthsum(self, code):
+        return self._v2_rvq_w8(code)
+
+    m.depthsum_embedding = types.MethodType(depthsum, m)
+    torch.cuda.empty_cache()
+    return {"rvq_w8": True, "shape": list(m.rvq_embs.shape), "bytes": q.nbytes(),
+            "encode_table": "Q8_fused" if encoder is not None else "BF16",
+            "encoder_bytes": encoder.nbytes() if encoder is not None else 0}
+
+
+def _rvq_w8_disable(engine) -> None:
+    m = _find_eartts(engine)
+    original = m.__dict__.pop("_v2_rvq_w8_original", None)
+    original_step = m.__dict__.pop("_v2_rvq_w8_original_step", None)
+    m._modules.pop("_v2_rvq_w8", None)
+    m._modules.pop("_v2_rvq_w8_encoder", None)
+    if original is not None:
+        m.depthsum_embedding = original
+    else:
+        m.__dict__.pop("depthsum_embedding", None)
+    if original_step is not None:
+        m._v2_depthsum_step = original_step
+    else:
+        m.__dict__.pop("_v2_depthsum_step", None)
+
+
+experiment("eartts_rvq_w8")((_rvq_w8_enable, _rvq_w8_disable))
+
+
+def _codec_depthwise_w8_enable(engine) -> dict:
+    from mynah_v2.model.w8_specialized import ConvTranspose1dW8, DepthwiseConv1dW8
+
+    codec = engine.wrapper.model.tts_model.audio_codec
+    if hasattr(codec, "_v2_depthwise_w8_originals"):
+        return {"codec_depthwise_w8": "already_enabled"}
+    originals = []
+    replaced = transpose_replaced = 0
+    bytes_w8 = 0
+    for path, block in list(codec.named_modules()):
+        dw = getattr(block, "dwconv", None)
+        if isinstance(dw, torch.nn.Conv1d) and dw.in_channels == dw.out_channels == dw.groups \
+                and dw.kernel_size[0] <= 15 and dw.stride == (1,) and dw.dilation == (1,) \
+                and dw.padding == (0,):
+            q8 = DepthwiseConv1dW8(dw)
+            parent_path, child = path.rsplit(".", 1) if "." in path else ("", path)
+            parent = codec.get_submodule(parent_path) if parent_path else codec
+            originals.append((parent, child, dw))
+            setattr(parent, child, q8)
+            replaced += 1
+            bytes_w8 += q8.nbytes() + (dw.bias.numel() * dw.bias.element_size() if dw.bias is not None else 0)
+    for path, module in list(codec.named_modules()):
+        if not isinstance(module, torch.nn.ConvTranspose1d):
+            continue
+        q8 = ConvTranspose1dW8(module)
+        parent_path, child = path.rsplit(".", 1) if "." in path else ("", path)
+        parent = codec.get_submodule(parent_path) if parent_path else codec
+        originals.append((parent, child, module))
+        setattr(parent, child, q8)
+        transpose_replaced += 1
+        bytes_w8 += q8.nbytes() + (module.bias.numel() * module.bias.element_size() if module.bias is not None else 0)
+    if not replaced and not transpose_replaced:
+        raise RuntimeError("no supported codec temporal/depthwise convolutions found")
+    codec._v2_depthwise_w8_originals = originals
+    torch.cuda.empty_cache()
+    return {"codec_depthwise_w8": True, "depthwise_layers": replaced,
+            "transpose_layers": transpose_replaced, "w8_bytes": bytes_w8}
+
+
+def _codec_depthwise_w8_disable(engine) -> None:
+    codec = engine.wrapper.model.tts_model.audio_codec
+    originals = getattr(codec, "_v2_depthwise_w8_originals", None)
+    if originals is None:
+        return
+    for parent, child, original in originals:
+        setattr(parent, child, original)
+    del codec._v2_depthwise_w8_originals
+
+
+experiment("codec_depthwise_w8")((_codec_depthwise_w8_enable, _codec_depthwise_w8_disable))
+
+
+def _rnnt_w8_enable(engine) -> dict:
+    from mynah_v2.model.w8_specialized import Int8LSTM
+
+    decoder = _find_rnnt_decoder(engine)
+    rnn = decoder.prediction["dec_rnn"]
+    if isinstance(rnn, Int8LSTM):
+        return {"rnnt_decoder_w8": "already_enabled"}
+    fused = os.environ.get("MYNAH_INT8_RNNT_FUSED", "1") == "1"
+    q8 = Int8LSTM(rnn, fused=fused)
+    decoder.prediction["dec_rnn"] = q8
+    decoder._v2_rnnt_w8_original = rnn
+    torch.cuda.empty_cache()
+    return {"rnnt_decoder_w8": True, "bytes": q8.nbytes(), "fused": fused,
+            "fallback": "BF16 LSTM when disabled"}
+
+
+def _rnnt_w8_disable(engine) -> None:
+    decoder = _find_rnnt_decoder(engine)
+    original = getattr(decoder, "_v2_rnnt_w8_original", None)
+    if original is not None:
+        decoder.prediction["dec_rnn"] = original
+        del decoder._v2_rnnt_w8_original
+
+
+experiment("rnnt_decoder_w8")((_rnnt_w8_enable, _rnnt_w8_disable))
+
+
+def _mog_w8_enable(engine) -> dict:
+    from mynah_v2.model.w8_specialized import SelectedMoGW8
+
+    m = _find_eartts(engine)
+    head = m.mog_head
+    preloaded_proj = isinstance(head.proj_mus, SelectedMoGW8)
+    if preloaded_proj and "_v2_mog_w8_original" in head.__dict__:
+        return {"mog_w8": "already_enabled"}
+    if not preloaded_proj and not isinstance(head.proj_mus, torch.nn.Linear):
+        raise RuntimeError("MoG proj_mus is not an ordinary Linear")
+    original = head.proj_mus
+    if not preloaded_proj:
+        head.proj_mus = SelectedMoGW8(original, head.num_predictions, head.low_rank or head.out_size)
+    low_q = getattr(head, "_v2_mog_w8_low", None)
+    low_state = None
+    if low_q is None and getattr(head, "low_rank", None) and os.environ.get("MYNAH_INT8_MOG_LOW", "1") == "1":
+        low = head.low_mat
+        low_state = (low.detach().cpu(), low.device, low.dtype)
+        low_q = SelectedMoGW8.from_tensor(low.detach())
+        head.low_mat = torch.nn.Parameter(torch.empty(0, device=low.device, dtype=low.dtype), requires_grad=False)
+    old_infer = head.infer
+    ns = type(head).infer.__globals__
+    F = ns["F"]
+    TopP, TopK = ns["TopPLogitsWarper"], ns["TopKLogitsWarper"]
+    gumbel_like = ns["gumbel_like"]
+    batch_matmul = ns["batch_matmul"]
+
+    def infer(self, x, guidance_scale: float = 0.0, top_p_or_k: float | int = 1.0):
+        b, t, _ = x.size()
+        n, d = self.num_predictions, self.low_rank or self.out_size
+        x = self.mlp_stack(x)
+        if guidance_scale > 0:
+            b //= 2
+            x_cond, x_uncond = x.chunk(2, dim=0)
+            x = x_cond + guidance_scale * (x_cond - x_uncond)
+        logits = self.proj_logits(x)
+        if top_p_or_k is not None:
+            logits = (TopP(top_p_or_k)(None, logits.view(-1, n)).view_as(logits)
+                      if isinstance(top_p_or_k, float)
+                      else TopK(top_p_or_k)(None, logits.view(-1, n)).view_as(logits))
+        mixture_indices = (F.log_softmax(logits, dim=-1) + gumbel_like(logits)).argmax(-1)
+        mu = self.proj_mus.selected(x.view(b * t, -1), mixture_indices.view(b * t)).view(b, t, d)
+        if self.low_rank:
+            if self._v2_mog_w8_low is not None:
+                mu = self._v2_mog_w8_low.selected(mu.view(b * t, -1), mixture_indices.view(b * t)).view(
+                    b, t, self.out_size
+                )
+            else:
+                mu = batch_matmul(
+                    mu.view(b * t, -1), self.low_mat.detach().view(n, self.out_size, -1),
+                    mixture_indices.view(b * t), BLOCK_SIZE_DIN=d, BLOCK_SIZE_DOUT=self.out_size,
+                ).view(b, t, self.out_size)
+            mu_res = self.proj_else(x)
+        else:
+            mu_res = torch.zeros((b, t, d), device=x.device)
+        logs = self.proj_logs(x).clamp_min(self.min_log_std)
+        return mu * torch.exp(logs) + mu_res, logs
+
+    head.__dict__["_v2_mog_w8_original"] = old_infer
+    head.__dict__["_v2_mog_w8_original_proj"] = original
+    head.__dict__["_v2_mog_w8_original_low"] = low_state
+    head._v2_mog_w8_low = low_q
+    head.infer = types.MethodType(infer, head)
+    torch.cuda.empty_cache()
+    return {"mog_w8": True, "bytes": head.proj_mus.nbytes() + (low_q.nbytes() if low_q else 0),
+            "num_predictions": head.num_predictions, "out_size": head.low_rank or head.out_size,
+            "low_mat_w8": low_q is not None}
+
+
+def _mog_w8_disable(engine) -> None:
+    m = _find_eartts(engine)
+    head = m.mog_head
+    old = head.__dict__.pop("_v2_mog_w8_original", None)
+    original = head.__dict__.pop("_v2_mog_w8_original_proj", None)
+    low_state = head.__dict__.pop("_v2_mog_w8_original_low", None)
+    low_q = head._modules.pop("_v2_mog_w8_low", None)
+    if old is not None:
+        head.infer = old
+    if original is not None:
+        head.proj_mus = original
+    if low_q is not None:
+        del low_q
+    if low_state is not None:
+        weight, device, dtype = low_state
+        head.low_mat = torch.nn.Parameter(weight.to(device=device, dtype=dtype), requires_grad=False)
+
+
+experiment("eartts_mog_w8")((_mog_w8_enable, _mog_w8_disable))
 
 
 def _codec_nosync_enable(engine) -> dict:

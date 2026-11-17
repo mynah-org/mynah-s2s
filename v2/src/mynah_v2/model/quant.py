@@ -1,12 +1,13 @@
-"""EXPERIMENTAL weight-only quantization of the Thinker (NemotronH backbone linears). Never used by REFERENCE.
+"""EXPERIMENTAL weight-only INT4 quantization for the graph-safe V2 paths. Never used by REFERENCE.
 
 Why int4 tinygemm: the Thinker step is bandwidth-bound (profile C2/C6: 68-74 ms/step, gemv kernels; 14.1 GB of BF16
 linear weights read per step). On GB10/sm_121 with torch 2.10 native kernels (microbench D1, M=1):
 bf16 64.4 ms/step, int8 weight-only ``_weight_int8pack_mm`` 86.5 ms (slower), fp8 row-wise ``_scaled_mm`` not supported
 by cuBLASLt, int4 ``_weight_int4pack_mm`` 11.9 ms (5.4×). Only int4 actually pays off, hence this module.
 
-Scope: Mamba ``in_proj``/``out_proj``, MLP ``up_proj``/``down_proj``, attention ``q/k/v/o_proj`` of the backbone layers.
-Not quantized: embeddings, text/function/ASR heads, RNN-T, perception, EarTTS, codec. Asymmetric min-max per group
+Scope: Thinker Mamba/attention/MLP projections, optional text/function heads, and the standard Linear paths in
+perception, RNNT joint, CAS/fusion and MoG. Embeddings, RNN-T decoder, convolution/codebooks and codec stay
+outside this module until they have a compatible graph-safe backend. Asymmetric min-max per group
 (torchao/tinygemm convention: w ≈ (q - 8) · scale + zero). Group 128, or 64/32 when K is not a multiple.
 The replaced module keeps an empty ``weight`` buffer so the remote code's device/dtype checks still work
 (``in_proj.weight.device`` for the fast-path dispatch, ``q_proj.weight.dtype``). Only the cached (incremental) path is
@@ -14,6 +15,11 @@ supported: the training-only fused kernel reads ``out_proj.weight`` directly.
 """
 
 from __future__ import annotations
+
+import json
+import os
+import types
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -81,6 +87,37 @@ class Int4Linear(nn.Module):
         self.register_buffer("weight", torch.empty(0, dtype=w.dtype, device=w.device), persistent=False)
         self.bias = lin.bias
 
+    @classmethod
+    def from_packed(cls, lin: nn.Linear, packed: torch.Tensor, scales_zeros: torch.Tensor,
+                    group: int, tiles: int):
+        """Build a tinygemm linear from an offline pack without re-quantizing the checkpoint.
+
+        The original bias is deliberately retained from ``lin``.  This keeps the pack
+        format weight-only and makes loading safe against accidentally changing the
+        model's non-quantized state (biases, caches, embeddings, and audio modules).
+        """
+        if packed.device != lin.weight.device or scales_zeros.device != lin.weight.device:
+            raise ValueError("offline int4 tensors must be loaded on the same device as the model")
+        # Torch's tinygemm pack dtype is device/version dependent: GB10 with
+        # torch 2.10 returns int32, while some builds expose uint8 storage.
+        if packed.dtype not in (torch.int32, torch.uint8):
+            raise ValueError(f"offline int4 packed weights must be int32 or uint8, got {packed.dtype}")
+        if scales_zeros.dtype != torch.bfloat16:
+            raise ValueError(f"offline int4 scales_zeros must be bfloat16, got {scales_zeros.dtype}")
+        expected = _pick(lin.in_features, max_group=group)
+        if expected != (group, tiles):
+            raise ValueError(f"invalid int4 layout for {lin.in_features=} expected {expected}, got {(group, tiles)}")
+        out = cls.__new__(cls)
+        nn.Module.__init__(out)
+        out.in_features, out.out_features = lin.in_features, lin.out_features
+        out.group, out.tiles = group, tiles
+        out.register_buffer("packed", packed.contiguous())
+        out.register_buffer("scales_zeros", scales_zeros.contiguous())
+        out.register_buffer("weight", torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device),
+                            persistent=False)
+        out.bias = lin.bias
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shp = x.shape
         x2 = x.reshape(-1, shp[-1])
@@ -91,15 +128,82 @@ class Int4Linear(nn.Module):
         return y.to(dt).reshape(*shp[:-1], self.out_features)
 
 
+class Int4PointwiseConv1d(nn.Module):
+    """Weight-only INT4 adapter for a dense 1x1 Conv1d.
+
+    Pointwise convolution is a Linear applied independently at every time
+    position. Temporal, grouped, and transposed convolutions deliberately do
+    not enter this adapter.
+    """
+
+    def __init__(self, conv: nn.Conv1d, max_group: int = 128):
+        if tuple(conv.kernel_size) != (1,) or tuple(conv.stride) != (1,) or tuple(conv.padding) != (0,):
+            raise ValueError("Int4PointwiseConv1d requires kernel_size=1, stride=1, padding=0")
+        if conv.groups != 1 or tuple(conv.dilation) != (1,):
+            raise ValueError("Int4PointwiseConv1d requires a dense non-dilated convolution")
+        super().__init__()
+        lin = nn.Linear(conv.in_channels, conv.out_channels, bias=conv.bias is not None,
+                        device=conv.weight.device, dtype=conv.weight.dtype)
+        with torch.no_grad():
+            lin.weight.copy_(conv.weight[:, :, 0])
+            if conv.bias is not None:
+                lin.bias.copy_(conv.bias)
+        self.linear = Int4Linear(lin, max_group=max_group)
+        self.in_channels = conv.in_channels
+        self.out_channels = conv.out_channels
+
+    @property
+    def packed(self):
+        return self.linear.packed
+
+    @property
+    def scales_zeros(self):
+        return self.linear.scales_zeros
+
+    @property
+    def group(self):
+        return self.linear.group
+
+    @property
+    def tiles(self):
+        return self.linear.tiles
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or x.shape[1] != self.in_channels:
+            raise RuntimeError(f"INT4 pointwise codec expects [B,{self.in_channels},T], got {tuple(x.shape)}")
+        y = self.linear(x.transpose(1, 2).contiguous())
+        return y.transpose(1, 2).contiguous()
+
+    def nbytes(self) -> int:
+        return self.packed.numel() * self.packed.element_size() + self.scales_zeros.numel() * 2
+
+
 def quantize_thinker_int4(engine, max_group: int = 128, clip: bool = False, skip_layers: set[int] | None = None,
-                          keep_original: bool = False):
-    """Replace the backbone linears of ``engine`` (ReferenceEngine) in place. Returns a summary for traces, and with
-    ``keep_original`` also the replaced modules so ``restore_thinker`` can undo it (A/B in one process)."""
-    llm = engine.wrapper.model.stt_model.llm
+                          keep_original: bool = False, include_heads: bool = False):
+    """Replace Thinker projections in place, optionally including text/function heads.
+
+    ``include_heads`` is deliberately separate from the backbone switch: these two
+    large vocab projections are read on every decode step, but the recurrent/KV
+    caches and all non-Linear audio state remain untouched. With ``keep_original``
+    the replaced modules are returned so ``restore_thinker`` can undo an A/B run.
+    """
+    stt = engine.wrapper.model.stt_model
+    llm = stt.llm
     before = after = 0
     n = 0
     originals = []
     skip_layers = skip_layers or set()
+    if include_heads:
+        for name in ("lm_head", "function_head"):
+            mod = getattr(stt, name, None)
+            if isinstance(mod, nn.Linear):
+                before += mod.weight.numel() * mod.weight.element_size()
+                q = Int4Linear(mod, max_group=max_group, clip=clip)
+                after += q.packed.numel() * q.packed.element_size() + q.scales_zeros.numel() * 2
+                setattr(stt, name, q)
+                if keep_original:
+                    originals.append((stt, name, mod))
+                n += 1
     for li, layer in enumerate(llm.layers):
         mixer = getattr(layer, "mixer", None)
         if mixer is None or li in skip_layers:
@@ -114,7 +218,8 @@ def quantize_thinker_int4(engine, max_group: int = 128, clip: bool = False, skip
                     originals.append((mixer, name, mod))
                 n += 1
     torch.cuda.empty_cache()
-    info = {"thinker_quant": "int4_tinygemm", "linears": n, "max_group": max_group, "clip_search": clip,
+    info = {"thinker_quant": "int4_tinygemm", "linears": n, "include_heads": include_heads,
+            "max_group": max_group, "clip_search": clip,
             "skip_layers": sorted(skip_layers), "bf16_GB": round(before / 2**30, 2), "int4_GB": round(after / 2**30, 2)}
     return (info, originals) if keep_original else info
 
@@ -123,3 +228,946 @@ def restore_thinker(originals) -> None:
     for mixer, name, mod in originals:
         setattr(mixer, name, mod)
     torch.cuda.empty_cache()
+
+
+def quantize_thinker_w8(engine, include_heads: bool = False) -> dict:
+    """Replace Thinker projections with the batched Triton Q8 path."""
+    from mynah_v2.model.wo_gemv import WOLinear
+
+    stt = engine.wrapper.model.stt_model
+    llm = stt.llm
+    before = after = n = 0
+    if include_heads:
+        for name in ("lm_head", "function_head"):
+            mod = getattr(stt, name, None)
+            if isinstance(mod, nn.Linear):
+                before += mod.weight.numel() * mod.weight.element_size()
+                q = WOLinear(mod, "w8")
+                after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+                setattr(stt, name, q)
+                n += 1
+    targets = {"in_proj", "out_proj", "up_proj", "down_proj", "q_proj", "k_proj", "v_proj", "o_proj"}
+    for layer in llm.layers:
+        mixer = getattr(layer, "mixer", None)
+        if mixer is None:
+            continue
+        for name, mod in list(mixer.named_children()):
+            if name not in targets or not isinstance(mod, nn.Linear):
+                continue
+            before += mod.weight.numel() * mod.weight.element_size()
+            q = WOLinear(mod, "w8")
+            after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+            setattr(mixer, name, q)
+            n += 1
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"thinker_quant": "w8_batched_gemv", "linears": n, "include_heads": include_heads,
+            "bf16_bytes": before, "w8_bytes": after}
+
+
+def _quantize_linear_tree(root: nn.Module, max_group: int, scope: str,
+                          predicate=None) -> dict:
+    """Replace ordinary Linear children in one model scope, reporting safe skips."""
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Linear) or (predicate is not None and not predicate(name, mod)):
+            continue
+        # Torch tinygemm requires the output tile (N) to be aligned.  The
+        # RNNT vocabulary projection is 1025 wide; keep it BF16 rather than
+        # producing a pack that only fails when the first RNNT token is read.
+        if mod.out_features % 8:
+            skipped.append({"name": name, "reason": f"out_features={mod.out_features} is not 8-aligned"})
+            continue
+        try:
+            group, _ = _pick(mod.in_features, max_group)
+            before += mod.weight.numel() * mod.weight.element_size()
+            q = Int4Linear(mod, max_group=max_group)
+        except (StopIteration, ValueError) as exc:
+            skipped.append({"name": name, "reason": str(exc)})
+            continue
+        after += q.packed.numel() * q.packed.element_size() + q.scales_zeros.numel() * 2
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "linears": n, "skipped": skipped, "max_group": max_group,
+            "bf16_bytes": before, "int4_bytes": after}
+
+
+def _quantize_pointwise_conv_tree(root: nn.Module, max_group: int, scope: str) -> dict:
+    """Quantize dense 1x1 Conv1d layers while leaving temporal kernels BF16."""
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Conv1d):
+            continue
+        if tuple(mod.kernel_size) != (1,) or tuple(mod.stride) != (1,) or tuple(mod.padding) != (0,) \
+                or mod.groups != 1 or tuple(mod.dilation) != (1,):
+            continue
+        if mod.out_channels % 8:
+            skipped.append({"name": name, "reason": f"out_channels={mod.out_channels} is not 8-aligned"})
+            continue
+        try:
+            before += mod.weight.numel() * mod.weight.element_size()
+            q = Int4PointwiseConv1d(mod, max_group=max_group)
+        except (StopIteration, ValueError) as exc:
+            skipped.append({"name": name, "reason": str(exc)})
+            continue
+        after += q.nbytes()
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "pointwise_conv1d": n, "skipped": skipped,
+            "max_group": max_group, "bf16_bytes": before, "int4_bytes": after}
+
+
+def quantize_extended_int4(engine, max_group: int = 128) -> dict:
+    """Quantize the Q8-equivalent standard matrix paths with native tinygemm.
+
+    This intentionally excludes temporal/grouped convolution weights, the RNNT
+    decoder LSTM, embeddings/codebooks, and MoG ``proj_mus`` (read directly by
+    a custom matmul). Dense codec 1x1 projections use the Linear kernel through
+    ``Int4PointwiseConv1d``; temporal codec kernels remain BF16.
+    """
+    model = engine.wrapper.model
+    scopes = {
+        "perception": _quantize_linear_tree(model.stt_model.perception, max_group, "perception"),
+        "rnnt_joint": _quantize_linear_tree(model.stt_model.rnnt_joint, max_group, "rnnt_joint"),
+    }
+    scopes["perception_pointwise"] = _quantize_pointwise_conv_tree(
+        model.stt_model.perception, max_group, "perception_pointwise"
+    )
+    tts = model.tts_model.tts_model
+    scopes["eartts_aux"] = _quantize_linear_tree(
+        tts, max_group, "eartts_aux",
+        predicate=lambda name, _mod: (
+            not name.startswith("backbone.") and name != "mog_head.proj_mus"
+        ),
+    )
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        scopes["codec_pointwise"] = _quantize_pointwise_conv_tree(decoder, max_group, "codec_pointwise")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"extended_int4": True, "scopes": scopes,
+            "linears": sum(v.get("linears", v.get("pointwise_conv1d", 0)) for v in scopes.values()),
+            "skipped": sum(len(v["skipped"]) for v in scopes.values())}
+
+
+def _quantize_linear_tree_w8(root: nn.Module, scope: str, predicate=None) -> dict:
+    """Replace ordinary Linear children with the Triton batched Q8 path."""
+    from mynah_v2.model.wo_gemv import WOLinear
+
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Linear) or (predicate is not None and not predicate(name, mod)):
+            continue
+        before += mod.weight.numel() * mod.weight.element_size()
+        q = WOLinear(mod, "w8")
+        after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "linears": n, "skipped": skipped, "bf16_bytes": before, "w8_bytes": after}
+
+
+def _quantize_pointwise_conv_tree_w8(root: nn.Module, scope: str) -> dict:
+    """Replace dense 1x1 Conv1d children with the Q8 pointwise adapter."""
+    from mynah_v2.model.w8_specialized import W8PointwiseConv1d
+
+    before = after = n = 0
+    skipped = []
+    for name, mod in list(root.named_modules()):
+        if not isinstance(mod, nn.Conv1d):
+            continue
+        if tuple(mod.kernel_size) != (1,) or tuple(mod.stride) != (1,) or tuple(mod.padding) != (0,) \
+                or mod.groups != 1 or tuple(mod.dilation) != (1,):
+            continue
+        before += mod.weight.numel() * mod.weight.element_size()
+        q = W8PointwiseConv1d(mod)
+        after += q.nbytes() + (mod.bias.numel() * mod.bias.element_size() if mod.bias is not None else 0)
+        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, q)
+        n += 1
+    return {"scope": scope, "pointwise_conv1d": n, "skipped": skipped,
+            "bf16_bytes": before, "w8_bytes": after}
+
+
+def quantize_extended_w8(engine) -> dict:
+    """Q8 counterpart of ``quantize_extended_int4`` for standard matrix paths.
+
+    Temporal/grouped convolutions, embeddings/codebooks, the selected MoG
+    projection, and the RNNT prediction LSTM are specialized paths and are
+    enabled by their own Q8 experiments.
+    """
+    model = engine.wrapper.model
+    scopes = {
+        "perception": _quantize_linear_tree_w8(model.stt_model.perception, "perception"),
+        "rnnt_joint": _quantize_linear_tree_w8(model.stt_model.rnnt_joint, "rnnt_joint"),
+    }
+    scopes["perception_pointwise"] = _quantize_pointwise_conv_tree_w8(
+        model.stt_model.perception, "perception_pointwise"
+    )
+    tts = model.tts_model.tts_model
+    scopes["eartts_aux"] = _quantize_linear_tree_w8(
+        tts, "eartts_aux",
+        predicate=lambda name, _mod: (
+            not name.startswith("backbone.") and name != "mog_head.proj_mus"
+        ),
+    )
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        scopes["codec_pointwise"] = _quantize_pointwise_conv_tree_w8(decoder, "codec_pointwise")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"extended_w8": True, "scopes": scopes,
+            "linears": sum(v.get("linears", v.get("pointwise_conv1d", 0)) for v in scopes.values()),
+            "skipped": sum(len(v["skipped"]) for v in scopes.values())}
+
+
+PACK_FORMAT = "mynah.int4.tinygemm.v1"
+BUNDLE_FORMAT = "mynah.int4.bundle.v1"
+W8_BUNDLE_FORMAT = "mynah.w8.bundle.v1"
+
+
+def _replace_child(root: nn.Module, name: str, replacement: nn.Module) -> None:
+    parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+    parent = root.get_submodule(parent_name) if parent_name else root
+    setattr(parent, child_name, replacement)
+
+
+def _w8_bundle_spec(root_name: str, name: str, mod, tensors: dict) -> dict:
+    """Serialize one runtime Q8 matrix without retaining the live module."""
+    prefix = f"{root_name}.{name}" if name else root_name
+    qk, sk = f"{prefix}.q", f"{prefix}.scale"
+    tensors[qk] = mod.p_q.detach().cpu().contiguous()
+    tensors[sk] = mod.p_scale.detach().cpu().contiguous()
+    return {"root": root_name, "name": name, "kind": "linear", "fmt": "w8",
+            "in_features": mod.in_features, "out_features": mod.out_features,
+            "q_key": qk, "scale_key": sk, "has_bias": mod.bias is not None}
+
+
+def _w8_pointwise_spec(root_name: str, name: str, mod, tensors: dict) -> dict:
+    spec = _w8_bundle_spec(root_name, name, mod.linear, tensors)
+    spec.update({"kind": "pointwise_conv1d", "in_channels": mod.in_channels,
+                 "out_channels": mod.out_channels})
+    return spec
+
+
+def _w8_tensor(tensors: dict, prefix: str, q: torch.Tensor, scale: torch.Tensor,
+               bias: torch.Tensor | None = None) -> dict:
+    q_key, scale_key = f"{prefix}.q", f"{prefix}.scale"
+    tensors[q_key] = q.detach().cpu().contiguous()
+    tensors[scale_key] = scale.detach().cpu().contiguous()
+    out = {"q_key": q_key, "scale_key": scale_key}
+    if bias is not None:
+        bias_key = f"{prefix}.bias"
+        tensors[bias_key] = bias.detach().cpu().contiguous()
+        out["bias_key"] = bias_key
+    return out
+
+
+def _w8_custom_specs(engine, tensors: dict) -> list[dict]:
+    """Pack custom-indexed Q8 paths which cannot use the ordinary Linear loader."""
+    from mynah_v2.model.w8_specialized import ConvTranspose1dW8, DepthwiseConv1dW8, RVQInt8Embedding
+    from mynah_v2.model.wo_gemv import pack_w8
+    model = engine.wrapper.model
+    tts = model.tts_model.tts_model
+    specs = []
+    head = tts.mog_head
+    proj = head.proj_mus
+    if isinstance(proj, nn.Linear):
+        n, d, k = head.num_predictions, head.low_rank or head.out_size, proj.in_features
+        p = pack_w8(proj.weight.detach().reshape(n * d, k))
+        keys = _w8_tensor(tensors, "custom.mog.proj_mus", p["q"].reshape(n, d, k),
+                          p["scale"].reshape(n, d),
+                          proj.bias.detach().reshape(n, d) if proj.bias is not None else None)
+        spec = {"kind": "selected_mog", "num_predictions": n, "out_size": d, "in_features": k, **keys}
+        if getattr(head, "low_rank", None) and isinstance(head.low_mat, torch.Tensor):
+            lp = pack_w8(head.low_mat.detach().reshape(n * head.out_size, -1))
+            spec.update({"low_rank": head.low_rank, "low_out_size": head.out_size,
+                         **{"low_" + k: v for k, v in _w8_tensor(
+                             tensors, "custom.mog.low_mat", lp["q"].reshape(n, head.out_size, -1),
+                             lp["scale"].reshape(n, head.out_size)).items()}})
+        specs.append(spec)
+
+    rvq = RVQInt8Embedding(tts.rvq_embs)
+    specs.append({"kind": "rvq_embedding", "depth": rvq.depth, "vocab": rvq.vocab,
+                  "hidden": rvq.hidden, **_w8_tensor(tensors, "custom.rvq.embedding", rvq.q, rvq.scale)})
+
+    decoder = None
+    for name in ("rnnt_decoder", "_rnnt_decoder"):
+        candidate = getattr(model.stt_model, name, None)
+        if candidate is not None and hasattr(candidate, "prediction"):
+            decoder = candidate
+            break
+    if decoder is not None:
+        rnn = decoder.prediction["dec_rnn"]
+        lstm = getattr(rnn, "lstm", None)
+        if isinstance(lstm, nn.LSTM) and not lstm.proj_size and not lstm.bidirectional:
+            layers = []
+            for li in range(lstm.num_layers):
+                wi = getattr(lstm, f"weight_ih_l{li}").detach()
+                wh = getattr(lstm, f"weight_hh_l{li}").detach()
+                bi = getattr(lstm, f"bias_ih_l{li}").detach()
+                bh = getattr(lstm, f"bias_hh_l{li}").detach()
+                pi, ph = pack_w8(wi), pack_w8(wh)
+                prefix = f"custom.rnnt.layer{li}"
+                layers.append({"qih_key": f"{prefix}.qih", "sih_key": f"{prefix}.sih",
+                               "qhh_key": f"{prefix}.qhh", "shh_key": f"{prefix}.shh",
+                               "bias_key": f"{prefix}.bias"})
+                tensors[f"{prefix}.qih"] = pi["q"].cpu().contiguous()
+                tensors[f"{prefix}.sih"] = pi["scale"].cpu().contiguous()
+                tensors[f"{prefix}.qhh"] = ph["q"].cpu().contiguous()
+                tensors[f"{prefix}.shh"] = ph["scale"].cpu().contiguous()
+                tensors[f"{prefix}.bias"] = (bi + bh).cpu().contiguous()
+            specs.append({"kind": "rnnt_lstm", "layers": layers,
+                          "fused": os.environ.get("MYNAH_INT8_RNNT_FUSED", "1") == "1"})
+
+    codec = getattr(model.tts_model, "audio_codec", None)
+    codec_decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if codec_decoder is not None:
+        for name, module in codec_decoder.named_modules():
+            prefix = f"custom.codec.{name or 'root'}"
+            if isinstance(module, nn.Conv1d) and module.in_channels == module.out_channels == module.groups \
+                    and module.kernel_size[0] <= 15 and module.stride == (1,) and module.dilation == (1,) \
+                    and module.padding == (0,):
+                q = DepthwiseConv1dW8(module)
+                keys = _w8_tensor(tensors, prefix, q.q, q.scale, module.bias)
+                specs.append({"kind": "codec_depthwise", "name": name, "channels": q.channels,
+                              "kernel_size": q.kernel_size, **keys})
+            elif isinstance(module, nn.ConvTranspose1d):
+                q = ConvTranspose1dW8(module)
+                keys = _w8_tensor(tensors, prefix, q.q, q.scale, module.bias)
+                specs.append({"kind": "codec_transpose", "name": name, "in_channels": q.in_channels,
+                              "out_channels": q.out_channels, "groups": q.groups, "kernel_size": q.kernel_size,
+                              "stride": q.stride, "padding": q.padding, "output_padding": q.output_padding,
+                              "dilation": q.dilation, **keys})
+    return specs
+
+
+def save_w8_bundle(engine, path: str | Path, include_heads: bool = True,
+                   include_eartts: bool = True, include_extended: bool = True,
+                   include_custom: bool = True) -> dict:
+    """Export the validated standard Q8 matrix paths for offline startup.
+
+    This mirrors the graph-safe INT4 bundle and also serializes the custom
+    selected-MoG, RVQ, RNNT, depthwise and codec upsampler paths when enabled.
+    Embeddings/state/cache remain live runtime state by design.
+    """
+    from mynah_v2.model.wo_gemv import WOLinear
+    from mynah_v2.model.w8_specialized import W8PointwiseConv1d
+
+    path = Path(path)
+    if path.suffix != ".safetensors":
+        raise ValueError("w8 bundle path must end in .safetensors")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    thinker_info = quantize_thinker_w8(engine, include_heads=include_heads)
+    eartts_info = None
+    if include_eartts:
+        from mynah_v2.model.eartts_q8 import quantize_eartts_w8
+        eartts_info = quantize_eartts_w8(engine)
+    extended_info = quantize_extended_w8(engine) if include_extended else None
+
+    model = engine.wrapper.model
+    tensors, modules = {}, []
+    stt = model.stt_model
+    for name, mod in stt.named_modules():
+        if name.startswith("perception.") or name.startswith("rnnt_joint."):
+            continue
+        if isinstance(mod, WOLinear):
+            modules.append(_w8_bundle_spec("stt_model", name, mod, tensors))
+    if include_eartts:
+        for name, mod in model.tts_model.tts_model.backbone.named_modules():
+            if isinstance(mod, WOLinear):
+                modules.append(_w8_bundle_spec("eartts_backbone", name, mod, tensors))
+    if include_extended:
+        perception = model.stt_model.perception
+        for name, mod in perception.named_modules():
+            if isinstance(mod, W8PointwiseConv1d):
+                modules.append(_w8_pointwise_spec("perception", name, mod, tensors))
+            elif isinstance(mod, WOLinear) and not name.endswith(".linear"):
+                modules.append(_w8_bundle_spec("perception", name, mod, tensors))
+        for name, mod in model.stt_model.rnnt_joint.named_modules():
+            if isinstance(mod, WOLinear):
+                modules.append(_w8_bundle_spec("rnnt_joint", name, mod, tensors))
+        tts = model.tts_model.tts_model
+        for name, mod in tts.named_modules():
+            if isinstance(mod, WOLinear) and not name.startswith("backbone."):
+                modules.append(_w8_bundle_spec("eartts_aux", name, mod, tensors))
+        codec = getattr(model.tts_model, "audio_codec", None)
+        decoder = getattr(codec, "decoder", None) if codec is not None else None
+        if decoder is not None:
+            for name, mod in decoder.named_modules():
+                if isinstance(mod, W8PointwiseConv1d):
+                    modules.append(_w8_pointwise_spec("codec_pointwise", name, mod, tensors))
+    if not modules:
+        raise RuntimeError("no native Q8 modules were produced")
+    custom_modules = _w8_custom_specs(engine, tensors) if include_custom else []
+    manifest = {
+        "format": W8_BUNDLE_FORMAT,
+        "backend": "mynah_triton_w8_gemv",
+        "packing": "per_output_channel_symmetric_int8",
+        "compute_dtype": "bfloat16",
+        "weight_only": True,
+        "scopes": {
+            "stt_model": "Thinker projections and optional text/function heads",
+            "eartts_backbone": "EarTTS Gemma backbone linears",
+            "perception": "Perception Conformer Linear layers",
+            "rnnt_joint": "RNNT joint projections",
+            "eartts_aux": "CAS/fusion standard Linear layers",
+            "codec_pointwise": "Dense 1x1 codec decoder projections",
+        },
+        "unsupported_scopes": ["embeddings", "state_and_cache"],
+        "modules": modules,
+        "custom_modules": custom_modules,
+        "quant_info": {"thinker": thinker_info, "eartts": eartts_info, "extended": extended_info},
+    }
+    from safetensors.torch import save_file
+    tmp_pack = path.with_name(path.name + ".tmp")
+    tmp_manifest = path.with_suffix(".json.tmp")
+    save_file(tensors, str(tmp_pack), metadata={"format": W8_BUNDLE_FORMAT})
+    tmp_pack.replace(path)
+    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_manifest.replace(path.with_suffix(".json"))
+    return {"path": str(path), "manifest": str(path.with_suffix(".json")),
+            "modules": len(modules), "custom_modules": len(custom_modules),
+            "format": W8_BUNDLE_FORMAT, "thinker": thinker_info, "eartts": eartts_info,
+            "extended": extended_info}
+
+
+def save_thinker_int4_pack(engine, path: str | Path, max_group: int = 128, clip: bool = False,
+                           include_heads: bool = True) -> dict:
+    """Quantize Thinker weights once and export a portable safetensors pack + manifest.
+
+    This is intentionally weight-only.  The manifest records every replaced module
+    and tinygemm layout; the runtime can validate it before swapping modules.  Audio
+    and recurrent state are not included because their CUDA-graph contracts are
+    model-specific and cannot be made safe by replacing arbitrary ``nn.Linear``
+    objects.
+    """
+    path = Path(path)
+    if path.suffix != ".safetensors":
+        raise ValueError("int4 pack path must end in .safetensors")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    info = quantize_thinker_int4(engine, max_group=max_group, clip=clip, include_heads=include_heads)
+    stt = engine.wrapper.model.stt_model
+    tensors = {}
+    modules = []
+    for name, mod in stt.named_modules():
+        if not isinstance(mod, Int4Linear):
+            continue
+        pk, sk = f"{name}.packed", f"{name}.scales_zeros"
+        tensors[pk] = mod.packed.detach().cpu().contiguous()
+        tensors[sk] = mod.scales_zeros.detach().cpu().contiguous()
+        modules.append({"name": name, "in_features": mod.in_features, "out_features": mod.out_features,
+                        "group": mod.group, "tiles": mod.tiles, "packed_dtype": str(mod.packed.dtype),
+                        "scales_dtype": str(mod.scales_zeros.dtype), "packed_key": pk, "scales_zeros_key": sk,
+                        "has_bias": mod.bias is not None})
+    if not modules:
+        raise RuntimeError("no Thinker int4 modules were produced")
+    manifest = {
+        "format": PACK_FORMAT,
+        "backend": "torch_native_weight_int4pack_mm",
+        "packing": "torch._convert_weight_to_int4pack",
+        "compute_dtype": "bfloat16",
+        "root": "stt_model",
+        "weight_only": True,
+        "audio_modules": "excluded_until_graph_safe_backend",
+        "quantizer": "asymmetric_minmax_tinygemm",
+        "max_group": max_group,
+        "clip_search": clip,
+        "modules": modules,
+        "quant_info": info,
+    }
+    from safetensors.torch import save_file
+    tmp_pack = path.with_name(path.name + ".tmp")
+    tmp_manifest = path.with_suffix(".json.tmp")
+    save_file(tensors, str(tmp_pack), metadata={"format": PACK_FORMAT})
+    tmp_pack.replace(path)
+    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_manifest.replace(path.with_suffix(".json"))
+    return {"path": str(path), "manifest": str(path.with_suffix(".json")), "modules": len(modules), **info}
+
+
+def _bundle_module_spec(root_name: str, name: str, mod: Int4Linear, tensors: dict) -> dict:
+    """Copy one native INT4 module into a bundle and return its portable spec."""
+    prefix = f"{root_name}.{name}" if name else root_name
+    pk, sk = f"{prefix}.packed", f"{prefix}.scales_zeros"
+    tensors[pk] = mod.packed.detach().cpu().contiguous()
+    tensors[sk] = mod.scales_zeros.detach().cpu().contiguous()
+    return {"root": root_name, "name": name, "in_features": mod.in_features,
+            "out_features": mod.out_features, "group": mod.group, "tiles": mod.tiles,
+            "packed_dtype": str(mod.packed.dtype), "scales_dtype": str(mod.scales_zeros.dtype),
+            "packed_key": pk, "scales_zeros_key": sk, "has_bias": mod.bias is not None}
+
+
+def _bundle_pointwise_spec(root_name: str, name: str, mod: Int4PointwiseConv1d, tensors: dict) -> dict:
+    spec = _bundle_module_spec(root_name, name, mod.linear, tensors)
+    spec["kind"] = "pointwise_conv1d"
+    spec["in_channels"] = mod.in_channels
+    spec["out_channels"] = mod.out_channels
+    return spec
+
+
+def save_int4_bundle(engine, path: str | Path, max_group: int = 128, clip: bool = False,
+                     include_heads: bool = True, include_eartts: bool = True,
+                     include_extended: bool = True) -> dict:
+    """Export one offline INT4 bundle for every currently graph-safe weight family.
+
+    The bundle deliberately uses the same Torch tinygemm representation for the
+    Thinker and the EarTTS Gemma backbone.  That means the server can load one
+    file, validate every module, and only then swap anything in the live model.
+    Unsupported audio pieces (convolution, decoder LSTM, embeddings/codebooks,
+    MoG direct ``proj_mus``, and codec) are not put in the bundle until they
+    have their own measured graph-safe implementation.
+    """
+    path = Path(path)
+    if path.suffix != ".safetensors":
+        raise ValueError("int4 bundle path must end in .safetensors")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    thinker_info = quantize_thinker_int4(engine, max_group=max_group, clip=clip,
+                                         include_heads=include_heads)
+    eartts_info = None
+    if include_eartts:
+        from mynah_v2.model.eartts_q4 import quantize_eartts_int4
+        eartts_info = quantize_eartts_int4(engine, group=max_group, backend="native")
+    extended_info = quantize_extended_int4(engine, max_group=max_group) if include_extended else None
+
+    model = engine.wrapper.model
+    tensors = {}
+    modules = []
+    stt = model.stt_model
+    for name, mod in stt.named_modules():
+        # Extended perception/RNNT modules are serialized under their own
+        # roots below. Excluding those subtrees here prevents duplicate specs
+        # (including the nested Linear inside each pointwise Conv1d wrapper).
+        if (name.startswith("perception.") or name.startswith("rnnt_joint.")):
+            continue
+        if isinstance(mod, Int4Linear):
+            modules.append(_bundle_module_spec("stt_model", name, mod, tensors))
+    if include_eartts:
+        backbone = model.tts_model.tts_model.backbone
+        for name, mod in backbone.named_modules():
+            if isinstance(mod, Int4Linear):
+                modules.append(_bundle_module_spec("eartts_backbone", name, mod, tensors))
+    if include_extended:
+        perception = model.stt_model.perception
+        for name, mod in perception.named_modules():
+            if isinstance(mod, Int4PointwiseConv1d):
+                modules.append(_bundle_pointwise_spec("perception", name, mod, tensors))
+            elif isinstance(mod, Int4Linear) and not name.endswith(".linear"):
+                modules.append(_bundle_module_spec("perception", name, mod, tensors))
+        rnnt_joint = model.stt_model.rnnt_joint
+        for name, mod in rnnt_joint.named_modules():
+            if isinstance(mod, Int4Linear):
+                modules.append(_bundle_module_spec("rnnt_joint", name, mod, tensors))
+        tts = model.tts_model.tts_model
+        for name, mod in tts.named_modules():
+            if isinstance(mod, Int4Linear) and not name.startswith("backbone."):
+                modules.append(_bundle_module_spec("eartts_aux", name, mod, tensors))
+        codec = getattr(model.tts_model, "audio_codec", None)
+        decoder = getattr(codec, "decoder", None) if codec is not None else None
+        if decoder is not None:
+            for name, mod in decoder.named_modules():
+                if isinstance(mod, Int4PointwiseConv1d):
+                    modules.append(_bundle_pointwise_spec("codec_pointwise", name, mod, tensors))
+    if not modules:
+        raise RuntimeError("no native INT4 modules were produced")
+    manifest = {
+        "format": BUNDLE_FORMAT,
+        "backend": "torch_native_weight_int4pack_mm",
+        "packing": "torch._convert_weight_to_int4pack",
+        "compute_dtype": "bfloat16",
+        "weight_only": True,
+        "scopes": {
+            "stt_model": "Thinker projections and optional text/function heads",
+            "eartts_backbone": "EarTTS Gemma backbone linears",
+            "perception": "Perception Conformer Linear layers",
+            "perception_pointwise": "Dense 1x1 Conformer projections; temporal conv stays BF16",
+            "rnnt_joint": "RNNT joint projections; decoder LSTM stays BF16",
+            "eartts_aux": "CAS/fusion/MoG standard Linear layers",
+            "codec_pointwise": "Dense 1x1 codec decoder projections",
+        },
+        "unsupported_scopes": ["perception_convolution", "rnnt_decoder_lstm", "embeddings",
+                               "mog_proj_mus", "rvq", "codec_temporal_convolution"],
+        "quantizer": "asymmetric_minmax_tinygemm",
+        "max_group": max_group,
+        "clip_search": clip,
+        "modules": modules,
+        "quant_info": {"thinker": thinker_info, "eartts": eartts_info, "extended": extended_info},
+    }
+    from safetensors.torch import save_file
+    tmp_pack = path.with_name(path.name + ".tmp")
+    tmp_manifest = path.with_suffix(".json.tmp")
+    save_file(tensors, str(tmp_pack), metadata={"format": BUNDLE_FORMAT})
+    tmp_pack.replace(path)
+    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_manifest.replace(path.with_suffix(".json"))
+    return {"path": str(path), "manifest": str(path.with_suffix(".json")), "modules": len(modules),
+            "format": BUNDLE_FORMAT, "thinker": thinker_info, "eartts": eartts_info,
+            "extended": extended_info}
+
+
+def load_thinker_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
+    """Load and validate an offline pack before replacing Thinker linears.
+
+    ``strict=True`` rejects missing/mismatched modules rather than silently running
+    a partially quantized model.  The caller can opt out only for an explicit A/B
+    experiment; the server uses strict loading.
+    """
+    path = Path(path)
+    manifest_path = path.with_suffix(".json")
+    if not path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(f"int4 pack requires {path} and {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != PACK_FORMAT:
+        raise ValueError(f"unsupported int4 pack format: {manifest.get('format')!r}")
+    stt = engine.wrapper.model.stt_model
+    device = str(next(stt.parameters()).device)
+    from safetensors.torch import load_file
+    tensors = load_file(str(path), device=device)
+    missing = []
+    replacements = []
+    for spec in manifest.get("modules", []):
+        name = spec["name"]
+        try:
+            current = stt.get_submodule(name)
+        except AttributeError:
+            missing.append(name)
+            continue
+        if not isinstance(current, nn.Linear):
+            missing.append(f"{name} (not nn.Linear)")
+            continue
+        shape = (current.out_features, current.in_features)
+        if shape != (spec["out_features"], spec["in_features"]):
+            missing.append(f"{name} (shape {shape} != manifest)")
+            continue
+        try:
+            packed = tensors[spec["packed_key"]]
+            scales = tensors[spec["scales_zeros_key"]]
+            replacement = Int4Linear.from_packed(current, packed, scales, spec["group"], spec["tiles"])
+        except (KeyError, ValueError) as exc:
+            missing.append(f"{name} ({exc})")
+            continue
+        replacements.append((name, replacement))
+    if missing and strict:
+        raise RuntimeError("int4 pack validation failed: " + "; ".join(missing[:8]))
+    for name, replacement in replacements:
+        _replace_child(stt, name, replacement)
+    loaded = len(replacements)
+    if loaded == 0:
+        raise RuntimeError("int4 pack did not replace any module")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"path": str(path), "modules": loaded, "skipped": missing, "format": PACK_FORMAT,
+            "weight_only": manifest.get("weight_only", False), "audio_modules": manifest.get("audio_modules")}
+
+
+def load_int4_pack(engine, path: str | Path, strict: bool = True) -> dict:
+    """Load either the legacy Thinker pack or the combined INT4 bundle."""
+    path = Path(path)
+    manifest_path = path.with_suffix(".json")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"int4 pack requires {path} and {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") == PACK_FORMAT:
+        return load_thinker_int4_pack(engine, path, strict=strict)
+    if manifest.get("format") != BUNDLE_FORMAT:
+        raise ValueError(f"unsupported int4 pack format: {manifest.get('format')!r}")
+    model = engine.wrapper.model
+    roots = {"stt_model": model.stt_model, "eartts_backbone": model.tts_model.tts_model.backbone}
+    if hasattr(model.stt_model, "perception"):
+        roots["perception"] = model.stt_model.perception
+    if hasattr(model.stt_model, "rnnt_joint"):
+        roots["rnnt_joint"] = model.stt_model.rnnt_joint
+    roots["eartts_aux"] = model.tts_model.tts_model
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        roots["codec_pointwise"] = decoder
+    device = str(next(model.parameters()).device)
+    from safetensors.torch import load_file
+    tensors = load_file(str(path), device=device)
+    missing = []
+    replacements = []
+    for spec in manifest.get("modules", []):
+        root_name, name = spec.get("root"), spec.get("name", "")
+        root = roots.get(root_name)
+        if root is None:
+            missing.append(f"{root_name}.{name} (unknown root)")
+            continue
+        try:
+            current = root.get_submodule(name) if name else root
+        except AttributeError:
+            missing.append(f"{root_name}.{name}")
+            continue
+        if spec.get("kind") == "pointwise_conv1d":
+            if not isinstance(current, nn.Conv1d):
+                missing.append(f"{root_name}.{name} (not nn.Conv1d)")
+                continue
+            if current.in_channels != spec["in_channels"] or current.out_channels != spec["out_channels"]:
+                missing.append(f"{root_name}.{name} (channel shape mismatch)")
+                continue
+            try:
+                packed = tensors[spec["packed_key"]]
+                scales = tensors[spec["scales_zeros_key"]]
+                lin = nn.Linear(current.in_channels, current.out_channels, bias=current.bias is not None,
+                                device=current.weight.device, dtype=current.weight.dtype)
+                with torch.no_grad():
+                    lin.weight.copy_(current.weight[:, :, 0])
+                    if current.bias is not None:
+                        lin.bias.copy_(current.bias)
+                replacement = Int4PointwiseConv1d.__new__(Int4PointwiseConv1d)
+                nn.Module.__init__(replacement)
+                replacement.linear = Int4Linear.from_packed(lin, packed, scales, spec["group"], spec["tiles"])
+                replacement.in_channels, replacement.out_channels = current.in_channels, current.out_channels
+            except (KeyError, ValueError) as exc:
+                missing.append(f"{root_name}.{name} ({exc})")
+                continue
+            replacements.append((root, name, replacement))
+            continue
+        if not isinstance(current, nn.Linear):
+            missing.append(f"{root_name}.{name} (not nn.Linear)")
+            continue
+        shape = (current.out_features, current.in_features)
+        if shape != (spec["out_features"], spec["in_features"]):
+            missing.append(f"{root_name}.{name} (shape {shape} != manifest)")
+            continue
+        try:
+            replacement = Int4Linear.from_packed(current, tensors[spec["packed_key"]],
+                                                 tensors[spec["scales_zeros_key"]],
+                                                 spec["group"], spec["tiles"])
+        except (KeyError, ValueError) as exc:
+            missing.append(f"{root_name}.{name} ({exc})")
+            continue
+        replacements.append((root, name, replacement))
+    if missing and strict:
+        raise RuntimeError("int4 bundle validation failed: " + "; ".join(missing[:8]))
+    for root, name, replacement in replacements:
+        _replace_child(root, name, replacement)
+    if not replacements:
+        raise RuntimeError("int4 bundle did not replace any module")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"path": str(path), "modules": len(replacements), "skipped": missing,
+            "format": BUNDLE_FORMAT, "weight_only": manifest.get("weight_only", False),
+            "unsupported_scopes": manifest.get("unsupported_scopes", [])}
+
+
+def load_w8_bundle(engine, path: str | Path, strict: bool = True) -> dict:
+    """Validate and load an offline Q8 bundle atomically."""
+    from mynah_v2.model.w8_specialized import (ConvTranspose1dW8, DepthwiseConv1dW8,
+                                                Int8LSTM, RVQInt8Embedding, SelectedMoGW8,
+                                                W8PointwiseConv1d)
+    from mynah_v2.model.wo_gemv import WOLinear
+
+    path = Path(path)
+    manifest_path = path.with_suffix(".json")
+    if not path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(f"w8 bundle requires {path} and {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != W8_BUNDLE_FORMAT:
+        raise ValueError(f"unsupported w8 bundle format: {manifest.get('format')!r}")
+    model = engine.wrapper.model
+    tts = model.tts_model.tts_model
+    roots = {"stt_model": model.stt_model, "eartts_backbone": model.tts_model.tts_model.backbone,
+             "perception": model.stt_model.perception, "rnnt_joint": model.stt_model.rnnt_joint,
+             "eartts_aux": tts}
+    codec = getattr(model.tts_model, "audio_codec", None)
+    decoder = getattr(codec, "decoder", None) if codec is not None else None
+    if decoder is not None:
+        roots["codec_pointwise"] = decoder
+    device = next(model.parameters()).device
+    from safetensors.torch import load_file
+    # Keep the 9.6 GB Q8 bundle on host memory while the live checkpoint is
+    # being replaced.  Loading all tensors directly to CUDA peaks above the
+    # GB10 unified-memory budget before the old BF16 modules can be released.
+    tensors = load_file(str(path), device="cpu")
+    missing, plan, custom_plan = [], [], []
+    for spec in manifest.get("modules", []):
+        root_name, name = spec.get("root"), spec.get("name", "")
+        root = roots.get(root_name)
+        if root is None:
+            missing.append(f"{root_name}.{name} (unknown root)")
+            continue
+        try:
+            current = root.get_submodule(name) if name else root
+        except AttributeError:
+            missing.append(f"{root_name}.{name}")
+            continue
+        try:
+            q = tensors[spec["q_key"]]
+            scale = tensors[spec["scale_key"]]
+            if q.dtype != torch.int8 or scale.dtype != torch.float32:
+                raise ValueError("Q8 bundle tensor dtype mismatch")
+            if spec.get("kind") == "pointwise_conv1d":
+                if not isinstance(current, torch.nn.Conv1d):
+                    raise ValueError("not nn.Conv1d")
+                if (current.in_channels != spec["in_channels"] or current.out_channels != spec["out_channels"]
+                        or tuple(current.kernel_size) != (1,) or current.groups != 1):
+                    raise ValueError("pointwise channel shape mismatch")
+                lin = torch.nn.Linear(current.in_channels, current.out_channels, bias=current.bias is not None,
+                                      device=current.weight.device, dtype=current.weight.dtype)
+                with torch.no_grad():
+                    lin.weight.copy_(current.weight[:, :, 0])
+                    if current.bias is not None:
+                        lin.bias.copy_(current.bias)
+                # Keep only the live Conv1d shape in the validation plan; the
+                # actual Q8 tensors are moved just before this module swaps.
+                plan.append((root, name, current, "pointwise", spec, None))
+                continue
+            else:
+                if not isinstance(current, torch.nn.Linear):
+                    raise ValueError("not nn.Linear")
+                if (current.in_features != spec["in_features"] or current.out_features != spec["out_features"]):
+                    raise ValueError("linear shape mismatch")
+                plan.append((root, name, current, "linear", spec, None))
+                continue
+        except (KeyError, TypeError, ValueError) as exc:
+            missing.append(f"{root_name}.{name} ({exc})")
+            continue
+    custom_specs = manifest.get("custom_modules", [])
+    rnnt_decoder = None
+    for rnnt_name in ("rnnt_decoder", "_rnnt_decoder"):
+        candidate = getattr(model.stt_model, rnnt_name, None)
+        if candidate is not None and hasattr(candidate, "prediction"):
+            rnnt_decoder = candidate
+            break
+    for spec in custom_specs:
+        kind = spec.get("kind")
+        try:
+            if kind == "selected_mog":
+                current = tts.mog_head.proj_mus
+                if not isinstance(current, torch.nn.Linear):
+                    raise ValueError("MoG projection is not a Linear")
+                if tuple(current.weight.shape) != (spec["num_predictions"] * spec["out_size"], spec["in_features"]):
+                    raise ValueError("MoG projection shape mismatch")
+                for key in ("q_key", "scale_key"):
+                    if tensors[spec[key]].dtype not in (torch.int8, torch.float32):
+                        raise ValueError("invalid MoG tensor dtype")
+                custom_plan.append((spec, current))
+            elif kind == "rvq_embedding":
+                current = tts.rvq_embs
+                if tuple(current.shape) != (spec["depth"], spec["vocab"], spec["hidden"]):
+                    raise ValueError("RVQ table shape mismatch")
+                custom_plan.append((spec, current))
+            elif kind == "rnnt_lstm":
+                if rnnt_decoder is None or not isinstance(getattr(rnnt_decoder.prediction["dec_rnn"], "lstm", None), torch.nn.LSTM):
+                    raise ValueError("RNNT decoder LSTM is unavailable")
+                for layer in spec["layers"]:
+                    for key in ("qih_key", "sih_key", "qhh_key", "shh_key", "bias_key"):
+                        if layer[key] not in tensors:
+                            raise KeyError(layer[key])
+                custom_plan.append((spec, rnnt_decoder.prediction["dec_rnn"]))
+            elif kind in ("codec_depthwise", "codec_transpose"):
+                if decoder is None:
+                    raise ValueError("codec decoder is unavailable")
+                current = decoder.get_submodule(spec["name"])
+                expected = torch.nn.Conv1d if kind == "codec_depthwise" else torch.nn.ConvTranspose1d
+                if not isinstance(current, expected):
+                    raise ValueError(f"codec module is not {expected.__name__}")
+                custom_plan.append((spec, current))
+            else:
+                raise ValueError(f"unknown custom kind {kind!r}")
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            missing.append(f"custom.{kind} ({exc})")
+    if missing and strict:
+        raise RuntimeError("w8 bundle validation failed: " + "; ".join(missing[:8]))
+    if not plan and not custom_plan:
+        raise RuntimeError("w8 bundle did not replace any module")
+    # All manifest/shape validation is complete.  Transfer and install one
+    # module at a time so releasing its BF16 parent can make room for its Q8
+    # replacement instead of creating a full-model CUDA peak.
+    for root, name, current, kind, spec, lin in plan:
+        q = tensors[spec["q_key"]].to(device)
+        scale = tensors[spec["scale_key"]].to(device)
+        if kind == "pointwise":
+            lin = torch.nn.Linear(current.in_channels, current.out_channels, bias=current.bias is not None,
+                                  device=current.weight.device, dtype=current.weight.dtype)
+            with torch.no_grad():
+                lin.weight.copy_(current.weight[:, :, 0])
+                if current.bias is not None:
+                    lin.bias.copy_(current.bias)
+            replacement = W8PointwiseConv1d.__new__(W8PointwiseConv1d)
+            torch.nn.Module.__init__(replacement)
+            replacement.linear = WOLinear.from_packed(lin, q, scale, fmt=spec.get("fmt", "w8"))
+            replacement.in_channels, replacement.out_channels = current.in_channels, current.out_channels
+        else:
+            replacement = WOLinear.from_packed(current, q, scale, fmt=spec.get("fmt", "w8"))
+        _replace_child(root, name, replacement)
+    custom_loaded = 0
+    codec_originals = []
+    for spec, current in custom_plan:
+        kind = spec["kind"]
+        if kind == "selected_mog":
+            q = tensors[spec["q_key"]].to(device)
+            scale = tensors[spec["scale_key"]].to(device)
+            bias = tensors[spec["bias_key"]].to(device) if spec.get("bias_key") else None
+            replacement = SelectedMoGW8.from_packed(q, scale, bias)
+            _replace_child(tts.mog_head, "proj_mus", replacement)
+            low_q = None
+            if spec.get("low_q_key"):
+                low_q = SelectedMoGW8.from_packed(
+                    tensors[spec["low_q_key"]].to(device), tensors[spec["low_scale_key"]].to(device), None)
+                tts.mog_head._v2_mog_w8_low = low_q
+                tts.mog_head.low_mat = nn.Parameter(torch.empty(0, device=device, dtype=torch.bfloat16),
+                                                     requires_grad=False)
+            custom_loaded += 1
+        elif kind == "rvq_embedding":
+            q = tensors[spec["q_key"]].to(device)
+            scale = tensors[spec["scale_key"]].to(device)
+            rvq = RVQInt8Embedding.from_packed(q, scale, spec["depth"], spec["vocab"], spec["hidden"])
+            original = tts.__dict__.get("depthsum_embedding")
+            tts._v2_rvq_w8 = rvq
+            tts._v2_rvq_w8_original = original
+            tts.depthsum_embedding = types.MethodType(lambda self, code: self._v2_rvq_w8(code), tts)
+            custom_loaded += 1
+        elif kind == "rnnt_lstm":
+            layers = []
+            for layer in spec["layers"]:
+                layers.append({key: tensors[layer[key]].to(device) for key in ("qih_key", "sih_key", "qhh_key", "shh_key", "bias_key")})
+            packed_layers = [{"qih": p["qih_key"], "sih": p["sih_key"], "qhh": p["qhh_key"],
+                              "shh": p["shh_key"], "bias": p["bias_key"]} for p in layers]
+            replacement = Int8LSTM.from_packed(packed_layers, fused=spec.get("fused", True))
+            rnnt_decoder.prediction["dec_rnn"] = replacement
+            rnnt_decoder._v2_rnnt_w8_original = current
+            custom_loaded += 1
+        elif kind == "codec_depthwise":
+            replacement = DepthwiseConv1dW8.from_packed(
+                tensors[spec["q_key"]].to(device), tensors[spec["scale_key"]].to(device),
+                tensors[spec["bias_key"]].to(device) if spec.get("bias_key") else None)
+            parent_name, child = spec["name"].rsplit(".", 1) if "." in spec["name"] else ("", spec["name"])
+            parent = decoder.get_submodule(parent_name) if parent_name else decoder
+            codec_originals.append((parent, child, current))
+            setattr(parent, child, replacement)
+            custom_loaded += 1
+        elif kind == "codec_transpose":
+            replacement = ConvTranspose1dW8.from_packed(
+                tensors[spec["q_key"]].to(device), tensors[spec["scale_key"]].to(device),
+                tensors[spec["bias_key"]].to(device) if spec.get("bias_key") else None,
+                spec["in_channels"], spec["out_channels"], spec["groups"], spec["kernel_size"],
+                spec["stride"], spec["padding"], spec["output_padding"], spec["dilation"])
+            parent_name, child = spec["name"].rsplit(".", 1) if "." in spec["name"] else ("", spec["name"])
+            parent = decoder.get_submodule(parent_name) if parent_name else decoder
+            codec_originals.append((parent, child, current))
+            setattr(parent, child, replacement)
+            custom_loaded += 1
+    if codec_originals:
+        codec._v2_depthwise_w8_originals = codec_originals
+    if any(spec.get("kind") == "selected_mog" for spec, _ in custom_plan):
+        from mynah_v2.model.perf import _mog_w8_enable
+        _mog_w8_enable(engine)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"path": str(path), "modules": len(plan), "custom_modules": custom_loaded, "skipped": missing,
+            "format": W8_BUNDLE_FORMAT, "weight_only": manifest.get("weight_only", False),
+            "unsupported_scopes": manifest.get("unsupported_scopes", [])}
+# End of quantization helpers.

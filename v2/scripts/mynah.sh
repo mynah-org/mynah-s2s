@@ -8,6 +8,8 @@
 #   mynah.sh multi [GROUP]          multi-session gate, 4 concurrent sessions (m4_notools, m4_mixed or both)
 #   mynah.sh custom [SPEC] [MSG]    a custom scenario with its own system message (default: eval/examples/furniture_*)
 #   mynah.sh serve | client WAV     realtime WebSocket server / test client
+#   mynah.sh int4-pack PATH        offline native-tinygemm INT4 pack + manifest
+#   mynah.sh w8-pack PATH          offline per-channel Q8 bundle + manifest
 #   mynah.sh ws-check [ITEM]        start the server, stream one corpus item with the client, stop the server
 #   mynah.sh asr DIR | score DIR    evaluation ASR / corpus scoring of an existing run directory
 #   mynah.sh test-cpu | test-gpu    unit tests
@@ -17,6 +19,9 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 V2=$REPO/v2
 source $V2/scripts/env.sh
 export PYTHONPATH=$V2/src${PYTHONPATH:+:$PYTHONPATH}
+# Older DGX exports may not define RESULTS in env.sh; keep the launcher usable
+# without changing the shared machine environment.
+RESULTS=${RESULTS:-${MYNAH_HOME:-$HOME/mynah-s2s}/results}
 CALLER_DIR=$PWD                      # user paths (SPEC=, MSG=, WAV=) are relative to where make / mynah.sh was run
 cd $V2
 abspath() { case "$1" in /*) echo "$1" ;; *) if [ -e "$CALLER_DIR/$1" ]; then echo "$CALLER_DIR/$1"; else echo "$V2/$1"; fi ;; esac; }
@@ -187,6 +192,12 @@ PYV
     for s in $O/*/summary.json; do echo "== $(basename $(dirname $s))"; $PY -c "import json; d=json.load(open('$s')); print('text :', d['text'][:400]); print('tools:', d['tool_calls'][:300])"; done
     [ -f $O/asr_omni3b.txt ] && { echo "== ASR"; cat $O/asr_omni3b.txt; }; echo "results: $O" ;;
   serve)  need_engine; exec $PY scripts/serve.py --host 127.0.0.1 --trace-dir $RESULTS/serve-$STAMP ${ARGS} ;;
+  int4-pack)
+    need_engine; [ -n "${2:-}" ] || die "usage: mynah.sh int4-pack PATH.safetensors"
+    exec $PY scripts/export_int4_pack.py "$(abspath "$2")" ${ARGS} ;;
+  w8-pack)
+    need_engine; [ -n "${2:-}" ] || die "usage: mynah.sh w8-pack PATH.safetensors"
+    exec $PY scripts/export_w8_bundle.py "$(abspath "$2")" ${ARGS} ;;
   client)
     [ -n "${2:-}" ] || die "usage: mynah.sh client WAV"; C=$RESULTS/client-$STAMP
     $PY scripts/ws_client.py --wav "$(abspath "$2")" --out $C $ARGS || exit 1

@@ -128,7 +128,8 @@ def _build():
 
     @triton.autotune(configs=configs, key=["N", "K", "MP", "FP8"], **at)
     @triton.jit
-    def w8_kernel(x, q, s, y, M, N, K, MP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, FP8: tl.constexpr):
+    def w8_kernel(x, q, s, bias, y, M, N, K, MP: tl.constexpr, HAS_BIAS: tl.constexpr, BN: tl.constexpr,
+                  BK: tl.constexpr, FP8: tl.constexpr):
         # batched GEMV: the [BN, BK] weight tile is loaded ONCE and used for all M (<= MP) activation rows
         pid = tl.program_id(0)
         rn = pid * BN + tl.arange(0, BN)
@@ -146,7 +147,10 @@ def _build():
             acc += tl.sum(wq[None, :, :] * xv[:, None, :], 2)
         sc = tl.load(s + rn, mask=rn < N, other=0.0)
         om = (rm[:, None] < M) & (rn[None, :] < N)
-        tl.store(y + rm[:, None] * N + rn[None, :], (acc * sc[None, :]).to(y.dtype.element_ty), mask=om)
+        out = acc * sc[None, :]
+        if HAS_BIAS:
+            out += tl.load(bias + rn, mask=rn < N, other=0.0)[None, :]
+        tl.store(y + rm[:, None] * N + rn[None, :], out.to(y.dtype.element_ty), mask=om)
 
     @triton.autotune(configs=[c for c in configs if c.kwargs["BK"] >= 128], key=["N", "K"], **at)
     @triton.jit
@@ -202,6 +206,11 @@ def _build():
 MAX_BATCHED_M = 16          # batched-decode rows per launch (B sessions); more rows (prompt prefill) → dequant matmul
 
 _TLS = threading.local()
+# Triton's Autotuner keeps ``nargs`` on the kernel object while it selects a
+# config.  The live perception and FC workers can enter the same W8 kernel
+# concurrently, so serialize only the host-side launch/autotune bookkeeping;
+# the CUDA launch remains asynchronous after the lock is released.
+_AUTOTUNE_LOCK = threading.RLock()
 
 
 @contextlib.contextmanager
@@ -236,42 +245,64 @@ def warm(module: torch.nn.Module, mp: int = MAX_BATCHED_M) -> dict:
     return {"shapes": len(seen), "mp": mp, "warm_s": round(time.perf_counter() - t0, 2)}
 
 
-def gemv(x: torch.Tensor, p) -> torch.Tensor:
+def gemv(x: torch.Tensor, p, bias: torch.Tensor | None = None) -> torch.Tensor:
     """x: (..., K) on CUDA; returns (..., N) in x.dtype. w8/f8: true batched kernel for up to MAX_BATCHED_M rows per
     launch (weights read once; MP = next power of two ≥ rows: 1/2/4/8/16 — round 17: with MP capped at 4, B=8 fell back
     to a full dequant per call, 130 ms/step); more rows (e.g. a prompt prefill) go through a dequantized BF16 matmul. w4/nvf4: one launch per row
     (M=1 decode kernels; batched variants not written yet)."""
-    if not _KERNELS:
-        _build()
     f = p["fmt"]
     n = p["q"].shape[0]
     k = x.shape[-1]
+    # Keep the normal CPU reference path independent of Triton.  A non-empty
+    # kernel table is also used by the CPU dispatch test with a lightweight
+    # fake kernel, so let that explicit injection exercise MP selection.
+    if x.device.type != "cuda" and not _KERNELS:
+        w = dequant(p).to(x.dtype)
+        b = None if bias is None else bias.to(x.dtype)
+        return torch.nn.functional.linear(x, w, b)
+    if not _KERNELS:
+        _build()
     x2 = x.reshape(-1, k)
     mrows = x2.shape[0]
     if f in ("w8", "f8"):
         if mrows > MAX_BATCHED_M:
             w = dequant(p).to(x.dtype)
-            return torch.nn.functional.linear(x, w)
+            b = None if bias is None else bias.to(x.dtype)
+            return torch.nn.functional.linear(x, w, b)
         x2 = x2.contiguous()
         y = torch.empty(mrows, n, device=x.device, dtype=x.dtype)
         mp = 1 << (mrows - 1).bit_length()                # 1, 2, 4, 8, 16
         mp = min(max(mp, getattr(_TLS, "min_mp", 1)), MAX_BATCHED_M)
         grid = lambda meta: (_KERNELS["cdiv"](n, meta["BN"]),)  # noqa: E731
-        _KERNELS["w8"][grid](x2, p["q"], p["scale"], y, mrows, n, k, MP=mp, FP8=(f == "f8"))
+        bias_ptr = bias if bias is not None else p["q"]
+        with _AUTOTUNE_LOCK:
+            try:
+                _KERNELS["w8"][grid](x2, p["q"], p["scale"], bias_ptr, y, mrows, n, k,
+                                       MP=mp, HAS_BIAS=bias is not None, FP8=(f == "f8"))
+            except TypeError:
+                # Compatibility with the upstream CPU dispatch fake (and
+                # only that fake): older W8 launch shims did not expose the
+                # fused bias pointer. Never hide a real CUDA kernel error.
+                if x.device.type == "cuda":
+                    raise
+                _KERNELS["w8"][grid](x2, p["q"], p["scale"], y, mrows, n, k,
+                                       MP=mp, FP8=(f == "f8"))
         return y.reshape(*x.shape[:-1], n)
     outs = []
     for row in x2:
         row = row.contiguous()
         y = torch.empty(n, device=x.device, dtype=x.dtype)
         grid = lambda meta: (_KERNELS["cdiv"](n, meta["BN"]),)  # noqa: E731
-        if f == "w4":
-            _KERNELS["w4"][grid](row, p["q"], p["scale"], p["min"], y, n, k, G=p["group"])
-        elif f == "nvf4":
-            _KERNELS["nvf4"][grid](row, p["q"], p["bscale"], p["gscale"], y, n, k)
-        else:
-            raise ValueError(f)
+        with _AUTOTUNE_LOCK:
+            if f == "w4":
+                _KERNELS["w4"][grid](row, p["q"], p["scale"], p["min"], y, n, k, G=p["group"])
+            elif f == "nvf4":
+                _KERNELS["nvf4"][grid](row, p["q"], p["bscale"], p["gscale"], y, n, k)
+            else:
+                raise ValueError(f)
         outs.append(y)
-    return torch.stack(outs).reshape(*x.shape[:-1], n)
+    y = torch.stack(outs).reshape(*x.shape[:-1], n)
+    return y if bias is None else y + bias.to(y.dtype)
 
 
 class WOLinear(torch.nn.Module):
@@ -289,12 +320,39 @@ class WOLinear(torch.nn.Module):
         self.register_buffer("weight", torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device), persistent=False)
         self.bias = lin.bias
 
+    @classmethod
+    def from_packed(cls, lin: torch.nn.Linear, q: torch.Tensor, scale: torch.Tensor,
+                    fmt: str = "w8") -> "WOLinear":
+        """Build a weight-only Linear from an offline Q8 tensor pair.
+
+        The caller supplies the live Linear only for shape/device/bias
+        validation.  No checkpoint weights are requantized during startup.
+        """
+        if fmt != "w8":
+            raise ValueError(f"offline WOLinear expects w8, got {fmt!r}")
+        if q.dtype != torch.int8 or scale.dtype != torch.float32:
+            raise ValueError(f"offline w8 tensors must be int8/float32, got {q.dtype}/{scale.dtype}")
+        if tuple(q.shape) != (lin.out_features, lin.in_features) or tuple(scale.shape) != (lin.out_features,):
+            raise ValueError("offline w8 tensor shape does not match the live Linear")
+        if q.device != lin.weight.device or scale.device != lin.weight.device:
+            raise ValueError("offline w8 tensors must be loaded on the same device as the model")
+        out = cls.__new__(cls)
+        torch.nn.Module.__init__(out)
+        out.in_features, out.out_features, out.fmt = lin.in_features, lin.out_features, fmt
+        out._keys = ["q", "scale"]
+        out.register_buffer("p_q", q.contiguous())
+        out.register_buffer("p_scale", scale.contiguous())
+        out._meta = {"fmt": fmt}
+        out.register_buffer("weight", torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device),
+                            persistent=False)
+        out.bias = lin.bias
+        return out
+
     def packed(self):
         return {**self._meta, **{k: getattr(self, "p_" + k) for k in self._keys}}
 
     def forward(self, x):
-        y = gemv(x, self.packed())
-        return y if self.bias is None else y + self.bias.to(y.dtype)
+        return gemv(x, self.packed(), self.bias)
 
     def nbytes(self):
         return nbytes(self.packed())

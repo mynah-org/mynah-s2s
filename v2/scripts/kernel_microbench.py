@@ -69,10 +69,11 @@ def main():
             r = {"K": k, "N": n, "layers": layers}
             r["bf16"] = {"us": timeit(lambda: F.linear(x, w)), "bytes": w.numel() * 2, "fmt_err": rel(F.linear(x, w), ref)}
             try:                                                   # torch-native int4 tinygemm
-                from mynah_v2.model.quant import quantize_int4
-                packed, sz = quantize_int4(w, 128, 8)
-                y = torch._weight_int4pack_mm(x, packed, 128, sz)
-                r["int4_tinygemm"] = {"us": timeit(lambda: torch._weight_int4pack_mm(x, packed, 128, sz)),
+                from mynah_v2.model.quant import _pick, quantize_int4
+                group, tiles = _pick(k, 128)
+                packed, sz = quantize_int4(w, group, tiles)
+                y = torch._weight_int4pack_mm(x, packed, group, sz)
+                r["int4_tinygemm"] = {"group": group, "us": timeit(lambda: torch._weight_int4pack_mm(x, packed, group, sz)),
                                       "bytes": packed.numel() * packed.element_size() + sz.numel() * 2,
                                       "fmt_err": rel(y, ref)}
             except Exception as e:  # noqa: BLE001

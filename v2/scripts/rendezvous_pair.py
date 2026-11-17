@@ -147,6 +147,10 @@ def main():
                     "default: the exact pair (mamba_host_pos + no_timer_sync)")
     ap.add_argument("--exp", default=None, help="comma list of perf experiments applied after the profile (solo AND pair), "
                     "e.g. fc_ctx_fix")
+    ap.add_argument("--int8", action="store_true", default=os.environ.get("MYNAH_INT8", "").lower() in {"1", "true", "yes", "on"},
+                    help="enable the complete runtime Q8 path, including specialized batched-safe kernels")
+    ap.add_argument("--int8-pack", default=os.environ.get("MYNAH_INT8_PACK"),
+                    help="load one offline Q8 .safetensors bundle and enable its complete runtime path")
     ap.add_argument("--breakdown", action=argparse.BooleanOptionalAction, default=None,
                     help="per-component CUDA-event breakdown (perception / Thinker / EarTTS / codec, FC threads tagged) "
                          "for the solo phase and the multi-session phase (runtime/comp_timer.py)")
@@ -211,12 +215,40 @@ def main():
     sess = group["sessions"][: a.max_sessions]       # N-session gate (B = N rows in the batched backend)
     srcs = {k: json.loads((Path(a.spec).parent / v).read_text()) for k, v in spec["sources"].items()}
     preset_info = presets.fill(a, presets.MULTI, a.preset)
+    if a.int8_pack and a.int8:
+        raise SystemExit("use only one of --int8 and --int8-pack")
+    if a.int8_pack:
+        a.int8 = True
+    if a.int8:
+        # The offline bundle and the dynamic Q8 path already replace these
+        # Thinker linears.  Leaving the profile's legacy experiment in place
+        # would wrap WOLinear a second time and defeat atomic bundle loading.
+        current = [x for x in (a.exp or "").split(",") if x and x != "wor:w8:mlp"]
+        current += [x for x in ("eartts_mog_w8", "eartts_rvq_w8", "codec_depthwise_w8", "rnnt_decoder_w8")
+                    if x not in current]
+        a.exp = ",".join(current)
+        preset_info = {**preset_info, "exp": a.exp}
     a.profile = presets.multi_profile_for(len(sess), a.profile)
     print("PRESET", a.preset, preset_info, "profile", a.profile, flush=True)
 
     eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo"), overrides=presets.determinism_overrides(a)),
                           fc_ctx_fix=a.fc_ctx_fix)
     det_info = presets.apply_determinism(a)
+    q8_info = None
+    if a.int8:
+        if a.int8_pack:
+            from mynah_v2.model.quant import load_w8_bundle
+            q8_info = load_w8_bundle(eng, a.int8_pack)
+            print("INT8_PACK " + json.dumps(q8_info, default=str), flush=True)
+        else:
+            from mynah_v2.model.eartts_q8 import quantize_eartts_w8
+            from mynah_v2.model.quant import quantize_extended_w8, quantize_thinker_w8
+            q8_info = {
+                "thinker": quantize_thinker_w8(eng, include_heads=True),
+                "eartts": quantize_eartts_w8(eng),
+                "extended": quantize_extended_w8(eng),
+            }
+            print("INT8_DYNAMIC " + json.dumps(q8_info, default=str), flush=True)
     prof, prof_info = None, None
     if prof_win is not None:                             # label before the profile: the fused norms keep the labels
         from mynah_v2.runtime import comp_timer as _ct
@@ -565,6 +597,7 @@ def main():
 
     # ------------------------------------------------------------------ compare
     res = {"tick_s": TICK, "group": a.group, "graphs": bool(a.graphs), "profile": a.profile or "exact-pair", "exp": exp_info, "preset": a.preset, "optimisations": opt,
+           "int8": bool(a.int8), "int8_pack": str(a.int8_pack) if a.int8_pack else None, "int8_info": q8_info,
            "fc_ctx_fix_info": {k: v for k, v in eng.fc_ctx_fix_info.items() if k != "fix"}, "breakdown": breakdown, "gpu": torch.cuda.get_device_name(), "sessions": {},
            "rendezvous_stats": {k: (v if not isinstance(v, dict) else {str(x): y for x, y in v.items()})
                                 for k, v in stats.items()},

@@ -30,11 +30,8 @@ See [`docs/research-summary.md`](docs/research-summary.md) (findings and ideas),
 
 **Work in progress.** What is measured today (details in `docs/benchmarks.md`):
 
-- **One session runs in real time** on an RTX 6000 Ada (BF16, RTF 0.71-0.74, including a tool call). One session on
-  an L40S has not been benchmarked separately.
-- **GB10 (128 GB unified memory) runs everything but is not real time**, even for one session (each 80 ms step
-  takes longer than 80 ms); use it to test and develop, not to judge latency. Its runs are not part of our
-  benchmarks.
+- **One session has a measured realtime profile** in BF16, including a tool call. Results vary by GPU and software
+  stack, so use the benchmark commands below for your target machine.
 - **Several concurrent sessions are not yet real time.** Four sessions on an L40S: round p95 173 ms without tool
   calls and 322 ms with two calls running (budget 160 ms per round). On an RTX 6000 Ada, four sessions without
   tools are close (throughput 25.9 session-chunks/s, lag ≤ 1.1 s) but still above the budget at p95.
@@ -48,12 +45,12 @@ See [`docs/research-summary.md`](docs/research-summary.md) (findings and ideas),
   Details in `docs/architecture.md` ("Function calls").
 - **Model limits** (NVIDIA's card and our tests): English only; spelled IDs and numbers are often misheard; no
   barge-in while a tool runs; about two minutes of trained context.
-- **All numbers come from specific GPUs and synthetic English test speech**; expect different results elsewhere.
+- **All numbers come from synthetic English test speech**; expect different results on other hardware and data.
 
 ## Requirements
 
-- Linux (x86_64 or aarch64), NVIDIA GPU with ≥ 46 GB memory for one VoiceChat instance (tested: RTX 6000 Ada 48 GB,
-  L40S 46 GB, GB10 128 GB unified memory). The 11B model in BF16 needs ~42 GB at peak for one session.
+- Linux (x86_64 or aarch64), NVIDIA GPU with ≥ 46 GB memory for one VoiceChat instance. The 11B model in BF16 needs
+  ~42 GB at peak for one session.
 - CUDA 13.x toolkit, Python 3.12, [uv](https://docs.astral.sh/uv/), git, `make`, ~70 GB of disk; `ffmpeg` is
   optional (silences an audio-library warning).
 - The evaluation ASR (spoken-output check) installs out of the box on x86_64 only; on aarch64 the suites run and
@@ -73,6 +70,57 @@ make corpus     # renders the synthetic test audio (a few minutes)
 make demo       # one call: "Can you look up order A B C four five six?" -> tool call -> spoken answer
 make help       # all targets
 ```
+
+## Web UI
+
+The local HTML5 voice-agent UI lives in `webui/`. It runs with Python and `uv`,
+without Node.js or a frontend build step. The default demo uses simulated
+scenarios and tool calls, so it does not require a model or GPU:
+
+```bash
+make webui
+```
+
+Open <http://127.0.0.1:8787>. To start the V2 runtime and connect the UI in one
+command, use. This target starts the measured INT4 + cuDNN benchmark
+configuration by default:
+
+```bash
+make webui-gpu
+```
+
+For BF16, override the Make variable explicitly, for example
+`make webui-gpu V2_SERVE_ARGS="--cudnn-benchmark"`. Direct `make serve` remains
+BF16 unless `--int4` or `MYNAH_INT4=1` is supplied. The INT4 path is also
+available explicitly (the equivalent environment variable is `MYNAH_INT4=1`):
+
+```bash
+make webui-gpu V2_SERVE_ARGS="--int4 --cudnn-benchmark"
+```
+
+For quantization profiles, fusion coverage, offline bundles, and validation
+results, see [`docs/q8-quantization.md`](docs/q8-quantization.md).
+The short operational commands are:
+
+```bash
+make int4-pack INT4_PACK=/path/to/voicechat-int4.safetensors
+make w8-pack W8_PACK=/path/to/voicechat-w8.safetensors
+make webui-gpu V2_SERVE_ARGS="--int8-pack /path/to/voicechat-w8.safetensors"
+```
+
+The UI is in English and shows the User/Agent conversation, microphone and
+speaker controls, model activity, tool calls, and an optional editable system
+prompt. More details are in [`webui/README.md`](webui/README.md).
+
+If the UI is opened from another machine and the browser does not offer a
+microphone permission, use an SSH port-forward and open the local URL instead:
+
+```bash
+ssh -N -L 8787:127.0.0.1:8787 -L 8788:127.0.0.1:8788 <user>@<host>
+```
+
+Then visit <http://127.0.0.1:8787>. Browsers require `localhost` or HTTPS for
+microphone capture; speakers normally do not show a separate permission prompt.
 
 | goal | command |
 |---|---|
