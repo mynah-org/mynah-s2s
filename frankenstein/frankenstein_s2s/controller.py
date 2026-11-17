@@ -34,9 +34,12 @@ PRIORITY = {
     "USER_SPEECH_START": 0, "USER_SPEECH": 0,         # barge-in evidence
     "CANCEL": 1,
     "TOOL_CALL": 2, "TOOL_RESULT": 2, "TOOL_TIMEOUT": 2,
-    "REPLY_TOKENS": 3, "REPLY_DONE": 3,
-    "YIELD": 4, "TAKE_TURN": 5, "EOU": 5, "USER_SPEECH_END": 6, "WORDS": 6,
-    "AUDIO_STARTED": 7, "AUDIO_ENDED": 7, "UNDERRUN": 7,
+    "REPLY_TOKENS": 3, "REPLY_DONE": 4,               # tokens of a frame before the end that follows them
+    "YIELD": 5,
+    "WORDS": 6,                                       # a word closed (before a new one opens in the same frame)
+    "WORD_OPEN": 7,                                   # the ASR has emitted pieces of a word not closed yet
+    "EOU": 8, "TAKE_TURN": 9, "USER_SPEECH_END": 10,
+    "AUDIO_STARTED": 11, "AUDIO_ENDED": 11, "UNDERRUN": 11,
 }
 SOURCE_RANK = {"app": 0, "asr": 1, "tool": 2, "nano": 3, "thinker": 4, "talker": 5}
 
@@ -81,6 +84,10 @@ class ControllerConfig:
     reply_timeout: int = 40        # PENDING without reply tokens: close the turn (3.2 s)
     tool_timeout: int = 100        # TOOL_WAIT without a result: resume with an error (8 s)
     eou_fallback: bool = True      # an ASR EOU opens the turn when the Thinker stays silent
+    merge_frames: int = 12         # caller words arriving this soon after an open, before anything was spoken,
+                                   # are merged into a NEW request that supersedes the pending one
+    barge_guard: int = 0           # user speech counts for barge-in only from this many frames after the turn opened
+                                   # (the ASR tail of the words just spoken is not a barge-in)
 
 
 class Controller:
@@ -103,6 +110,8 @@ class Controller:
         self.opened_k = None
         self.last_reply_k = None
         self.tool_since_k = None
+        self.open_word = False
+        self.spoken_in_turn = False
 
     # ------------------------------------------------------------------ input
     def post(self, it: Intent) -> None:
@@ -153,6 +162,7 @@ class Controller:
         self.opened_k = k
         self.last_reply_k = None
         self.heard_since_turn = False
+        self.spoken_in_turn = False
         self.deferred = None
         self._act("OPEN_TURN", k, reason)
         self._act("REQUEST_REPLY", k, reason, request_id=self.request_id, user_text=user_text)
@@ -177,6 +187,8 @@ class Controller:
             return "debounce_after_cancel"
         if k - self.last_speech_k < self.cfg.min_blank:
             return "asr_speech_recent"
+        if self.open_word:
+            return "asr_word_open"
         if self.turn > 0 and not self.heard_since_turn:
             return "no_new_caller_words"
         return None
@@ -188,7 +200,8 @@ class Controller:
     def _on_user_speech(self, it, k):
         self.speech_run += 1
         self.last_speech_k = it.k
-        if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT):
+        if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT) and \
+                (self.opened_k is None or it.k - self.opened_k >= self.cfg.barge_guard):
             if self.speech_run >= self.cfg.barge_in_frames:
                 self._cancel(k, "barge_in")
             elif self.state is St.SPEAKING:
@@ -199,6 +212,15 @@ class Controller:
 
     def _on_words(self, it, k):
         self.heard_since_turn = True
+        self.open_word = False
+        if self.state is St.PENDING and not self.spoken_in_turn and self.opened_k is not None \
+                and k - self.opened_k <= self.cfg.merge_frames:
+            old = self.request_id
+            self.request_id += 1
+            self._act("REQUEST_REPLY", k, "merge_fragment", request_id=self.request_id, supersedes=old)
+
+    def _on_word_open(self, it, k):
+        self.open_word = True
 
     def _on_cancel(self, it, k):
         if self.state is not St.LISTENING:
@@ -210,7 +232,7 @@ class Controller:
         why = self._may_open(k)
         if why is None:
             self._open(k, f"thinker_{it.payload or 'bos'}")
-        elif why == "asr_speech_recent":
+        elif why in ("asr_speech_recent", "asr_word_open"):
             self.deferred = it                           # sources disagree: keep it, retry when the ASR is blank
             self._act("DEFER", k, why, signal=it.payload or "bos")
         else:
@@ -230,6 +252,7 @@ class Controller:
         if why or self.state not in (St.PENDING, St.SPEAKING):
             return self._stale(it, k, why or f"state_{self.state.value}")
         self.state = St.SPEAKING
+        self.spoken_in_turn = True
         self.last_reply_k = k
         self._act("SPEAK", k, "reply_tokens", ids=list(it.payload or []), request_id=it.request_id)
 

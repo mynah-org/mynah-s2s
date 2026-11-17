@@ -26,38 +26,18 @@ from e1.tool_step_probe import STEP_Q
 STOPS = (12, 11, 2)
 
 
-class NanoWorker(threading.Thread):
-    def __init__(self, tok, model, system: str, tools: list, bound: dict, backend=None, parse=None,
-                 max_new: int = 80, tool_step: bool = True):
-        super().__init__(daemon=True, name="nano-worker")
-        import torch
-        from mynah_v2.model.llm_cache import _hybrid_cache_cls, cache_passing_attention, position_injecting_forward
-        self.torch = torch
-        self.tok, self.m = tok, model
-        self.system, self.tools, self.bound, self.backend, self.parse = system, tools, bound, backend, parse
-        self.max_new, self.tool_step = max_new, tool_step
-        llm = model.backbone
-        if not hasattr(llm.forward, "__wrapped_v2__"):
-            llm.forward = position_injecting_forward(llm.forward, holder=llm)
-        for layer in llm.layers:
-            if getattr(layer, "block_type", None) == "attention" and not hasattr(layer.mixer.forward, "__wrapped_v2__"):
-                layer.mixer.forward = cache_passing_attention(layer.mixer.forward, llm)
-        self.llm = llm
-        self.cache_cls = _hybrid_cache_cls(llm)
-        p = next(model.parameters())
-        self.dtype, self.dev = p.dtype, p.device
+class QueueWorker(threading.Thread):
+    """Thread + request queue + cancel / close, model-free (unit-tested). Subclasses implement _serve()."""
+
+    def __init__(self, name: str = "worker"):
+        super().__init__(daemon=True, name=name)
         self.q_in: queue.Queue = queue.Queue()
         self.q_out: queue.Queue = queue.Queue()
         self.cancelled: set = set()
         self.calls: list = []
-        # NO private CUDA stream (E1h): the NemotronH remote code runs every block inside
-        # torch.cuda.stream(torch.cuda.default_stream(...)) (modeling_nemotron_h.py:767), so on a side stream the
-        # block kernels and our embedding / attention-cache / lm_head ops ran on two streams without ordering; the
-        # decode diverged from token 1. On the default stream the cached decode equals the no-cache greedy ids.
-        self.stream = None
         self.stop_flag = False
+        self.served: list = []
 
-    # ------------------------------------------------------------------ API (frame-loop thread)
     def submit(self, rid: int, messages: list) -> None:
         self.q_in.put((rid, [dict(m) for m in messages], time.monotonic_ns()))
 
@@ -82,19 +62,57 @@ class NanoWorker(threading.Thread):
         if self.is_alive():
             self.join(timeout)
 
-    # ------------------------------------------------------------------ worker
     def run(self):
-        torch = self.torch
         while not self.stop_flag:
             job = self.q_in.get()
             if job is None:
                 break
             rid, msgs, t_req = job
+            if rid in self.cancelled:                     # superseded before it started: never served
+                self.q_out.put(("skipped", rid))
+                continue
+            self.served.append(rid)
             try:
-                with torch.inference_mode():
-                    self._serve(rid, msgs, t_req)
+                self._serve_job(rid, msgs, t_req)
             except Exception as e:  # noqa: BLE001 - a failed request must not kill the worker
                 self.q_out.put(("done", rid, "", [], {"error": repr(e)}))
+
+    def _serve_job(self, rid, msgs, t_req):
+        self._serve(rid, msgs, t_req)
+
+    def _serve(self, rid, msgs, t_req):  # pragma: no cover - abstract
+        raise NotImplementedError
+
+
+class NanoWorker(QueueWorker):
+    def __init__(self, tok, model, system: str, tools: list, bound: dict, backend=None, parse=None,
+                 max_new: int = 80, tool_step: bool = True):
+        super().__init__(name="nano-worker")
+        import torch
+        from mynah_v2.model.llm_cache import _hybrid_cache_cls, cache_passing_attention, position_injecting_forward
+        self.torch = torch
+        self.tok, self.m = tok, model
+        self.system, self.tools, self.bound, self.backend, self.parse = system, tools, bound, backend, parse
+        self.max_new, self.tool_step = max_new, tool_step
+        llm = model.backbone
+        if not hasattr(llm.forward, "__wrapped_v2__"):
+            llm.forward = position_injecting_forward(llm.forward, holder=llm)
+        for layer in llm.layers:
+            if getattr(layer, "block_type", None) == "attention" and not hasattr(layer.mixer.forward, "__wrapped_v2__"):
+                layer.mixer.forward = cache_passing_attention(layer.mixer.forward, llm)
+        self.llm = llm
+        self.cache_cls = _hybrid_cache_cls(llm)
+        p = next(model.parameters())
+        self.dtype, self.dev = p.dtype, p.device
+        # NO private CUDA stream (E1h): the NemotronH remote code runs every block inside
+        # torch.cuda.stream(torch.cuda.default_stream(...)) (modeling_nemotron_h.py:767), so on a side stream the
+        # block kernels and our embedding / attention-cache / lm_head ops ran on two streams without ordering; the
+        # decode diverged from token 1. On the default stream the cached decode equals the no-cache greedy ids.
+        self.stream = None
+
+    def _serve_job(self, rid, msgs, t_req):
+        with self.torch.inference_mode():
+            self._serve(rid, msgs, t_req)
 
     def _ids(self, msgs, extra=None):
         ids = self.tok.apply_chat_template([{"role": "system", "content": self.system}] + msgs, tools=self.tools,

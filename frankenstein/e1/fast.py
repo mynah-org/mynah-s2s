@@ -43,11 +43,15 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--cut-s", type=float, default=52.0)
     ap.add_argument("--int4-thinker", action="store_true")
     ap.add_argument("--int4-nano", action="store_true")
+    ap.add_argument("--ctl", action="store_true", help="E1j: controller-driven session(s) instead of the hook")
+    ap.add_argument("--int4-nano-variant-after-s", type=float, default=0.0,
+                    help="E1j: after the bf16 session, quantize Nano INT4 and rerun if the job is younger than this")
     ap.add_argument("--debug-first", action="store_true", help="E1h: check the worker decode against no-cache greedy "
                                                                "first; run the session only if it is exact")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
+    T_START = time.monotonic()
     lab = Path(a.lab_scripts)
     sys.path.insert(0, str(lab / "multilingual"))
     sys.path.insert(0, str(lab / "agentbench"))
@@ -118,6 +122,25 @@ def main():  # pragma: no cover - GPU
         timer._wrap(pcm, "step", "perception")
     timer._wrap(w.model.stt_model, "forward", "thinker_b1")
     timer._wrap(w, "_rnnt_step", "rnnt")
+
+    if a.ctl:
+        from e1 import ctl_session
+        res = ctl_session.run(out, "ctl_bf16", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), a.cut_s,
+                              lab / "agentbench", tool_schemas, timer=timer)
+        print("SPEED ctl_bf16", json.dumps(res["speed"], default=str)[:1500], flush=True)
+        el = time.monotonic() - T_START
+        if a.int4_nano_variant_after_s and el < a.int4_nano_variant_after_s:
+            from mynah_v2.model.quant import quantize_thinker_int4
+            shim = SimpleNamespace(wrapper=SimpleNamespace(model=SimpleNamespace(stt_model=SimpleNamespace(llm=m.backbone))))
+            t0 = time.monotonic()
+            qi = quantize_thinker_int4(shim)
+            print("INT4 nano", json.dumps(qi), round(time.monotonic() - t0, 1), "s", flush=True)
+            res2 = ctl_session.run(out, "ctl_int4nano", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), a.cut_s,
+                                   lab / "agentbench", tool_schemas, timer=timer)
+            print("SPEED ctl_int4nano", json.dumps(res2["speed"], default=str)[:1500], flush=True)
+        else:
+            print("SKIP int4 nano variant, elapsed", round(el), flush=True)
+        return
 
     def factory(tok_, model_, system, tools, bound, backend, parse):
         return NanoWorker(tok_, model_, system, tools, bound, backend, parse, max_new=80, tool_step=True)

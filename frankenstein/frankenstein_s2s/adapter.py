@@ -144,6 +144,14 @@ class TalkerAdapter:
                 self.tool_wait = False
                 self._log(ev.k, f"tool_{ev.kind}", "leave TOOL_WAIT", call_id=ev.call_id)
 
+    def cancel(self, k: int, reason: str) -> bool:
+        """External cancel (the controller is the single writer of turn state): epoch + 1, flush. False if idle."""
+        if self.turn is None and not self.busy:
+            return False
+        self._log(k, "external_cancel", "cancel reply and flush audio", reason=reason)
+        self._cancel(k, reason)
+        return True
+
     def talker_done(self, d: TalkerDone) -> None:
         if d.epoch == self.epoch:
             self.busy.discard((d.turn, d.segment))
