@@ -1,6 +1,7 @@
 """INT4 dispatch: M == 1 delegates to V2's Int4Linear unchanged; M > 1 equals the reference dequantized matmul.
 
-Needs torch and V2 on the GPU host (random small tensors; skipped elsewhere: no model or tensor test on the laptop).
+Needs torch, V2 and CUDA on the GPU host (V2's int4 packing has no CPU kernel; random small tensors; skipped
+elsewhere: no model or tensor test on the laptop). The GPU job runs it before loading the models.
 Run there with FRANK_TORCH_TESTS=1 PYTHONPATH=<v2/src> python -m pytest tests/test_int4_dispatch.py
 """
 
@@ -23,6 +24,7 @@ def _q4(lin):
     return Int4Linear(lin, max_group=128, clip=False)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="V2's int4 packing (_convert_weight_to_int4pack): CUDA only")
 def test_dequant_matches_v2_reference():
     from mynah_v2.model.quant import dequantize_int4_reference
     torch.manual_seed(0)
