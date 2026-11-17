@@ -7,6 +7,9 @@ PHRASES = {
     "it": "Un momento, controllo.",
     "fr": "Un instant, je vérifie.",
     "en": "One moment, let me check.",
+    "de": "Einen Moment, ich schaue nach.",
+    "es": "Un momento, lo compruebo.",
+    "pt": "Um momento, vou verificar.",
 }
 
 

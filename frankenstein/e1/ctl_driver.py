@@ -63,6 +63,7 @@ class CtlDriver:
         self.pump_every = 5
         self.audible = None              # G0: callable -> is agent audio still playing (default: adapter.busy)
         self.fast_barge = False          # G4: see _rnnt_hook
+        self.handed: list = []           # every reply id handed to the adapter, whole session (server engine)
         self.ids_per_frame = 1           # G6: reply ids handed to the adapter per frame (1 = one per 80 ms frame)
         self.holding_cut = "audible"     # "audible": cut a still-audible phrase when the reply starts (E1l);
                                          # "never": the reply queues behind the phrase (G0: a cut in a talker
@@ -139,6 +140,7 @@ class CtlDriver:
                 and to_adapter >= T.FIRST_TEXT_ID:       # G6: hand over every reply id that is ready, not one
             tid = self.queue.pop(0)                      # per 80 ms frame (words still commit only when complete)
             self.spoken.append(tid)
+            self.handed.append(tid)
             self.adapter.feed(_frame(t, tid))
             extra += 1
         self.frames.write({"k": t, "predicted": predicted, "emitted": emitted, "to_adapter": to_adapter,
@@ -244,7 +246,8 @@ class CtlDriver:
                              "supersedes": sup, "t_submit_ns": time.monotonic_ns()}
             self.active_rid = rid
             self.worker.submit(rid, self.messages)
-            self.blog.write({"ev": "brain.submit", "k": t, "rid": rid, "user": text, "supersedes": sup})
+            self.blog.write({"ev": "brain.submit", "k": t, "rid": rid, "user": text, "supersedes": sup,
+                             "history_len": len(self.messages)})
         elif a.kind == "SPEAK":
             if self.reply_bos_needed:
                 self.reply_bos_needed = False
@@ -300,6 +303,7 @@ class CtlDriver:
         if self.queue:
             tid = self.queue.pop(0)
             self.spoken.append(tid)
+            self.handed.append(tid)
             return tid
         if self.close_pending:
             self.close_pending = False

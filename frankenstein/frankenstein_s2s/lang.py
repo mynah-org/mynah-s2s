@@ -28,6 +28,12 @@ LANGUAGES = {
     "fr": SessionLanguage("fr", "fr-FR", "French", "french"),
     "de": SessionLanguage("de", "de-DE", "German", "german"),
     "es": SessionLanguage("es", "es-ES", "Spanish", "spanish"),
+    # the rest of the Qwen3-TTS codec language table (talker); the ASR runs language-auto for these
+    "pt": SessionLanguage("pt", "pt-PT", "Portuguese", "portuguese"),
+    "ru": SessionLanguage("ru", "ru-RU", "Russian", "russian"),
+    "zh": SessionLanguage("zh", "zh-CN", "Chinese", "chinese"),
+    "ja": SessionLanguage("ja", "ja-JP", "Japanese", "japanese"),
+    "ko": SessionLanguage("ko", "ko-KR", "Korean", "korean"),
 }
 
 

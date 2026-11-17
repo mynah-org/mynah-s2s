@@ -47,6 +47,10 @@ from collections import deque
 OUT = None
 
 
+CODEC_LANG = {"it": "italian", "en": "english", "fr": "french", "de": "german", "es": "spanish", "pt": "portuguese",
+              "ru": "russian", "zh": "chinese", "ja": "japanese", "ko": "korean"}
+
+
 def emit(obj):
     OUT.write(json.dumps(obj) + "\n")
     OUT.flush()
@@ -178,6 +182,7 @@ def main():  # pragma: no cover - GPU, talker env
     ap.add_argument("--fast-cp", action="store_true", help="plain loop instead of HF generate for the code predictor")
     ap.add_argument("--profile", action="store_true", help="time the code predictor separately (extra syncs)")
     ap.add_argument("--cp-graph", action="store_true", help="G5: the code-predictor loop as one CUDA graph")
+    ap.add_argument("--clone", action="append", default=[], help="NAME=reference.wav: a selectable clone voice")
     ap.add_argument("--prio", default="", choices=["", "high"],
                     help="G4: run all talker GPU work on a highest-priority CUDA stream of this process. CUDA stream "
                          "priorities act inside one context; across processes (the engine is another process) they "
@@ -188,14 +193,28 @@ def main():  # pragma: no cover - GPU, talker env
     sys.path.insert(0, a.harness)
     import numpy as np
     import torch
-    from flash_rt import LEFT_CTX, RAMP, FRAME_S, FlashTalker, Sampling
+    from flash_rt import LEFT_CTX, RAMP, ROLE, FRAME_S, FlashTalker, Sampling
     t0 = time.monotonic()
     ft = FlashTalker(a.root)
-    xvec, vname = ft.voice(a.voice, a.lang)
+    clones = dict(x.split("=", 1) for x in a.clone)
+    xvec, vname = ft.voice(clones.get(a.voice, a.voice), a.lang)
+    cur = {"lang": a.lang, "xvec": xvec, "voice": vname}
+    builtin = sorted(p.stem for p in (ft.root / "voices").glob("*.pt")) if (ft.root / "voices").exists() else []
     s = Sampling()
     load_s = round(time.monotonic() - t0, 1)
     emit({"ev": "ready", "load_s": load_s, "voice": vname, "lang": a.lang,
+          "languages": sorted(ft.tc.codec_language_id), "voices": sorted(set(clones) | set(builtin)),
           "mem_alloc_gb": round(torch.cuda.memory_allocated() / 2 ** 30, 2)})
+
+    def prefill(first_id):
+        """flash_rt.FlashTalker.prefill_embeds with the codec language NAME of the session (any language of the
+        talker's codec table, not only flash_rt's short list)."""
+        lid = ft.tc.codec_language_id[CODEC_LANG.get(cur["lang"], cur["lang"])]
+        codec = torch.cat([ft.ce([ft.tc.codec_think_id, ft.tc.codec_think_bos_id, lid, ft.tc.codec_think_eos_id]),
+                           cur["xvec"], ft.ce([ft.tc.codec_pad_id, ft.tc.codec_bos_id])], 1)
+        body = torch.cat([ft.pad.expand(-1, codec.shape[1] - 2, -1), ft.bos], 1) + codec[:, :-1]
+        first = ft.te([first_id]) + codec[:, -1:]
+        return torch.cat([ft.te(ROLE), body, first], 1)
 
     cmds: queue.Queue = queue.Queue()
 
@@ -301,6 +320,13 @@ def main():  # pragma: no cover - GPU, talker env
                               "frames": len(x.codes), "t_ns": time.monotonic_ns()})
                 elif key[0] in dead_epochs:
                     pass
+                elif op == "session":                       # server engine: language + voice of a session
+                    if cmd.get("lang"):
+                        cur["lang"] = cmd["lang"]
+                    if cmd.get("voice"):
+                        v = cmd["voice"]
+                        cur["xvec"], cur["voice"] = ft.voice(clones.get(v, v), cur["lang"])
+                    emit({"ev": "session", "lang": cur["lang"], "voice": cur["voice"]})
                 elif op == "start":
                     gg = Gen(*key, ft.encode_text(cmd["text"]))
                     pending.append(gg)
@@ -323,7 +349,7 @@ def main():  # pragma: no cover - GPU, talker env
                     continue
                 sync()
                 c0 = time.perf_counter()
-                out = ft.tk(inputs_embeds=ft.prefill_embeds(g.ids[0], a.lang, xvec), use_cache=True,
+                out = ft.tk(inputs_embeds=prefill(g.ids[0]), use_cache=True,
                             attention_mask=None, generation_step=None)
                 sync()
                 stats["prefill_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
