@@ -73,9 +73,14 @@ class NanoWorker(threading.Thread):
             except queue.Empty:
                 return out
 
-    def close(self) -> None:
+    def close(self, timeout: float = 30.0) -> None:
+        """Stop after the current request and wait for the thread (E1i aborted at interpreter exit with the worker
+        still decoding: 'terminate called without an active exception')."""
         self.stop_flag = True
+        self.cancelled.update(range(0, 10 ** 6))
         self.q_in.put(None)
+        if self.is_alive():
+            self.join(timeout)
 
     # ------------------------------------------------------------------ worker
     def run(self):
