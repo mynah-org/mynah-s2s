@@ -138,6 +138,10 @@ def main():  # pragma: no cover - GPU
             save()
             print("STOP codes differ", flush=True)
             return
+        # G5: a talker process that already ran (CUDA context, caching allocator, graph pool) made the engine load
+        # fail with a CUDA OOM on this unified-memory host; load the engine first, then a fresh talker (G4 order)
+        proc.close()
+        proc = None
     t0 = time.monotonic()
     eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo"), overrides={"s2s.decode_audio": False}),
                           llm_cache=True)
