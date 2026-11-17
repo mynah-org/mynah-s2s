@@ -349,6 +349,11 @@ class M1Force:
                     self.async_stats["stale_tokens"] += 1
                 self.ftr.emit("adapter.stale_drop", t, what=f"brain_{kind}", rid=rid, active=self.active_rid)
                 continue
+            if kind == "tok" and ev[2] < T.FIRST_TEXT_ID:
+                # a special id from the text LLM (E1g: id 0 crashed the run): never spoken, traced
+                self.async_stats["special_ids"] = self.async_stats.get("special_ids", 0) + 1
+                self.ftr.emit("adapter.drop", t, what="brain_special_id", action="dropped", id=ev[2], rid=rid)
+                continue
             if kind == "tok":
                 if req is not None and req.get("first_tok_k") is None:
                     req["first_tok_k"], req["first_tok_ns"] = t, ev[3]
