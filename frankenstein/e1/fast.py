@@ -43,6 +43,8 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--cut-s", type=float, default=52.0)
     ap.add_argument("--int4-thinker", action="store_true")
     ap.add_argument("--int4-nano", action="store_true")
+    ap.add_argument("--debug-first", action="store_true", help="E1h: check the worker decode against no-cache greedy "
+                                                               "first; run the session only if it is exact")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -90,6 +92,25 @@ def main():  # pragma: no cover - GPU
     info["mem_after_nano_gb"] = round(mem_available_gb(), 1)
     print("NANO", json.dumps({k: info[k] for k in info if "nano" in k}, default=str), flush=True)
     (out / "freeze.json").write_text(json.dumps(info, indent=1, default=str))
+    spec = json.load(open(lab / "agentbench" / "tenant_furniture.json"))
+    if a.debug_first:
+        from e1 import nano_debug
+        from mynah_v2.agent.tools import ToolRegistry
+        from tenant_backend import TenantBackend
+        reg = ToolRegistry()
+        be = TenantBackend(spec)
+        for t_ in spec["tools"]:
+            reg.register(t_["name"], be.handlers()[t_["name"]], t_["description"], t_["parameters"])
+        system = spec["system_prompt"] + "\n" + POLICY["it"] + " /no_think"
+        t0 = time.monotonic()
+        dbg, _wk = nano_debug.run_debug(tok, m, eng, system, tool_schemas(reg), n=20)
+        dbg["debug_s"] = round(time.monotonic() - t0, 1)
+        (out / "nano_debug.json").write_text(json.dumps(dbg, indent=1, ensure_ascii=False, default=str))
+        print("DEBUG", json.dumps({k: v for k, v in dbg.items() if k.startswith(("div_", "exact", "debug_s"))}),
+              json.dumps(dbg["text"], ensure_ascii=False)[:1200], flush=True)
+        if not dbg["exact"]:
+            print("DEBUG: worker decode not exact, session not run", flush=True)
+            return
     timer = CompTimer()
     w = eng.wrapper
     pcm = getattr(w, "perception_cache_mgr", None)
@@ -97,7 +118,6 @@ def main():  # pragma: no cover - GPU
         timer._wrap(pcm, "step", "perception")
     timer._wrap(w.model.stt_model, "forward", "thinker_b1")
     timer._wrap(w, "_rnnt_step", "rnnt")
-    spec = json.load(open(lab / "agentbench" / "tenant_furniture.json"))
 
     def factory(tok_, model_, system, tools, bound, backend, parse):
         return NanoWorker(tok_, model_, system, tools, bound, backend, parse, max_new=80, tool_step=True)

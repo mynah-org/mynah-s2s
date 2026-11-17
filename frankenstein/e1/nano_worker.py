@@ -90,7 +90,7 @@ class NanoWorker(threading.Thread):
                                            add_generation_prompt=True)
         return list(ids) + list(extra or [])
 
-    def _greedy(self, rid, ids, max_new, emit, stop_text=None):
+    def _greedy(self, rid, ids, max_new, emit, stop_text=None, ignore_stops=False, cache_info=False):
         torch = self.torch
         cache = self.cache_cls(self.llm.config, 1, dtype=self.dtype, device=self.dev, ssm_dtype=torch.float32)
         emb = self.llm.embeddings(torch.tensor([ids], device=self.dev))
@@ -102,7 +102,7 @@ class NanoWorker(threading.Thread):
             if rid in self.cancelled:
                 break
             nxt = int(logits.argmax(-1))
-            if nxt in STOPS:
+            if nxt in STOPS and not ignore_stops:
                 break
             out.append(nxt)
             if t_first is None:
@@ -117,8 +117,17 @@ class NanoWorker(threading.Thread):
             logits = self.m.lm_head(h[:, -1]).float()
         torch.cuda.current_stream().synchronize()
         t_end = time.monotonic_ns()
-        return out, {"ctx": len(ids), "n": len(out), "first_ms": round(((t_first or t_end) - t0) / 1e6, 1),
-                     "ms": round((t_end - t0) / 1e6, 1)}
+        info = {"ctx": len(ids), "n": len(out), "first_ms": round(((t_first or t_end) - t0) / 1e6, 1),
+                "ms": round((t_end - t0) / 1e6, 1)}
+        if cache_info:
+            keys = [k for k in getattr(cache, "key_cache", []) if isinstance(k, torch.Tensor) and k.numel()]
+            convs = [c for c in getattr(cache, "conv_states", []) if isinstance(c, torch.Tensor) and c.numel()]
+            info.update(cache_pos=int(getattr(cache, "_v2_pos", -1)), n_key=len(keys), n_conv=len(convs),
+                        key_shape=list(keys[0].shape) if keys else None,
+                        key_dev=str(keys[0].device) if keys else None, key_dtype=str(keys[0].dtype) if keys else None,
+                        conv_dtype=str(convs[0].dtype) if convs else None, cache_cls=type(cache).__name__,
+                        stream=str(torch.cuda.current_stream()))
+        return out, info
 
     def _serve(self, rid, msgs, t_req):
         info = {"t_req_ns": t_req, "t_start_ns": time.monotonic_ns(), "steps": []}
