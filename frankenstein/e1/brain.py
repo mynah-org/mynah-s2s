@@ -3,7 +3,8 @@
   context  Nano-v2 chat template; system = the session prompt + " /no_think"; history of user turns (multilingual ASR
            text) and the agent replies actually spoken; generation prompt.
   reply    llm(embed_tokens(ids)) -> lm_head (the training text_to_text path), greedy, id 12 (= Nano chat EOS = duplex
-           PAD) banned, stop on </s> (2) or <SPECIAL_11> (11), max ``max_new`` tokens.
+           PAD) banned for the first ``min_new`` tokens then a stop, stop on </s> (2) or <SPECIAL_11> (11), max
+           ``max_new`` tokens.
   tools    T1 (DESIGN.md 4.3): decision = function head at the last context position, SOTC (20) vs PAD (12);
            call = the duplex FC fast-path input layout (fusion(agent PAD, audio = the wrapper's silence embedding,
            function = previous function token)) read by function_head, SOTC + the format prefix forced, greedy to
@@ -40,7 +41,7 @@ def fingerprint(cache) -> str:
 
 
 class TextBrain:
-    def __init__(self, eng, tok, system_prompt: str, max_new: int = 90, max_call: int = 56):
+    def __init__(self, eng, tok, system_prompt: str, max_new: int = 70, max_call: int = 56, min_new: int = 4):
         from mynah_v2.model.llm_cache import _hybrid_cache_cls
         w = eng.wrapper
         self.w, self.stt, self.fusion, self.tok = w, w.model.stt_model, w.fusion_module, tok
@@ -49,7 +50,7 @@ class TextBrain:
         self.dtype, self.dev = p.dtype, p.device
         self.cache_cls = _hybrid_cache_cls(self.stt.llm)
         self.system = system_prompt + " /no_think"
-        self.max_new, self.max_call = max_new, max_call
+        self.max_new, self.max_call, self.min_new = max_new, max_call, min_new
         if getattr(w, "_silence_embedding_cache", None) is None:
             w._create_silence_embedding_cache()
         self.sil = w._silence_embedding_cache.reshape(-1).to(self.dev, self.dtype)
@@ -93,10 +94,13 @@ class TextBrain:
             return out
         lg = ans["text_logits"][0, -1].float()
         gen, t1 = [], time.monotonic()
-        for _ in range(self.max_new):
-            lg[PAD] = -float("inf")
+        for i in range(self.max_new):
+            # id 12 is Nano's chat end-of-turn (= duplex PAD): banned for the first tokens (empty replies otherwise),
+            # then accepted as the end of the reply. Banning it everywhere made replies run to max_new (E1 job 4).
+            if i < self.min_new:
+                lg[PAD] = -float("inf")
             nxt = int(lg.argmax())
-            if nxt in (EOS, SPECIAL_11):
+            if nxt in (EOS, SPECIAL_11, PAD):
                 break
             gen.append(nxt)
             ans, cache = self._fwd(self.e(torch.tensor([[nxt]], device=self.dev)).to(self.dtype), cache)

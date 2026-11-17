@@ -164,6 +164,8 @@ class M1Force:
         duplex_change = emitted != expected
         if duplex_change and self.mode == "force":
             self.mismatch.append({"k": t, "expected": expected, "emitted": emitted})
+            if emitted == T.BOS_ID and state_before is ForceState.LISTEN and self.forcer.state is ForceState.LISTEN:
+                self.forcer._open(t, write=None, why="duplex_wrapper_bos")   # the audio path's own timing decision
             if emitted == T.EOS_ID and state_before in (ForceState.WAIT_TEXT, ForceState.FORCING):
                 self.ftr.emit("adapter.barge_in", t, source="duplex_rnnt", what="wrapper_forced_eos",
                               action="cut forced reply")
@@ -200,6 +202,10 @@ class M1Force:
     # ---------------------------------------------------------------------------------------- brain
     def _maybe_close_history(self, t):
         if getattr(self, "_open_turn", None) is not None and self.forcer.state is ForceState.LISTEN:
+            dropped = sum(len(x[1]) for x in self.sched)
+            self.sched = []                    # ids of a closed turn must never reach the next one
+            if dropped:
+                self.ftr.emit("force.turn_close", t, why="drop_unreleased_reply_ids", dropped_reply_ids=dropped)
             spoken = self.tok.decode(self.forcer.turn_ids) if self.forcer.turn_ids else ""
             why = self.forcer.log[-1][2] if self.forcer.log and self.forcer.log[-1][1] == "turn_close" else "?"
             self.messages.append({"role": "assistant", "content": spoken})
@@ -244,7 +250,7 @@ class M1Force:
         ids = [i for i in r["ids"] if i >= T.FIRST_TEXT_ID]
         dropped = [i for i in r["ids"] if i < T.FIRST_TEXT_ID]
         per_tok = r.get("decode_ms_per_tok", 0.0)
-        first_ms = ms_total - per_tok * max(0, len(ids) - 1)
+        first_ms = max(ms_total - per_tok * max(0, len(ids) - 1), r.get("prefill_ms", 0.0) + per_tok)
         for i, tid in enumerate(ids):
             avail = t + math.ceil((first_ms + per_tok * i) / 80.0)
             self.sched.append((avail, [tid], i == len(ids) - 1))

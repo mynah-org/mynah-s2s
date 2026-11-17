@@ -149,3 +149,31 @@ def test_observer_mode_never_writes():
     un()
     assert g.d[0] == model and not hook.mismatch
     assert "_apply_rnnt_turn_taking" not in w.__dict__
+
+
+class SlowBrain(FakeBrain):
+    def run(self, messages, decide_tool=True):
+        r = super().run(messages, decide_tool)
+        r["decode_ms_per_tok"] = 400.0                         # 5 frames per token: most ids still unreleased
+        return r
+
+
+def test_unreleased_ids_of_a_cut_turn_never_reach_the_next_turn():
+    v = FakeVocab()
+    first = [v.id(p) for p in [" uno", " due", " tre", " quattro", " cinque"]]
+    second = [v.id(p) for p in [" sei", "."]]
+    w = FakeWrapper(barge_eos_at=14)
+    tr = Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode, config=AdapterConfig(), tracer=tr)
+    hook = M1Force(w, SlowBrain([first, second]), Tok(v), ASR, ad, tr, Log(), Log(), lambda p: ("{}", 0.0))
+    M1Force.brain_fp = staticmethod(lambda cache: "fp")
+    un = hook.install()
+    model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * 9 + [T.BOS_ID] + [T.PAD_ID] * 30
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    after_second_bos = [x for x in g.d[0][20:] if x >= 1000]
+    assert not set(after_second_bos) & set(first)
+    assert any(e.get("why") == "drop_unreleased_reply_ids" for e in tr.of("force.turn_close"))

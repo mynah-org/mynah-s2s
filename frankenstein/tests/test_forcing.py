@@ -96,3 +96,13 @@ def test_forced_stream_drives_adapter(make_rig):
     assert rig.spoken_text() == "Certo, arriva domani."
     assert [c.reason for c in rig.cmds("FinalizeSegment")] == ["burst_commit"]
     assert rig.logs("eos_after_commit")
+
+
+def test_cut_in_tail_closes_turn():
+    f = AgentChannelForcer()
+    run(f, [BOS])
+    f.add_reply([2001], done=True)
+    run(f, [PAD, PAD], start=1)                               # 2001 forced, then TAIL
+    assert f.state is ForceState.TAIL
+    f.cut()
+    assert f.step(3, PAD).write == EOS and f.state is ForceState.LISTEN

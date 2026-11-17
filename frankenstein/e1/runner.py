@@ -295,7 +295,7 @@ def run_cascade(asr, brain, tok, ad, drv, gate, ftr, frames, blog, reg, backend,
             ms = (_t.monotonic() - t0) * 1e3
             ids = [i for i in r["ids"] if i >= T.FIRST_TEXT_ID]
             per = r.get("decode_ms_per_tok", 0.0)
-            first = ms - per * max(0, len(ids) - 1)
+            first = max(ms - per * max(0, len(ids) - 1), r.get("prefill_ms", 0.0) + per)
             queue = [(k + math.ceil((first + per * i) / 80.0), tid) for i, tid in enumerate(ids)]
             row.update(reply=r["text"], wall_ms=round(ms, 1), first_avail_k=queue[0][0] if queue else None)
             blog.write(row)

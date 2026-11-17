@@ -80,8 +80,8 @@ class AgentChannelForcer:
         self.reply_done = self.reply_done or done
 
     def cut(self) -> None:
-        """Barge-in decided outside (adapter / TurnTaker): stop the reply at the next frame."""
-        if self.state in (ForceState.WAIT_TEXT, ForceState.FORCING):
+        """Barge-in decided outside (adapter / TurnTaker): stop the reply at the next frame (also in the PAD tail)."""
+        if self.state in (ForceState.WAIT_TEXT, ForceState.FORCING, ForceState.TAIL):
             self._cut = True
 
     # ------------------------------------------------------------------------------ per frame
@@ -121,6 +121,8 @@ class AgentChannelForcer:
             self.tracer.emit("force.underrun", k, predicted=predicted)
             return ForcedStep(T.PAD_ID if predicted != T.PAD_ID else None, None)
 
+        if self._cut:
+            return self._close(k, "barge_in")
         return self._tail(k, predicted)
 
     # ------------------------------------------------------------------------------ helpers
