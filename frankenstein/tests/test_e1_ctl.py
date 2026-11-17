@@ -321,3 +321,15 @@ def test_driver_closes_at_audio_end_and_finalizes_text_first():
     assert end_text and close and close[0][2] == "audio_end" and close[0][0] >= 50 > end_text[0][0]
     assert any(type(c).__name__ == "FinalizeSegment" and c.k <= end_text[0][0] + 3 for c in ad.commands)
     assert sum(1 for m in d.messages if m["role"] == "assistant") == 1
+
+
+def test_barge_in_words_go_to_the_next_request():
+    asr = {"words": [{"k": 4, "word": "ciao"}, {"k": 22, "word": "aspetta"}],
+           "pieces": {"3": ["▁ciao"], "18": ["▁asp"], "19": ["et"], "20": ["ta"]},
+           "nonblank": [], "eou": [14]}
+    model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * 30 + [T.BOS_ID] + [T.PAD_ID] * 20
+    d, wk, ad, tr, ids, g = rig(asr, model, {1: [" a", " b", " c", " d", " e", " f", " g", " h", " i", " l", "."],
+                                             2: [" Ok", "."]},
+                                cfg=ControllerConfig(reply_timeout=100, barge_after_open=True))
+    assert any(a.kind == "CANCEL" for a in d.ctl.actions)
+    assert len(wk.submitted) >= 2 and wk.submitted[1][1] == "aspetta"

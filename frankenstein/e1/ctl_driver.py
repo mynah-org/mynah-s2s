@@ -261,6 +261,11 @@ class CtlDriver:
                 self.blog.write({"ev": "history.agent", "k": t, "why": a.reason, "spoken": "", "audio_cut": True})
             else:
                 self._history(t, a.reason)
+            rs = getattr(self.ctl, "run_start_k", None)
+            if a.reason == "barge_in" and rs is not None:
+                # the words that made the barge-in belong to the NEXT request (G3b: "può prenota-" / "Vorrei sa-"
+                # spoken before the cancel were dropped, and the out-of-scope request became a tool call)
+                self.base_k = min(self.base_k, rs - 1)
         elif a.kind == "DROP_STALE" and a.data.get("intent") == "REPLY_TOKENS":
             self.stale += 1
 
