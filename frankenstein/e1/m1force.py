@@ -104,10 +104,12 @@ class UserSide:
 class M1Force:
     def __init__(self, wrapper, brain, tok, asr: dict, adapter, ftr, frames: FrameLog, brain_log: FrameLog,
                  execute_tool, mode: str = "force", tool_turns: bool = True, bos_gate: bool = True,
-                 no_empty_turns: bool = True, eos_hold=None, debounce_frames: int = 0):
+                 no_empty_turns: bool = True, eos_hold=None, debounce_frames: int = 0,
+                 no_new_words_gate: bool = False, hold_cps: float = 0.0, fallback: bool = True):
         assert mode in ("force", "observe", "shell")
         self.forcing = mode in ("force", "shell")     # shell: the controller drives the talker, never gen_text
         self.debounce_frames, self.debounce_until = debounce_frames, -1
+        self.no_new_words_gate, self.hold_cps = no_new_words_gate, hold_cps
         self.bos_gate, self.no_empty_turns = bos_gate, no_empty_turns
         self.opener_done = False
         self.suppressed: list = []
@@ -116,8 +118,9 @@ class M1Force:
         self.frames, self.brain_log, self.execute_tool = frames, brain_log, execute_tool
         self.mode = mode
         self.user = UserSide(asr)
-        self.forcer = AgentChannelForcer(bos_fallback_frames=8, wait_max=150, tail_max=60, eos_hold=eos_hold,
-                                         tracer=ftr)
+        self.forcer = AgentChannelForcer(bos_fallback_frames=8 if fallback else 10 ** 9, wait_max=150, tail_max=60,
+                                         eos_hold=eos_hold, tracer=ftr)
+        self.default_eos_hold = eos_hold
         self.messages: list = []
         self.sched: list = []          # (avail_k, [ids], done)
         self.job_active = False
@@ -182,9 +185,7 @@ class M1Force:
             state_before = self.forcer.state
             pred_in = predicted
             if self.bos_gate and predicted == T.BOS_ID and state_before is ForceState.LISTEN:
-                ok, why = self.user.turn_open(t)
-                if ok and t < self.debounce_until:
-                    ok, why = False, "debounce_after_cancel"
+                ok, why = self._turn_allowed(t)
                 if not ok:
                     pred_in = T.PAD_ID                      # the BOS is not taken: PAD is written instead
                     self.suppressed.append({"k": t, "source": "model_bos", "why": why})
@@ -207,9 +208,7 @@ class M1Force:
         if duplex_change and self.forcing:
             self.mismatch.append({"k": t, "expected": expected, "emitted": emitted})
             if emitted == T.BOS_ID and state_before is ForceState.LISTEN and self.forcer.state is ForceState.LISTEN:
-                ok, why = self.user.turn_open(t) if self.bos_gate else (True, "ok")
-                if ok and t < self.debounce_until:
-                    ok, why = False, "debounce_after_cancel"
+                ok, why = self._turn_allowed(t) if self.bos_gate else (True, "ok")
                 if ok:
                     self.forcer._open(t, write=None, why="duplex_wrapper_bos")   # the audio path's own decision
                 else:
@@ -225,7 +224,11 @@ class M1Force:
                 self.forcer._close(t, "duplex_rnnt_eos", write=None)   # the wrapper already wrote EOS at t
                 self.debounce_until = t + self.debounce_frames
         # adapter (CPU) sees what the talker would get
-        if self.forcing:
+        if self.mode == "shell":
+            # timing shell: the talker follows the controller; a BOS written by the wrapper never reaches it, a
+            # wrapper EOS (RNNT barge-in) does
+            to_adapter = emitted if (duplex_change and emitted == T.EOS_ID) else s.to_adapter
+        elif self.forcing:
             to_adapter = s.to_adapter if not duplex_change else emitted
         else:
             to_adapter = emitted
@@ -253,6 +256,14 @@ class M1Force:
             if self.forcer.need_reply and not self.job_active:
                 self._start_brain(t)
         return out
+
+    def _turn_allowed(self, t):
+        ok, why = self.user.turn_open(t)
+        if ok and t < self.debounce_until:
+            ok, why = False, "debounce_after_cancel"
+        if ok and self.no_new_words_gate and self.opener_done and not self.user.pending:
+            ok, why = False, "no_new_caller_words"
+        return ok, why
 
     # ---------------------------------------------------------------------------------------- brain
     def _maybe_close_history(self, t):
@@ -323,6 +334,11 @@ class M1Force:
             self.sched.append((t + math.ceil(ms_total / 80.0), [], True))
         self.sched.sort(key=lambda x: x[0])
         self._open_turn = {"k": t, "text": r["text"]}
+        if self.hold_cps > 0:
+            # talker-duration hold: EOS once the estimated speaking time of the reply has passed (burst = 1 id/frame)
+            est = math.ceil(len(r["text"]) / self.hold_cps / 0.08)
+            self.forcer.eos_hold = max(0, est - len(ids))
+            rec["eos_hold_frames"] = self.forcer.eos_hold
         rec.update({"reply": r["text"], "n_ids": len(ids), "dropped_special": dropped, "wall_ms": round(ms_total, 1),
                     "first_avail_k": self.sched[0][0] if self.sched else None, "decode_ms_per_tok": per_tok,
                     "duplex_cache_same": fp0 == fp1})

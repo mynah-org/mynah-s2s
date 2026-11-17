@@ -241,3 +241,23 @@ def test_debounce_blocks_bos_right_after_a_cancel():
     un()
     cancel_k = next(c.k for c in ad.commands if type(c).__name__ == "Cancel")   # caller speech 30..33 cut the reply
     assert any(x["why"] == "debounce_after_cancel" and x["k"] < cancel_k + 8 for x in hook.suppressed)
+
+
+def test_no_new_words_gate_turns_a_bare_bos_into_pad():
+    asr = {"words": [{"k": 3, "word": "ciao"}], "nonblank": [1, 2, 3], "eou": [13]}
+    v = FakeVocab()
+    w = FakeWrapper()
+    tr = Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode, config=AdapterConfig(), tracer=tr)
+    hook = M1Force(w, FakeBrain([[v.id(" Ok"), v.id(".")], [v.id(" Si"), v.id(".")]]), Tok(v), asr, ad, tr, Log(), Log(),
+                   lambda p: ("{}", 0.0), no_new_words_gate=True, eos_hold=0)
+    M1Force.brain_fp = staticmethod(lambda cache: "fp")
+    un = hook.install()
+    model = [T.BOS_ID] + [T.PAD_ID] * 25 + [T.BOS_ID] + [T.PAD_ID] * 15 + [T.BOS_ID] + [T.PAD_ID] * 5
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    assert g.d[0][42] == T.PAD_ID and any(x["why"] == "no_new_caller_words" for x in hook.suppressed)
+    assert not hook.skipped

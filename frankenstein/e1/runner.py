@@ -103,6 +103,10 @@ def main():  # pragma: no cover - GPU
                          "with decode_audio=False its log_output() fails on audio_wave=None (E1 job 3)")
     ap.add_argument("--eos-hold", type=int, default=None, help="controller-owned EOS n frames after the forced text")
     ap.add_argument("--debounce-frames", type=int, default=0, help="no new BOS for n frames after a cancel")
+    ap.add_argument("--no-new-words-gate", action="store_true", help="m1f: a BOS without new caller words -> PAD")
+    ap.add_argument("--hold-cps", type=float, default=0.0, help="m1f: hold PAD for the estimated speech time (chars/s)")
+    ap.add_argument("--pure-thinker", action="store_true",
+                    help="ts: force_turn_taking off (no 3.2 s RNNT EOU BOS), no ASR fallback, no BOS gate")
     ap.add_argument("--smoke-s", type=float, default=20.0,
                     help="first run M1-force on the first N s of the first language and stop the job if the "
                          "TECHNICAL invariants fail (0 = no smoke)")
@@ -200,8 +204,18 @@ def main():  # pragma: no cover - GPU
                         res = _bound[parsed["name"]](parsed.get("arguments") or {})
                     return res, round((time.monotonic() - t0) * 1e3, 1)
                 mode = {"m1f": "force", "m0": "observe", "ts": "shell"}[arm]
+                pure = arm == "ts" and a.pure_thinker
                 hook = M1Force(w, brain, tok, asr, ad, ftr, frames, blog, execute_tool, mode=mode,
-                               eos_hold=a.eos_hold, debounce_frames=a.debounce_frames)
+                               eos_hold=a.eos_hold, debounce_frames=a.debounce_frames,
+                               no_new_words_gate=a.no_new_words_gate and arm == "m1f",
+                               hold_cps=a.hold_cps if arm == "m1f" else 0.0,
+                               bos_gate=not pure, fallback=not pure)
+                old_ftt = None
+                if pure:   # the Thinker alone decides BOS: NVIDIA's RNNT forced turn-taking (3.2 s EOU) switched off
+                    from m0_runner import set_model_cfg
+                    old_ftt = set_model_cfg(w.model_cfg, "force_turn_taking", False)
+                    ftr.emit("adapter.drop", None, what="force_turn_taking_off", action="pure Thinker timing",
+                             previous=old_ftt)
                 hook.pump = lambda: pump(ad, drv, gate)
                 uninstall = hook.install()
                 sess = Session(eng, tr, Mode.REFERENCE, None, on_audio=lambda x: None, controller=None)
@@ -214,6 +228,9 @@ def main():  # pragma: no cover - GPU
                 finally:
                     uninstall()
                     tr.close()
+                    if pure:
+                        from m0_runner import set_model_cfg
+                        set_model_cfg(w.model_cfg, "force_turn_taking", old_ftt)
                 v2_text = "".join(sess.text)
                 rec = {"arm": arm, "lang": lang, "agent_text_v2": v2_text, "hook_calls": hook.n_hook,
                        "frames_last": hook.last_t, "mismatch": hook.mismatch[:50], "n_mismatch": len(hook.mismatch),
