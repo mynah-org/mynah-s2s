@@ -69,17 +69,31 @@ WEBUI_PYTHON ?= $(if $(wildcard $(HOME)/mynah-s2s/.venv-v2/bin/python),$(HOME)/m
 # The WebUI path targets the measured GB10 configuration by default. Direct
 # `make serve` remains BF16 unless the caller explicitly passes --int4.
 V2_SERVE_ARGS ?= --int4 --cudnn-benchmark
+# ENGINE=frankenstein: the Frankenstein engine (streaming ASR + Thinker as timing shell + text LLM + talker) behind
+# the same WebSocket protocol. FRANK_DIR = a checkout of the frankenstein-s2s branch; FRANK_SERVE_ARGS = its model
+# paths (see frankenstein/server/serve.py). The UI's LANGUAGE / VOICE selectors are honoured by this engine only.
+ENGINE ?= voicechat
+FRANK_DIR ?=
+FRANK_PORT ?= 8771
+FRANK_SERVE_ARGS ?=
+ifeq ($(ENGINE),frankenstein)
+WEBUI_SERVE_CMD = cd $(FRANK_DIR) && PYTHONPATH=$(FRANK_DIR)/v2/src $(WEBUI_PYTHON) frankenstein/server/serve.py --port $(FRANK_PORT) $(FRANK_SERVE_ARGS)
+WEBUI_V2_WS = ws://127.0.0.1:$(FRANK_PORT)/v1/session
+else
+WEBUI_SERVE_CMD = ARGS="$(V2_SERVE_ARGS)" $(M) serve
+WEBUI_V2_WS = ws://127.0.0.1:8765/v1/session
+endif
 webui: ## local HTML5 UI + Python bridge on http://127.0.0.1:8787 (no Node.js)
 	@if command -v uv >/dev/null 2>&1; then uv run --project webui --no-sync python webui/server.py $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py $(WEBUI_ARGS); fi
 webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ctrl-C
 	@set -e; \
-	ARGS="$(V2_SERVE_ARGS)" $(M) serve >$(WEBUI_GPU_LOG) 2>&1 & gpu_pid=$$!; \
+	( $(WEBUI_SERVE_CMD) ) >$(WEBUI_GPU_LOG) 2>&1 & gpu_pid=$$!; \
 	trap 'kill $$gpu_pid 2>/dev/null || true' EXIT INT TERM; \
 	until grep -q '^READY' $(WEBUI_GPU_LOG); do \
 		kill -0 $$gpu_pid 2>/dev/null || { tail -40 $(WEBUI_GPU_LOG); exit 1; }; \
 		sleep 2; \
 	done; \
-	if command -v uv >/dev/null 2>&1; then uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS); fi
+	if command -v uv >/dev/null 2>&1; then uv run --project webui --extra gpu python webui/server.py --v2-ws $(WEBUI_V2_WS) $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --v2-ws $(WEBUI_V2_WS) $(WEBUI_ARGS); fi
 client: ## stream a WAV to the server at real-time pace: make client WAV=path/to.wav
 	$(M) client $(WAV)
 ws-check: ## non-interactive server + client round trip on one corpus item (WS_ITEM=q03 by default); fails on dropped audio / no answer

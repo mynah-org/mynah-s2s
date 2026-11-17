@@ -82,7 +82,7 @@ class StaticHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/config":
             configured = bool(self.server.v2_ws)
-            self._json({"gpu_configured": configured, "v2_reachable": probe_v2(self.server.v2_ws) if configured else False, "ws_path": "/ws"})
+            self._json({"gpu_configured": configured, "v2_reachable": probe_v2(self.server.v2_ws) if configured else False, "ws_path": "/ws", "ws_port": self.server.ws_port})
             return
         if path == "/" or path == "":
             self.path = "/index.html"
@@ -335,6 +335,7 @@ def main():
     root = Path(__file__).parent
 
     httpd = WebUIHTTPServer((args.host, args.port), lambda *a, **kw: StaticHandler(*a, directory=str(root), **kw), v2_ws=args.v2_ws)
+    httpd.ws_port = args.ws_port                 # reported by /api/config: the page connects to it (any UI port)
     http_thread = threading.Thread(target=httpd.serve_forever, name="webui-http", daemon=True)
     http_thread.start()
     browser_host = args.advertise_host or ("127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host)
