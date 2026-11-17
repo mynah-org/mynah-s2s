@@ -46,10 +46,17 @@ async def run_session(url, wav16, language, voice, seconds, tail_s, busy_probe=N
             wait = t0 + (i // 2) / 16000 - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
-            await ws.send(pcm[i:i + step])
+            try:
+                await ws.send(pcm[i:i + step])
+            except Exception as e:  # noqa: BLE001 - the server closed the session: keep what it said
+                ctrl.append({"type": "client.send_failed", "error": f"{type(e).__name__}: {e}", "at_s": i / 32000})
+                break
             if busy_probe is not None and busy is None and time.monotonic() - t0 > 5:
                 busy = await busy_probe()
-        await ws.send(json.dumps({"type": "session.end"}))
+        try:
+            await ws.send(json.dumps({"type": "session.end"}))
+        except Exception:  # noqa: BLE001
+            pass
         await asyncio.wait_for(rt, 120)
     return {"events": events, "ctrl": ctrl, "audio": bytes(audio), "busy_probe": busy}
 

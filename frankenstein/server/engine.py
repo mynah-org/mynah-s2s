@@ -76,6 +76,24 @@ class BridgeTracer:
         f = {x: v for x, v in fields.items() if v is not None}
         if k is not None:
             f["model_step"] = k
+        if hasattr(self.t, "_subs") and hasattr(self.t, "_fh"):
+            from mynah_v2.tracing import events as E
+            if ev not in E.ALL_EVENTS:
+                # V2's Tracer only accepts its canonical names (I1: the first custom event raised and the server
+                # closed the session). Engine-specific events go through the SAME JSONL file and live listeners,
+                # under their own names, without touching the V2 module.
+                e = E.Event(name=ev, t_ns=self.t.clock(), session_id=self.t.session_id, fields=f)
+                with self.t._lock:
+                    if self.t.events is not None:
+                        self.t.events.append(e)
+                    if self.t._fh:
+                        self.t._fh.write(e.to_json() + "\n")
+                for fn in self.t._subs:
+                    try:
+                        fn(e)
+                    except Exception:  # noqa: BLE001 - same policy as V2: a broken listener never breaks a session
+                        pass
+                return
         self.t.emit(ev, **f)
 
     def write(self, rec: dict) -> None:            # FrameLog-compatible (brain log) -> events too

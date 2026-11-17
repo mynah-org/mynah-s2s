@@ -57,3 +57,19 @@ def test_ws_proxy_reads_session_start_once_and_passes_messages_through():
     m2 = asyncio.run(p.recv())
     assert json.loads(m1)["language"] == "en" and m2 == b"\x00\x00"
     assert seen == [{"type": "session.start", "language": "en", "voice": "v"}] and p.request.path == "/v1/session"
+
+
+def test_bridge_tracer_carries_engine_events_through_a_v2_tracer(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "v2" / "src"))
+    from mynah_v2.tracing.events import Tracer
+    t = Tracer(tmp_path / "s.jsonl", session_id="ws-1", keep=True)
+    seen = []
+    t.subscribe(lambda e: seen.append((e.name, e.session_id)))
+    b = BridgeTracer(t)
+    b.emit("ctl.action", 5, kind="OPEN_TURN", turn_id=1)        # not a V2 name: must not raise
+    b.emit("turn.started", 5, turn_id=1, who="agent")           # a V2 name: V2's own path
+    t.close()
+    lines = [json.loads(x) for x in (tmp_path / "s.jsonl").read_text().splitlines()]
+    assert [x["ev"] for x in lines] == ["ctl.action", "turn.started"]
+    assert all(x.get("session_id") == "ws-1" for x in lines)
+    assert seen == [("ctl.action", "ws-1"), ("turn.started", "ws-1")]
