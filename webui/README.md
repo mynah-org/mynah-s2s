@@ -65,7 +65,7 @@ To open it from another device on the LAN, use `--host 0.0.0.0` and pass the
 machine address so the bridge prints a copy/pasteable URL.
 
 ```bash
-uv run --project webui --no-sync python webui/server.py --host 0.0.0.0 --advertise-host 192.168.1.20
+uv run --project webui --no-sync python webui/server.py --host 0.0.0.0 --advertise-host 192.0.2.20
 ```
 
 The top bar shows bridge and voice-agent state separately. The button becomes

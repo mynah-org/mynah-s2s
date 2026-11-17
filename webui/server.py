@@ -327,7 +327,7 @@ async def websocket_server(host: str, port: int, v2_ws: str | None):
 def main():
     parser = argparse.ArgumentParser(description="Mynah S2S local web UI bridge")
     parser.add_argument("--host", default="127.0.0.1", help="bind address; use 0.0.0.0 for LAN")
-    parser.add_argument("--advertise-host", default=None, help="host printed as the LAN URL (e.g. 192.168.1.20)")
+    parser.add_argument("--advertise-host", default=None, help="host printed as the LAN URL (e.g. 192.0.2.20)")
     parser.add_argument("--port", type=int, default=8787, help="static UI port")
     parser.add_argument("--ws-port", type=int, default=8788, help="browser WebSocket port")
     parser.add_argument("--v2-ws", default=None, help="GPU server URL, e.g. ws://127.0.0.1:8765/v1/session")
