@@ -71,6 +71,7 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--langs", default="it,en")
     ap.add_argument("--max-new", type=int, default=96)
     ap.add_argument("--budget-s", type=float, default=480)
+    ap.add_argument("--nano-dir", default=None, help="Nano-9B-v2 snapshot with weights (overrides the lab default)")
     a = ap.parse_args()
     T0 = time.monotonic()
     out = Path(a.out)
@@ -79,6 +80,8 @@ def main():  # pragma: no cover - GPU
     sys.path.insert(0, str(lab / "multilingual"))
     sys.path.insert(0, str(lab / "agentbench"))
     import llm_text_bench as B2
+    if a.nano_dir:
+        B2.NANO = Path(a.nano_dir)          # same revision, weights downloaded to this host's own cache
     from tenant_backend import TenantBackend
     from mynah_v2.agent.tools import ORDERS_SCHEMA, ToolLedger, ToolRegistry, make_orders_db, orders_tool
     from mynah_v2.tracing.events import Tracer
