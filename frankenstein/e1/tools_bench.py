@@ -238,36 +238,38 @@ def main():  # pragma: no cover - GPU
                   "|", rec["agent_text"][:140], flush=True)
         durations.append(time.monotonic() - t_arm)
         status["done"].append([arm, round(durations[-1], 1)])
-    if a.two_llm_asr_dir and loaded is None:
-        t0 = time.monotonic()
-        tok, m, info = B2.load("nano")
-        info["load_s"] = round(time.monotonic() - t0, 1)
-        (out / "info_nano.json").write_text(json.dumps(info))
-        loaded = "nano"
-        print("LOADED nano", info, flush=True)
     if a.two_llm_asr_dir:
+        from e1.runner import mem_available_gb
+        from e1 import two_llm
         left = a.budget_s - (time.monotonic() - T0)
-        if loaded != "nano" or left < a.two_llm_need_s:
+        if left < a.two_llm_need_s:
             status["skipped"].append("two_llm")
             print("BUDGET: skip two_llm", round(left), flush=True)
         else:
-            from e1.runner import mem_available_gb
-            free = mem_available_gb()
-            print("MEM before engine", round(free, 1), "GB", flush=True)
-            if free < 45:
-                status["skipped"].append(f"two_llm: only {free:.0f} GB free")
-            else:
-                from mynah_v2.model.reference import ReferenceEngine, build_cfg
-                from e1 import two_llm
+            # engine FIRST (it loaded in ~55 s alone; with Nano resident it ran past 120 s in e1d-002), then Nano
+            loads = {"mem_before_engine_gb": round(mem_available_gb(), 1)}
+            print("MEM before engine", loads["mem_before_engine_gb"], "GB", flush=True)
+            from mynah_v2.model.reference import ReferenceEngine, build_cfg
+            t0 = time.monotonic()
+            eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo")), llm_cache=True)
+            loads["engine_load_s"] = round(time.monotonic() - t0, 1)
+            loads["mem_after_engine_gb"] = round(mem_available_gb(), 1)
+            print("LOADED engine", loads, flush=True)
+            if loaded is None:
+                if loads["mem_after_engine_gb"] < 30:
+                    raise SystemExit(f"not enough memory for Nano: {loads['mem_after_engine_gb']} GB")
                 t0 = time.monotonic()
-                eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo")), llm_cache=True)
-                print("LOADED engine", round(time.monotonic() - t0, 1), "s, free", round(mem_available_gb(), 1), "GB",
-                      flush=True)
-                rec = two_llm.run_session(out, eng, tok, m, gen, B2.parse_toolcall, spec, POLICY["it"],
-                                          Path(a.two_llm_asr_dir), a.two_llm_cut_s, lab / "agentbench", tool_schemas)
-                status["done"].append(["two_llm", rec["wall_s"]])
-                print("DONE two_llm", rec["wall_s"], "s |", json.dumps(rec["messages"], ensure_ascii=False)[:1500],
-                      flush=True)
+                tok, m, info = B2.load("nano")
+                loads["nano_load_s"] = round(time.monotonic() - t0, 1)
+                loaded = "nano"
+            loads["mem_after_nano_gb"] = round(mem_available_gb(), 1)
+            print("LOADED nano", loads, flush=True)
+            (out / "loads.json").write_text(json.dumps(loads, indent=1))
+            rec = two_llm.run_session(out, eng, tok, m, gen, B2.parse_toolcall, spec, POLICY["it"],
+                                      Path(a.two_llm_asr_dir), a.two_llm_cut_s, lab / "agentbench", tool_schemas)
+            status["done"].append(["two_llm", rec["wall_s"]])
+            print("DONE two_llm", rec["wall_s"], "s |", json.dumps(rec["messages"], ensure_ascii=False)[:1500],
+                  flush=True)
     status["elapsed_s"] = round(time.monotonic() - T0, 1)
     (out / "status.json").write_text(json.dumps(status, indent=1))
     print("STATUS", json.dumps(status), flush=True)
