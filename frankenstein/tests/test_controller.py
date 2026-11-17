@@ -196,3 +196,34 @@ def test_tokens_of_one_frame_keep_their_order():
     acts = c.tick(5)
     assert [a.data["ids"][0] for a in acts if a.kind == "SPEAK"] == [900001, 12, 5000, 7]
     assert acts[-1].kind == "CLOSE_TURN"
+
+
+def test_reply_streamed_before_the_tool_result_is_held_not_dropped():
+    # E1k regression: with KV reuse the worker runs the tool and streams the first reply word in the SAME frame as the
+    # call, while TOOL_RESULT lands at k + 1. The word was dropped as state_tool_wait ("Ho trovato" -> "trovato").
+    c = Controller()
+    run(c, {1: [I("WORDS", "asr", 1)], 4: [I("TAKE_TURN", "thinker", 4)]}, 4)
+    c.post(I("TOOL_CALL", "nano", 5, request_id=1, epoch=0, call_id="r1-0", payload={"name": "search"}))
+    c.post(I("REPLY_TOKENS", "nano", 5, payload=[1001], request_id=1, epoch=0))
+    c.post(I("TOOL_RESULT", "tool", 6, call_id="r1-0", epoch=0))
+    acts5 = c.tick(5)
+    assert [a.kind for a in acts5] == ["CALL_TOOL", "HOLD"] and c.state is St.TOOL_WAIT
+    c.post(I("REPLY_TOKENS", "nano", 6, payload=[1002], request_id=1, epoch=0))
+    c.post(I("REPLY_DONE", "nano", 6, request_id=1, epoch=0))
+    acts6 = c.tick(6)
+    assert [a.data["ids"][0] for a in acts6 if a.kind == "SPEAK"] == [1001, 1002]
+    assert [a.kind for a in acts6][-1] == "CLOSE_TURN"
+    assert not any(a.kind == "DROP_STALE" for a in c.actions)
+
+
+def test_held_reply_is_discarded_by_a_barge_in():
+    c = Controller(ControllerConfig(barge_in_frames=1))
+    run(c, {1: [I("WORDS", "asr", 1)], 4: [I("TAKE_TURN", "thinker", 4)]}, 4)
+    c.post(I("TOOL_CALL", "nano", 5, request_id=1, epoch=0, call_id="r1-0"))
+    c.post(I("REPLY_TOKENS", "nano", 5, payload=[1001], request_id=1, epoch=0))
+    c.tick(5)
+    c.post(I("USER_SPEECH", "asr", 6))
+    c.tick(6)
+    c.post(I("TOOL_RESULT", "tool", 7, call_id="r1-0", epoch=0))
+    acts = c.tick(7)
+    assert not any(a.kind == "SPEAK" for a in acts) and c.held == []

@@ -11,6 +11,10 @@ The dequantization uses the same quantized values and the same bf16 scales / zer
 (w = q * scale + (zero - 8 * scale), tinygemm convention): q is recomputed once from the bf16 weight with V2's own
 quantizer math (min-max per group, no clip search) and kept as 4-bit nibbles (N x K/2 bytes, as large as the packed
 weight: the INT4 footprint doubles, still ~1/2 of bf16).
+
+E1k: the dequant path paid off only for long prefills (~800 rows) and made short multi-row calls far slower (the
+16-row chunks of a cache continuation re-dequantized every layer each chunk). ``min_rows`` keeps tinygemm below a
+row threshold; rows == 1 is always the unchanged tinygemm path. The crossover is NOT VERIFIED (PERF.md, G3).
 """
 
 from __future__ import annotations
@@ -31,13 +35,14 @@ def _nibbles(w: torch.Tensor, group: int) -> torch.Tensor:
 
 
 class Int4Dispatch(nn.Module):
-    def __init__(self, q4: nn.Module, nib: torch.Tensor, scratch: dict):
+    def __init__(self, q4: nn.Module, nib: torch.Tensor, scratch: dict, min_rows: int = 256):
         super().__init__()
         self.q4 = q4
         self.register_buffer("nib", nib, persistent=False)
         self.scratch = scratch
         self.in_features, self.out_features, self.group = q4.in_features, q4.out_features, q4.group
-        self.calls = {"m1": 0, "mN": 0}
+        self.min_rows = max(2, int(min_rows))
+        self.calls = {"m1": 0, "mN": 0, "m_small": 0}
 
     @property
     def weight(self):                      # the remote code reads .weight.device / .dtype
@@ -65,6 +70,9 @@ class Int4Dispatch(nn.Module):
         if rows == 1:
             self.calls["m1"] += 1
             return self.q4(x)
+        if rows < self.min_rows:
+            self.calls["m_small"] += 1
+            return self.q4(x)
         self.calls["mN"] += 1
         w = self.dequant()
         y = F.linear(x.to(torch.bfloat16), w, None)
@@ -73,7 +81,7 @@ class Int4Dispatch(nn.Module):
         return y.to(x.dtype)
 
 
-def quantize_int4_dispatch(llm, max_group: int = 128) -> dict:
+def quantize_int4_dispatch(llm, max_group: int = 128, min_rows: int = 256) -> dict:
     """Replace the backbone linears of a NemotronH ``llm`` (TARGETS of V2's quantizer) by Int4Dispatch(Int4Linear)."""
     from mynah_v2.model.quant import TARGETS, Int4Linear
     scratch: dict = {}
@@ -85,7 +93,8 @@ def quantize_int4_dispatch(llm, max_group: int = 128) -> dict:
         for name, mod in list(mixer.named_children()):
             if name in TARGETS and isinstance(mod, nn.Linear):
                 q4 = Int4Linear(mod, max_group=max_group, clip=False)
-                setattr(mixer, name, Int4Dispatch(q4, _nibbles(mod.weight.data.to(torch.bfloat16), q4.group), scratch))
+                setattr(mixer, name, Int4Dispatch(q4, _nibbles(mod.weight.data.to(torch.bfloat16), q4.group), scratch,
+                                                         min_rows=min_rows))
                 n += 1
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    return {"int4_dispatch_linears": n, "scratch_shapes": len(scratch), "max_group": max_group}
+    return {"int4_dispatch_linears": n, "scratch_shapes": len(scratch), "max_group": max_group, "min_rows": min_rows}

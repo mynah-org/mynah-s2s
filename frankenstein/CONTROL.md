@@ -85,6 +85,10 @@ Otherwise it expires (traced). The ASR `EOU` opens the turn only as a fallback, 
   - `REPLY_TOKENS` / `REPLY_DONE` / `TOOL_CALL` with an old epoch or request → `DROP_STALE`.
   - A `TOOL_RESULT` for a cancelled or unknown call → `DROP_STALE`.
   - Talker audio of an old epoch → `DROP_STALE`. The `PlaybackGate` drops it too.
+  - `REPLY_TOKENS` / `REPLY_DONE` of the **current** request during `TOOL_WAIT` are not stale. The worker runs the
+    tool itself and may stream the answer before `TOOL_RESULT` lands. They are held (`HOLD reply_during_tool_wait`)
+    and released in arrival order on `RESUME_AFTER_TOOL`. A cancel or a new turn discards them. (E1k regression: the
+    first reply word was dropped.)
 - **Idempotency:** an intent with a `uid` is applied once; a `TOOL_CALL` with a known `call_id` is ignored.
 - **Timeouts:**
   - `PENDING` without tokens for `reply_timeout` frames → `CLOSE_TURN(reply_timeout)`;

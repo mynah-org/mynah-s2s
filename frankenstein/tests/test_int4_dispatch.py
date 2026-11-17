@@ -43,9 +43,11 @@ def test_m1_bit_identical_and_mN_matches_reference_matmul():
     torch.manual_seed(1)
     lin = torch.nn.Linear(1024, 768, bias=False).cuda().to(torch.bfloat16)
     q4 = _q4(lin)
-    d = Int4Dispatch(q4, _nibbles(lin.weight.data, q4.group), {})
+    d = Int4Dispatch(q4, _nibbles(lin.weight.data, q4.group), {}, min_rows=32)
     x1 = torch.randn(1, 1, 1024, device="cuda", dtype=torch.bfloat16)
     assert torch.equal(d(x1), q4(x1))                                     # M == 1: unchanged path
+    xs = torch.randn(1, 16, 1024, device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(d(xs), q4(xs))                                     # below min_rows: unchanged tinygemm
     xn = torch.randn(1, 64, 1024, device="cuda", dtype=torch.bfloat16)
     y = d(xn).float()
     ref = xn.float() @ d.dequant().float().t()

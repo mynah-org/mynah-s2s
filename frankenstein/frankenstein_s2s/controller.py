@@ -119,6 +119,7 @@ class Controller:
         self.tool_since_k = None
         self.open_word = False
         self.spoken_in_turn = False
+        self.held: list = []             # current-request reply intents that arrived during TOOL_WAIT (E1k)
 
     # ------------------------------------------------------------------ input
     def post(self, it: Intent) -> None:
@@ -172,6 +173,7 @@ class Controller:
         self.heard_since_turn = False
         self.spoken_in_turn = False
         self.deferred = None
+        self.held = []
         self._act("OPEN_TURN", k, reason)
         self._act("REQUEST_REPLY", k, reason, request_id=self.request_id, user_text=user_text)
 
@@ -184,6 +186,7 @@ class Controller:
                 self.calls[cid] = "cancelled"
         self.state = St.LISTENING
         self.deferred = None
+        self.held = []
         self.debounce_until = k + self.cfg.debounce
 
     def _close(self, k: int, reason: str) -> None:
@@ -259,7 +262,24 @@ class Controller:
     def _on_yield(self, it, k):
         pass                                             # the Thinker's EOS is advisory; the controller owns EOS
 
+    def _hold(self, it, k) -> bool:
+        """A reply of the CURRENT request during TOOL_WAIT is not stale: the worker ran the tool itself and is already
+        streaming the answer, while the TOOL_RESULT intent lands a frame later (E1k: with KV reuse the first word
+        arrived in the same frame as the call and was dropped). Keep it and release it on resume, in arrival order."""
+        if self.state is St.TOOL_WAIT and self._is_stale(it) is None:
+            self.held.append(it)
+            self._act("HOLD", k, "reply_during_tool_wait", intent=it.kind, request_id=it.request_id)
+            return True
+        return False
+
+    def _release(self, k: int) -> None:
+        held, self.held = self.held, []
+        for it in held:
+            (self._on_reply_tokens if it.kind == "REPLY_TOKENS" else self._on_reply_done)(it, k)
+
     def _on_reply_tokens(self, it, k):
+        if self._hold(it, k):
+            return
         why = self._is_stale(it)
         if why or self.state not in (St.PENDING, St.SPEAKING):
             return self._stale(it, k, why or f"state_{self.state.value}")
@@ -269,6 +289,8 @@ class Controller:
         self._act("SPEAK", k, "reply_tokens", ids=list(it.payload or []), request_id=it.request_id)
 
     def _on_reply_done(self, it, k):
+        if self._hold(it, k):
+            return
         why = self._is_stale(it)
         if why or self.state not in (St.PENDING, St.SPEAKING):
             return self._stale(it, k, why or f"state_{self.state.value}")
@@ -292,12 +314,14 @@ class Controller:
         if self.state is St.TOOL_WAIT and all(v != "pending" for v in self.calls.values()):
             self.state = St.PENDING
             self._act("RESUME_AFTER_TOOL", k, "tool_result", call_id=it.call_id, request_id=self.request_id)
+            self._release(k)
 
     def _on_tool_timeout(self, it, k):
         if self.calls.get(it.call_id) == "pending":
             self.calls[it.call_id] = "timeout"
             self.state = St.PENDING
             self._act("RESUME_AFTER_TOOL", k, "tool_timeout", call_id=it.call_id, request_id=self.request_id)
+            self._release(k)
 
     def _on_audio_started(self, it, k):
         if it.epoch is not None and it.epoch != self.epoch:
@@ -328,3 +352,4 @@ class Controller:
             self.state = St.PENDING
             self.opened_k = k
             self._act("RESUME_AFTER_TOOL", k, "tool_timeout", request_id=self.request_id)
+            self._release(k)
