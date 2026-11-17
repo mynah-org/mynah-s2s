@@ -132,6 +132,7 @@ class M1Force:
                  no_new_words_gate: bool = False, hold_cps: float = 0.0, fallback: bool = True,
                  sotc_turn: bool = False, open_rule: str = "eou", min_blank: int = 2, fake_opener: bool = True):
         self.fake_opener = fake_opener
+        self.req_seq, self.active_rid, self.async_stats = 0, None, {"stale_tokens": 0, "requests": []}
         assert mode in ("force", "observe", "shell")
         self.forcing = mode in ("force", "shell")     # shell: the controller drives the talker, never gen_text
         self.debounce_frames, self.debounce_until = debounce_frames, -1
@@ -216,6 +217,8 @@ class M1Force:
         s = None
         written = None
         state_before = None
+        if self.forcing and hasattr(self.brain, "poll"):
+            self._drain_async(t)
         if self.forcing:
             while self.sched and self.sched[0][0] <= t:
                 _, ids, done = self.sched.pop(0)
@@ -324,6 +327,38 @@ class M1Force:
                                   "planned": self._open_turn.get("text")})
             self._open_turn = None
             self.job_active = False
+            if hasattr(self.brain, "cancel"):
+                self.brain.cancel(self.active_rid)        # its later tokens are stale
+                self.active_rid = None
+
+    def _drain_async(self, t):
+        """Non-blocking: take what the text-LLM worker produced since the last frame."""
+        live = self.forcer.state in (ForceState.WAIT_TEXT, ForceState.FORCING, ForceState.TAIL)
+        for ev in self.brain.poll():
+            kind, rid = ev[0], ev[1]
+            req = next((r for r in self.async_stats["requests"] if r["rid"] == rid), None)
+            if rid != self.active_rid or not live:
+                if kind == "tok":
+                    self.async_stats["stale_tokens"] += 1
+                self.ftr.emit("adapter.stale_drop", t, what=f"brain_{kind}", rid=rid, active=self.active_rid)
+                continue
+            if kind == "tok":
+                if req is not None and req.get("first_tok_k") is None:
+                    req["first_tok_k"], req["first_tok_ns"] = t, ev[3]
+                self.forcer.add_reply([ev[2]])
+            elif kind == "tool":
+                self.ftr.emit("brain.tool_call", t, call=json.dumps(ev[2], ensure_ascii=False)[:300])
+                self.brain_log.write({"ev": "brain.tool", "k": t, "rid": rid, "call": ev[2]})
+            elif kind == "done":
+                self.forcer.add_reply([], done=True)
+                self.messages.extend(ev[3])
+                if self._open_turn is not None:
+                    self._open_turn["text"] = ev[2]
+                if req is not None:
+                    req.update(done_k=t, text=ev[2], info=ev[4])
+                self.brain_log.write({"ev": "brain.done", "k": t, "rid": rid, "reply": ev[2], "info": ev[4],
+                                      "first_tok_k": req.get("first_tok_k") if req else None})
+                self.ftr.emit("brain.text", t, text=ev[2], rid=rid)
 
     def _start_brain(self, t):
         self.forcer.need_reply = False
@@ -338,6 +373,16 @@ class M1Force:
         self.job_active = True
         if user or self.fake_opener:
             self.messages.append({"role": "user", "content": user or OPENER_USER})
+        if hasattr(self.brain, "submit"):
+            self.req_seq += 1
+            self.active_rid = self.req_seq
+            self.brain.submit(self.active_rid, self.messages)
+            self.async_stats["requests"].append({"rid": self.active_rid, "k": t, "user": user,
+                                                 "t_submit_ns": time.monotonic_ns()})
+            self.ftr.emit("brain.request", t, user_text=user or OPENER_USER, rid=self.active_rid)
+            self.brain_log.write({"ev": "brain.submit", "k": t, "rid": self.active_rid, "user": user})
+            self._open_turn = {"k": t, "text": None}
+            return
         dup = _caller_cache()
         fp0 = self.brain_fp(dup)
         t0 = time.monotonic()

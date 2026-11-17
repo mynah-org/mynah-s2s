@@ -324,3 +324,56 @@ def test_blank_rule_and_piece_based_turn_text():
     sig = [(s["k"], s["allowed"], s["why"]) for s in hook.signals]
     assert sig[0] == (10, False, "asr_speech_recent_1") and sig[1] == (11, True, "asr_blank_2")
     assert brain.calls[0][-1]["content"] == "vorrei due div"          # open word included, tag dropped, nothing later
+
+
+class FakeAsyncBrain:
+    """Worker stand-in: a submitted request yields one token per poll() after `delay` polls, then done."""
+
+    def __init__(self, replies, delay=2):
+        self.replies, self.delay = list(replies), delay
+        self.jobs, self.cancelled, self.calls, self.last_cache = [], set(), [], None
+
+    def submit(self, rid, messages):
+        self.jobs.append({"rid": rid, "ids": list(self.replies.pop(0)), "wait": self.delay,
+                          "user": messages[-1]["content"] if messages else ""})
+
+    def cancel(self, rid):
+        self.cancelled.add(rid)
+
+    def poll(self):
+        out = []
+        for j in self.jobs:
+            if j["wait"] > 0:
+                j["wait"] -= 1
+                continue
+            if j["ids"]:
+                out.append(("tok", j["rid"], j["ids"].pop(0), 0))
+                if not j["ids"]:
+                    out.append(("done", j["rid"], "x", [], {}))
+        return out
+
+
+def test_async_worker_tokens_flow_and_stale_after_cut():
+    v = FakeVocab()
+    first = [v.id(p) for p in [" Uno", " due", " tre", " quattro", " cinque", "."]]
+    second = [v.id(p) for p in [" Si", "."]]
+    asr = {"words": [{"k": 3, "word": "ciao"}, {"k": 30, "word": "ancora"}], "nonblank": [1, 2, 3, 24, 25, 26, 27],
+           "eou": [13, 37]}
+    w = FakeWrapper()
+    tr = Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode, config=AdapterConfig(), tracer=tr)
+    brain = FakeAsyncBrain([first, second], delay=2)
+    hook = M1Force(w, brain, Tok(v), asr, ad, tr, Log(), Log(), lambda p: ("{}", 0.0), eos_hold=0)
+    un = hook.install()
+    model = [T.PAD_ID] * 20 + [T.BOS_ID] + [T.PAD_ID] * 25 + [T.BOS_ID] + [T.PAD_ID] * 15
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    em = g.d[0]
+    assert em[20:23] == [T.BOS_ID, T.PAD_ID, T.PAD_ID] and em[23] == first[0]          # not before it arrived
+    cut = next(c.k for c in ad.commands if type(c).__name__ == "Cancel")              # caller speech at 24..27
+    assert not [x for x in em[cut + 1:46] if x in first]                              # nothing of turn 1 after the cut
+    assert hook.async_stats["stale_tokens"] > 0 and 1 in brain.cancelled
+    assert [x for x in em[46:] if x >= 1000] == second

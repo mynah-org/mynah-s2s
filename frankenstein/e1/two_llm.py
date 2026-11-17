@@ -115,7 +115,8 @@ class NanoBrain:
 
 
 def run_session(out: Path, eng, tok, model, gen, parse, spec, policy_it: str, asr_dir: Path, cut_s: float,
-                lab_agentbench: Path, tool_schemas, fixes: bool = False):  # pragma: no cover - GPU
+                lab_agentbench: Path, tool_schemas, fixes: bool = False, brain_factory=None, timer=None,
+                od_name: str = "two_llm_it"):  # pragma: no cover - GPU
     import sys
     sys.path.insert(0, str(lab_agentbench))
     from m0_runner import load_16k, set_model_cfg
@@ -131,7 +132,7 @@ def run_session(out: Path, eng, tok, model, gen, parse, spec, policy_it: str, as
     L = session_language("it")
     asr = json.load(open(asr_dir / "asr_it.json"))
     wav = load_16k(asr_dir / "track_it.wav")[: int(cut_s * 16000)]
-    od = out / "two_llm_it"
+    od = out / od_name
     od.mkdir()
     said = []
     backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
@@ -144,8 +145,13 @@ def run_session(out: Path, eng, tok, model, gen, parse, spec, policy_it: str, as
     bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=None)
     from m0_runner import render_prompt
     duplex_prompt = render_prompt(reg.schemas, with_language(spec["system_prompt"], L))
-    brain = NanoBrain(tok, model, gen, spec["system_prompt"] + "\n" + policy_it + " /no_think", tool_schemas(reg),
-                      bound, backend, parse, tool_step=fixes)
+    system = spec["system_prompt"] + "\n" + policy_it + " /no_think"
+    if brain_factory is not None:
+        brain = brain_factory(tok, model, system, tool_schemas(reg), bound, backend, parse)
+        if hasattr(brain, "start"):
+            brain.start()
+    else:
+        brain = NanoBrain(tok, model, gen, system, tool_schemas(reg), bound, backend, parse, tool_step=fixes)
     ftr = FTracer(od / "fr_trace.jsonl", session_id="two_llm_it")
     ad, drv, gate = make_adapter(tok, ftr, L.talker_lang)
     frames, blog = FrameLog(od / "frames.jsonl"), FrameLog(od / "brain.jsonl")
@@ -168,6 +174,8 @@ def run_session(out: Path, eng, tok, model, gen, parse, spec, policy_it: str, as
         uninstall()
         tr.close()
         set_model_cfg(w.model_cfg, "force_turn_taking", old)
+        if hasattr(brain, "close"):
+            brain.close()
     frames.close()
     blog.close()
     rec = {"arm": "two_llm", "lang": "it", "cut_s": cut_s, "hook_calls": hook.n_hook, "frames_last": hook.last_t,
@@ -179,7 +187,8 @@ def run_session(out: Path, eng, tok, model, gen, parse, spec, policy_it: str, as
                       "log": [list(map(str, x)) for x in hook.forcer.log]},
            "messages": hook.messages, "calls": brain.calls, "backend_audit": backend.audit,
            "ledger": [{"name": c.name, "status": c.status.value} for c in led.calls.values()],
-           "adapter": adapter_summary(ad, gate), "wall_s": round(time.monotonic() - t0, 1)}
+           "adapter": adapter_summary(ad, gate), "wall_s": round(time.monotonic() - t0, 1),
+           "async": getattr(hook, "async_stats", None), "comp_timer": timer.report() if timer is not None else None}
     ftr.close()
     (od / "summary.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False, default=str))
     return rec
