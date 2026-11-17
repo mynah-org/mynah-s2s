@@ -115,17 +115,32 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--s1-seconds", type=float, default=52.0)
     ap.add_argument("--s2-seconds", type=float, default=22.0)
     ap.add_argument("--lang2", default="it", help="language of session 2 (language honoured: replies in it)")
+    ap.add_argument("--base", action="store_true", help="one plain V2 session (base VoiceChat engine): protocol check")
+    ap.add_argument("--skip-s2", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
     wav, sr = sf.read(a.track, dtype="float32")
     res = {}
+    if a.base:
+        r = asyncio.run(run_session(a.url, wav, "", "", a.s1_seconds, 6.0))
+        names = [e["ev"] for e in r["events"]]
+        res["base"] = {"ctrl": [c.get("type") for c in r["ctrl"]], "events": len(names),
+                       "event_kinds": sorted(set(names)), "audio_s": round(len(r["audio"]) / 2 / 22050, 1),
+                       "text": "".join(e.get("text", "") for e in r["events"] if e["ev"] == "text.generated")[:400]}
+        sf.write(out / "base_agent_22k.wav", np.frombuffer(r["audio"], "<i2").astype(np.float32) / 32767, 22050)
+        (out / "smoke.json").write_text(json.dumps(res, indent=1, ensure_ascii=False, default=str))
+        print("BASE", json.dumps(res["base"], ensure_ascii=False)[:1500], flush=True)
+        return
     r1 = asyncio.run(run_session(a.url, wav, "it", a.voice1, a.s1_seconds, 8.0,
                                  busy_probe=lambda: probe_busy(a.url)))
     res["s1"] = gates(r1, "it", a.voice1)
     (out / "s1_events.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in r1["events"]))
     sf.write(out / "s1_agent_22k.wav", np.frombuffer(r1["audio"], "<i2").astype(np.float32) / 32767, 22050)
     print("S1", json.dumps(res["s1"], ensure_ascii=False, default=str)[:2500], flush=True)
+    if a.skip_s2:
+        (out / "smoke.json").write_text(json.dumps(res, indent=1, ensure_ascii=False, default=str))
+        return
     r2 = asyncio.run(run_session(a.url, wav, a.lang2, a.voice2, a.s2_seconds, 8.0))
     res["s2"] = gates(r2, a.lang2, a.voice2, other_words=None)
     # no leak: session 2's first request starts a fresh history (1 message), and none of session 1's replies is in
