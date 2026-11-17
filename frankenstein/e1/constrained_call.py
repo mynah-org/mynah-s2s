@@ -46,7 +46,15 @@ class ConstrainedCall:
         """Greedy walk restricted to the token sequences of ``options`` (texts). The ids are fed as they are picked;
         once one option is left its remaining ids are returned as pending (fed with the next forced text)."""
         seqs = {o: list(self.encode(o)) for o in options}
-        i, cand = 0, list(options)
+        first = seqs[options[0]]
+        i = 0
+        while all(len(seqs[o]) > i and seqs[o][i] == first[i] for o in options):
+            i += 1
+        if i:                                      # the shared prefix is forced: one multi-token feed
+            lm.feed(first[:i])
+            st["forced"] += i
+            st["feeds"] += 1
+        cand = list(options)
         while True:
             done = [o for o in cand if len(seqs[o]) == i]
             if done:
@@ -121,10 +129,13 @@ class ConstrainedCall:
                 if not left:
                     break
                 sep = ", " if not first else ""
-                options = ["}"] + [f'{sep}"{k}": ' for k in left]
-                self._flush(lm, pend, text, st)
+                # the unfed text (e.g. the closing quote of the last value) is part of every option, so that the
+                # options are tokenized as the model would write them (E1l: '"' fed alone, then ', "postcode"'
+                # lost against '}': the natural token is '",')
+                options = [text + "}"] + [text + f'{sep}"{k}": ' for k in left]
+                self._flush(lm, pend, "", st)
                 choice, pend = self._trie(lm, options, st)
-                text = ""
+                choice, text = choice[len(text):], ""
                 if choice == "}":
                     break
                 key = choice.split('"')[1]
@@ -135,10 +146,10 @@ class ConstrainedCall:
             typ = (props.get(key) or {}).get("type", "string")
             enum = (props.get(key) or {}).get("enum")
             if enum or typ == "boolean":
-                lits = [json.dumps(v, ensure_ascii=False) for v in (enum or [True, False])]
-                self._flush(lm, pend, text, st)
+                lits = [text + json.dumps(v, ensure_ascii=False) for v in (enum or [True, False])]
+                self._flush(lm, pend, "", st)
                 lit, pend = self._trie(lm, lits, st)
-                args[key] = json.loads(lit)
+                args[key] = json.loads(lit[len(text):])
                 text = ""
             elif typ in ("integer", "number"):
                 self._flush(lm, pend, text, st)

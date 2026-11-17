@@ -113,3 +113,28 @@ def test_integer_and_enum_values():
     free, out, _, _ = call({"n": 3, "mode": "set"}, "set_qty")
     assert json.loads(out[len("<TOOLCALL>["):-len("]</TOOLCALL>")]) == {"name": "set_qty",
                                                                         "arguments": {"n": 3, "mode": "set"}}
+
+
+class LoneQuoteLM(WantLM):
+    """E1l failure mode: after an unnatural lone '"' token the model prefers to close the object."""
+
+    def __init__(self, v, target, fed):
+        super().__init__(v, target, fed)
+        self.last = None
+
+    def feed(self, ids):
+        super().feed(ids)
+        self.last = ids[-1]
+
+    def pick(self, allowed):
+        if self.last == self.v.id('"') and allowed and self.v.id("}") in allowed:
+            return self.v.id("}")
+        return super().pick(allowed)
+
+
+def test_optional_key_options_keep_the_natural_tokenization_of_the_closing_quote():
+    v = Vocab()
+    args = {"full_name": "Mario Rossi", "postcode": "10121"}
+    free = "<TOOLCALL>[" + json.dumps({"name": "find_customer", "arguments": args}) + "]</TOOLCALL>"
+    out, _ = ConstrainedCall(TOOLS, v.encode).run(LoneQuoteLM(v, free, "<TOOLCALL>["))
+    assert out == free
