@@ -114,6 +114,7 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--voice2", default="")
     ap.add_argument("--s1-seconds", type=float, default=52.0)
     ap.add_argument("--s2-seconds", type=float, default=22.0)
+    ap.add_argument("--lang2", default="it", help="language of session 2 (language honoured: replies in it)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -125,8 +126,8 @@ def main():  # pragma: no cover - GPU
     (out / "s1_events.jsonl").write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in r1["events"]))
     sf.write(out / "s1_agent_22k.wav", np.frombuffer(r1["audio"], "<i2").astype(np.float32) / 32767, 22050)
     print("S1", json.dumps(res["s1"], ensure_ascii=False, default=str)[:2500], flush=True)
-    r2 = asyncio.run(run_session(a.url, wav, "it", a.voice2, a.s2_seconds, 8.0))
-    res["s2"] = gates(r2, "it", a.voice2, other_words=None)
+    r2 = asyncio.run(run_session(a.url, wav, a.lang2, a.voice2, a.s2_seconds, 8.0))
+    res["s2"] = gates(r2, a.lang2, a.voice2, other_words=None)
     # no leak: session 2's first request starts a fresh history (1 message), and none of session 1's replies is in
     # session 2's history (the history length counts only session 2's turns)
     h = [e.get("history_len") for e in r2["events"] if e["ev"] == "brain.submit"]

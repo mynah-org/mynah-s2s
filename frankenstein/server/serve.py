@@ -96,6 +96,8 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--max-session-s", type=float, default=1200.0)
     ap.add_argument("--idle-timeout", type=float, default=60.0)
     ap.add_argument("--no-gpu-gate", action="store_true", help="do not time-slice frames and text-LLM work (G7)")
+    ap.add_argument("--gate-budget-ms", type=float, default=50.0,
+                    help="text-LLM time after each frame (G7b policy, the default); 0 = strict frame priority")
     a = ap.parse_args()
     lab = Path(a.lab_scripts)
     sys.path.insert(0, str(lab / "multilingual"))
@@ -147,7 +149,7 @@ def main():  # pragma: no cover - GPU
     gate = None
     if not a.no_gpu_gate:
         from e1.gpu_gate import GpuGate
-        gate = GpuGate(sync=torch.cuda.synchronize)
+        gate = GpuGate(sync=torch.cuda.synchronize, unit_budget_ms=a.gate_budget_ms)
     eng = FrankensteinEngine(ref, tok, nano, spec, live, proc, lab / "agentbench", POLICY, brief,
                              max_session_s=a.max_session_s, gate=gate)
     cfg = ServerConfig(host=a.host, port=a.port, trace_dir=str(td), idle_timeout_s=a.idle_timeout)
