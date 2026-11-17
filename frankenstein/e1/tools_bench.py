@@ -82,6 +82,7 @@ def main():  # pragma: no cover - GPU
     lab = Path(a.lab_scripts)
     sys.path.insert(0, str(lab / "multilingual"))
     sys.path.insert(0, str(lab / "agentbench"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))      # package root: e1.*, frankenstein_s2s.*
     import llm_text_bench as B2
     if a.nano_dir:
         B2.NANO = Path(a.nano_dir)          # same revision, weights downloaded to this host's own cache
@@ -173,7 +174,7 @@ def main():  # pragma: no cover - GPU
     status = {"done": [], "skipped": []}
     loaded = None
     durations = []
-    for arm in a.arms.split(","):
+    for arm in [x for x in a.arms.split(",") if x]:
         which = "vc" if arm == "vc" else "nano"
         est = (max(durations) if durations else 200) + (90 if which != loaded else 0)
         if time.monotonic() - T0 + est > a.budget_s:
@@ -237,6 +238,13 @@ def main():  # pragma: no cover - GPU
                   "|", rec["agent_text"][:140], flush=True)
         durations.append(time.monotonic() - t_arm)
         status["done"].append([arm, round(durations[-1], 1)])
+    if a.two_llm_asr_dir and loaded is None:
+        t0 = time.monotonic()
+        tok, m, info = B2.load("nano")
+        info["load_s"] = round(time.monotonic() - t0, 1)
+        (out / "info_nano.json").write_text(json.dumps(info))
+        loaded = "nano"
+        print("LOADED nano", info, flush=True)
     if a.two_llm_asr_dir:
         left = a.budget_s - (time.monotonic() - T0)
         if loaded != "nano" or left < a.two_llm_need_s:
