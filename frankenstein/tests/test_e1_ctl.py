@@ -333,3 +333,46 @@ def test_barge_in_words_go_to_the_next_request():
                                 cfg=ControllerConfig(reply_timeout=100, barge_after_open=True))
     assert any(a.kind == "CANCEL" for a in d.ctl.actions)
     assert len(wk.submitted) >= 2 and wk.submitted[1][1] == "aspetta"
+
+
+class BurstWorker(FakeWorker):
+    """Delivers a whole reply in one poll (a fast text LLM)."""
+
+    def poll(self):
+        out = []
+        for j in self.jobs:
+            if j["wait"] > 0:
+                j["wait"] -= 1
+                continue
+            if j["ids"] and j["rid"] not in self.cancelled:
+                out += [("tok", j["rid"], i, 0) for i in j["ids"]] + [("done", j["rid"], "x", [], {})]
+                j["ids"] = []
+        return out
+
+
+def _burst(ids_per_frame):
+    asr = {"words": [{"k": 4, "word": "ciao"}], "pieces": {"3": ["▁ciao"]}, "nonblank": [], "eou": [8]}
+    model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * 40
+    v = FakeVocab()
+    w, tr = FakeWrapper(), Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode,
+                       config=AdapterConfig(barge_in="thinker"), tracer=tr)
+    wk = BurstWorker({1: [v.id(p) for p in [" Il", " suo", " ordine", " arriva", " domani", "."]]}, delay=2)
+    d = CtlDriver(w, wk, Tok(v), asr, ad, tr, Log(), Log(), Controller(ControllerConfig(reply_timeout=100)), lang="it")
+    d.ids_per_frame = ids_per_frame
+    un = d.install()
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    text = "".join(c.text for c in ad.commands if hasattr(c, "text"))
+    last = max(c.k for c in ad.commands if type(c).__name__ in ("StartSegment", "AppendText"))
+    return text, last
+
+
+def test_several_reply_ids_per_frame_same_text_sooner():
+    t1, last1 = _burst(1)
+    t8, last8 = _burst(8)
+    assert t1 == t8 == "Il suo ordine arriva domani."
+    assert last8 < last1

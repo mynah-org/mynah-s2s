@@ -56,6 +56,77 @@ def run_codes_check(proc, ref_path):  # pragma: no cover - GPU
                                                           "fps": ref["fast"]["fps"]}}
 
 
+def g6(a, res, save, spec, tok, m, B2, lab):  # pragma: no cover - GPU
+    """G6 a) + b) + d): suite per Nano variant, per-token decode ms, NVFP4 probe. Returns the graph to use (or None)
+    and leaves Int4DecodeOnly.active as decided."""
+    from mynah_v2.agent.tools import ToolLedger, ToolRegistry
+    from tenant_backend import TenantBackend
+    from e1.g0_session import BRIEF_IT
+    from e1.g6_bench import compare, nvfp4_probe, per_token_bench, run_suite, suite_items
+    from e1.int4_dispatch import Int4DecodeOnly, quantize_int4_decode_only
+    from e1.nano_graph import NanoGraph
+    from e1.nano_worker import NanoWorker
+    from e1.tools_bench import POLICY, tool_schemas
+    brief = {"it": BRIEF_IT, "en": "Answer as on a phone call: at most two short sentences, no lists, no markdown."}
+
+    def mk(graph):
+        def make_worker(lang):
+            said = []
+            be = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
+            be._said = said
+            reg = ToolRegistry()
+            for t in spec["tools"]:
+                reg.register(t["name"], be.handlers()[t["name"]], t["description"], t["parameters"])
+            bound = reg.bind(ToolLedger("g6", None), lambda: 0, lambda: None, timeout_s=None)
+            system = spec["system_prompt"] + "\n" + POLICY[lang] + "\n" + brief[lang] + " /no_think"
+            wk = NanoWorker(tok, m, system, tool_schemas(reg), bound, be, B2.parse_toolcall, max_new=60,
+                            tool_step=True, constrained=True)
+            wk.reply_soft_cap, wk.graph = 24, graph
+            return wk
+        return make_worker
+    items = suite_items(spec, a.suite_session or None)
+    out = {"items": len(items)}
+    r0 = run_suite(mk(None), items, "bf16")
+    out["bf16"] = {"per_token_ms_suite": r0["per_token_ms_mean"], **per_token_bench(mk(None)("it"))}
+    out["int4_wrap"] = quantize_int4_decode_only(m.backbone)
+    r1 = run_suite(mk(None), items, "int4")
+    out["int4"] = {"per_token_ms_suite": r1["per_token_ms_mean"], **per_token_bench(mk(None)("it")),
+                   "vs_bf16": compare(r0, r1)}
+    graph = None
+    try:
+        graph = NanoGraph(m.backbone, lmax=4096)
+        w0 = mk(graph)("it")
+        out["int4_graph_warm"] = per_token_bench(w0)                     # captures bucket 1024
+        import torch
+        with torch.inference_mode():                                    # and the next bucket, before the session
+            ids = w0._ids([{"role": "user", "content": "parola " * 1300}])
+            cache, h = w0._prefill(ids)
+            for _ in range(3):
+                h = w0._step(w0.llm.embeddings(torch.tensor([[1000]], device=w0.dev)), cache)
+        out["warm_ctx_tokens"] = len(ids)
+        r2 = run_suite(mk(graph), items, "int4_graph")
+        out["int4_graph"] = {"per_token_ms_suite": r2["per_token_ms_mean"], **per_token_bench(mk(graph)("it")),
+                             "vs_bf16": compare(r0, r2), "vs_int4": compare(r1, r2), "graph_stats": graph.stats()}
+    except Exception as e:  # noqa: BLE001
+        out["int4_graph"] = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+        graph = None
+    use_int4 = out["int4"]["vs_bf16"]["tools_ok"]
+    use_graph = graph is not None and use_int4 and out["int4_graph"].get("vs_bf16", {}).get("tools_ok", False)
+    Int4DecodeOnly.active = use_int4
+    out["decision"] = {"int4_decode": use_int4, "nano_graph": use_graph}
+    try:
+        out["nvfp4"] = nvfp4_probe(m, a.wo_gemv or None)
+    except Exception as e:  # noqa: BLE001
+        out["nvfp4"] = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+    res["g6"] = out
+    save()
+    (Path(a.out) / "g6_suite.json").write_text(json.dumps({"bf16": r0, "int4": r1,
+                                                            "int4_graph": locals().get("r2")}, ensure_ascii=False))
+    print("G6", json.dumps({k: v for k, v in out.items() if k != "nvfp4"}, default=str)[:3000], flush=True)
+    print("NVFP4", json.dumps(out.get("nvfp4"), default=str)[:1500], flush=True)
+    return graph if use_graph else None
+
+
 def main():  # pragma: no cover - GPU
     ap = argparse.ArgumentParser()
     ap.add_argument("--lab-scripts", required=True)
@@ -84,6 +155,12 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--content-run", action="append", default=[], help="NAME=RUN_IT_DIR for the content check")
     ap.add_argument("--single-content", action="store_true", help="G4: one content check at the end (all runs)")
     ap.add_argument("--cp-graph", action="store_true", help="G5: the code-predictor loop as one CUDA graph")
+    ap.add_argument("--g6-bench", action="store_true",
+                    help="G6: Nano bf16 vs INT4 decode-only vs INT4 + decode graph on the tool suite, NVFP4 probe; "
+                         "the session then uses what passed")
+    ap.add_argument("--suite-session", default="", help="G6: summary.json whose tool prompts join the suite")
+    ap.add_argument("--wo-gemv", default="", help="G6: copy of the web UI tree's Triton GEMV file (NVFP4 probe)")
+    ap.add_argument("--ids-per-frame", type=int, default=1, help="G6: reply ids handed to the talker per frame")
     ap.add_argument("--standalone-bench", action="store_true",
                     help="G5: before the engine loads, the G1 texts through the talker alone (codes vs G1, speed)")
     ap.add_argument("--stop-if-codes-differ", action="store_true",
@@ -167,6 +244,9 @@ def main():  # pragma: no cover - GPU
         save()
         return
     spec = json.load(open(lab / "agentbench" / "tenant_furniture.json"))
+    nano_graph = None
+    if a.g6_bench:
+        nano_graph = g6(a, res, save, spec, tok, m, B2, lab)
     w = eng.wrapper
     set_model_cfg(w.model_cfg, "force_turn_taking", False)
     timer = CompTimer()
@@ -184,7 +264,8 @@ def main():  # pragma: no cover - GPU
         r = g0_session.run(out, f"{a.tag}_{arm}", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), 52.0,
                            lab / "agentbench", tool_schemas, live, proc, timer=timer, prebuffer_s=0.32,
                            listen_dir=listen / arm, holding_cut="never", audio_aware=True, reactive=reactive,
-                           keep_proc=True, brief=a.brief, fast_barge=a.fast_barge)
+                           keep_proc=True, brief=a.brief, fast_barge=a.fast_barge, nano_graph=nano_graph,
+                           ids_per_frame=a.ids_per_frame)
         g = r["g0"]
         res["arms"][arm] = {"status": "DONE", "session_s": round(time.monotonic() - t0, 1)}
         save()

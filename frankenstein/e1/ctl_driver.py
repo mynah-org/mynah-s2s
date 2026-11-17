@@ -63,6 +63,7 @@ class CtlDriver:
         self.pump_every = 5
         self.audible = None              # G0: callable -> is agent audio still playing (default: adapter.busy)
         self.fast_barge = False          # G4: see _rnnt_hook
+        self.ids_per_frame = 1           # G6: reply ids handed to the adapter per frame (1 = one per 80 ms frame)
         self.holding_cut = "audible"     # "audible": cut a still-audible phrase when the reply starts (E1l);
                                          # "never": the reply queues behind the phrase (G0: a cut in a talker
                                          # underrun dropped the end of the phrase)
@@ -133,6 +134,13 @@ class CtlDriver:
             self._do(a, t)
         to_adapter = self._adapter_id()
         self.adapter.feed(_frame(t, to_adapter))
+        extra = 0
+        while extra < self.ids_per_frame - 1 and self.queue and not self.pending_bos and to_adapter is not None \
+                and to_adapter >= T.FIRST_TEXT_ID:       # G6: hand over every reply id that is ready, not one
+            tid = self.queue.pop(0)                      # per 80 ms frame (words still commit only when complete)
+            self.spoken.append(tid)
+            self.adapter.feed(_frame(t, tid))
+            extra += 1
         self.frames.write({"k": t, "predicted": predicted, "emitted": emitted, "to_adapter": to_adapter,
                            "state": self.ctl.state.value, "epoch": self.ctl.epoch, "speech": speech,
                            "eou": t in self.eou, "t_ns": time.monotonic_ns()})

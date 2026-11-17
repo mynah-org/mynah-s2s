@@ -98,3 +98,46 @@ def quantize_int4_dispatch(llm, max_group: int = 128, min_rows: int = 256) -> di
                 n += 1
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return {"int4_dispatch_linears": n, "scratch_shapes": len(scratch), "max_group": max_group, "min_rows": min_rows}
+
+
+class Int4DecodeOnly(nn.Module):
+    """G6: INT4 only where it pays (the 1-row decode step, tinygemm); every multi-row call (prefill, continuation)
+    stays on the ORIGINAL bf16 weights. Costs the INT4 copy on top of bf16 (~1/4 more memory) and keeps prefill speed.
+    ``Int4DecodeOnly.active`` switches the INT4 path off for A/B runs in one process."""
+    active = True
+
+    def __init__(self, lin: nn.Module, q4: nn.Module):
+        super().__init__()
+        self.lin, self.q4 = lin, q4
+        self.in_features, self.out_features = lin.in_features, lin.out_features
+        self.calls = {"m1_int4": 0, "bf16": 0}
+
+    @property
+    def weight(self):                      # the remote code reads .weight.device / .dtype
+        return self.lin.weight
+
+    @property
+    def bias(self):
+        return self.lin.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if Int4DecodeOnly.active and x.numel() // x.shape[-1] == 1:
+            self.calls["m1_int4"] += 1
+            return self.q4(x)
+        self.calls["bf16"] += 1
+        return self.lin(x)
+
+
+def quantize_int4_decode_only(llm, max_group: int = 128) -> dict:
+    """Wrap the backbone linears of a NemotronH ``llm`` (TARGETS of V2's quantizer) in Int4DecodeOnly."""
+    from mynah_v2.model.quant import TARGETS, Int4Linear
+    n = 0
+    for layer in llm.layers:
+        mixer = getattr(layer, "mixer", None)
+        if mixer is None:
+            continue
+        for name, mod in list(mixer.named_children()):
+            if name in TARGETS and isinstance(mod, nn.Linear):
+                setattr(mixer, name, Int4DecodeOnly(mod, Int4Linear(mod, max_group=max_group, clip=False)))
+                n += 1
+    return {"int4_decode_only_linears": n, "max_group": max_group}

@@ -49,9 +49,9 @@ class _TorchLM:
 
     def feed(self, ids):
         wk = self.wk
-        if len(ids) == 1:
-            h = wk.llm(inputs_embeds=wk.llm.embeddings(wk.torch.tensor([ids], device=wk.dev)), cache_params=self.cache,
-                       use_cache=True).last_hidden_state
+        if len(ids) == 1 or wk.graph is not None:      # G6: with the decode graph, forced text goes one position
+            for i in ids:                                  # at a time (no multi-position call on a converted cache)
+                h = wk._step(wk.llm.embeddings(wk.torch.tensor([[i]], device=wk.dev)), self.cache)
         else:
             h = wk._continue(self.cache, list(ids))
         self.logits = wk.m.lm_head(h[:, -1]).float()
@@ -124,6 +124,7 @@ class NanoWorker(QueueWorker):
         super().__init__(name="nano-worker")
         self.reuse = reuse
         self.constrained = constrained
+        self.graph = None                # G6: e1.nano_graph.NanoGraph for the decode steps (None = eager)
         self.reply_soft_cap = None       # G4: after this many reply tokens, stop at the next sentence end
         import torch
         from mynah_v2.model.llm_cache import _hybrid_cache_cls, cache_passing_attention, position_injecting_forward
@@ -181,7 +182,7 @@ class NanoWorker(QueueWorker):
             if soft_cap and len(out) >= soft_cap and sentence_end(self.tok.decode(out[-4:])):
                 break                                    # G4: brief spoken replies, cut at a sentence end
             e = self.llm.embeddings(torch.tensor([[nxt]], device=self.dev))
-            h = self.llm(inputs_embeds=e, cache_params=cache, use_cache=True).last_hidden_state
+            h = self._step(e, cache)
             logits = self.m.lm_head(h[:, -1]).float()
         torch.cuda.current_stream().synchronize()
         t_end = time.monotonic_ns()
@@ -300,6 +301,12 @@ class NanoWorker(QueueWorker):
         info["steps"].append(dict(st, step="reply", suffix=len(reply_ids) - cp))
         info["t_done_ns"] = time.monotonic_ns()
         self.q_out.put(("done", rid, self.tok.decode(r, skip_special_tokens=True), new_msgs, info))
+
+    def _step(self, e, cache):
+        """One decode position: the CUDA graph when enabled (G6), else the eager backbone."""
+        if self.graph is not None:
+            return self.graph.step(e, cache)
+        return self.llm(inputs_embeds=e, cache_params=cache, use_cache=True).last_hidden_state
 
     def _constrained_call(self, ids):
         """E1l G2: prefill the call context (ending with the <TOOLCALL>[ prefix), then the schema-constrained call."""
