@@ -18,6 +18,7 @@ async function boot() {
   updateMicNote();
   const config = await fetch("/api/config").then((r) => r.json());
   state.gpuConfigured = Boolean(config.gpu_configured && config.v2_reachable !== false);
+  state.wsPort = config.ws_port ? String(config.ws_port) : null;
   if (!config.gpu_configured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · not configured"; }
   else if (!state.gpuConfigured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · offline"; }
 }
@@ -48,7 +49,7 @@ function connect() {
   // contract. If a browser chooses another rate, advertise that exact rate
   // and let the V2 transport resample it server-side.
   if (state.transport === "gpu" && !state.audioIn) { try { state.audioIn = new AudioContext({sampleRate:16000}); } catch (_) { state.audioIn = new AudioContext(); } }
-  state.ws = new WebSocket(`${protocol}://${location.hostname}:${location.port === "8787" ? "8788" : location.port}/ws`);
+  state.ws = new WebSocket(`${protocol}://${location.hostname}:${state.wsPort || (location.port === "8787" ? "8788" : location.port)}/ws`);
   state.ws.binaryType = "arraybuffer";
   state.ws.onopen = () => { setConnection("ok", state.transport === "gpu" ? "V2 bridge connected" : "Demo bridge connected"); $("connectButton").textContent = "Disconnect"; $("micButton").disabled = false; setSession("Opening agent…", true); state.t0 = performance.now(); const rate = state.audioIn?.sampleRate || 16000; state.ws.send(JSON.stringify({type:"session.start", transport:state.transport, scenario:currentScenario().id, system_prompt:$("promptEditor").value, input_rate:rate, language:$("languageSelect")?.value || undefined, voice:$("voiceSelect")?.value || undefined})); };
   state.ws.onmessage = (e) => { if (typeof e.data === "string") handleJson(JSON.parse(e.data)); else playPcm(e.data); };
