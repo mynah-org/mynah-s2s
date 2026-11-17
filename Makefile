@@ -70,10 +70,10 @@ WEBUI_PYTHON ?= $(if $(wildcard $(HOME)/mynah-s2s/.venv-v2/bin/python),$(HOME)/m
 # `make serve` remains BF16 unless the caller explicitly passes --int4.
 V2_SERVE_ARGS ?= --int4 --cudnn-benchmark
 # ENGINE=frankenstein: the Frankenstein engine (streaming ASR + Thinker as timing shell + text LLM + talker) behind
-# the same WebSocket protocol. FRANK_DIR = a checkout of the frankenstein-s2s branch; FRANK_SERVE_ARGS = its model
-# paths (see frankenstein/server/serve.py). The UI's LANGUAGE / VOICE selectors are honoured by this engine only.
+# the same WebSocket protocol, from frankenstein/ in this tree (FRANK_DIR); FRANK_SERVE_ARGS = its model paths
+# (see frankenstein/server/serve.py: --lab-scripts, --nano-dir, --flash-python, --flash-harness, --flash-root, ...). The UI's LANGUAGE / VOICE selectors are honoured by this engine only.
 ENGINE ?= voicechat
-FRANK_DIR ?=
+FRANK_DIR ?= $(CURDIR)
 FRANK_PORT ?= 8771
 FRANK_SERVE_ARGS ?=
 ifeq ($(ENGINE),frankenstein)
