@@ -41,7 +41,7 @@ def replay_player(log, prebuffer_s, sr):
 def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir: Path, cut_s: float,
         lab_agentbench: Path, tool_schemas, live, proc, timer=None, prebuffer_s: float = 0.32,
         listen_dir: Path | None = None, drain_s: float = 15.0, holding_cut: str = "never",
-        audio_aware: bool = False) -> dict:  # pragma: no cover - GPU
+        audio_aware: bool = False, reactive: bool = False, keep_proc: bool = False) -> dict:  # pragma: no cover - GPU
     import sys
     import numpy as np
     import soundfile as sf
@@ -66,6 +66,10 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     L = session_language("it")
     frozen = json.load(open(asr_dir / "asr_it.json"))
     wav = load_16k(asr_dir / "track_it.wav")[: int(cut_s * 16000)]
+    track = wav
+    if reactive:                                     # G3b arm B: user audio produced live, written into this buffer
+        import torch
+        wav = torch.zeros(int(240 * 16000))
     od = out / od_name
     od.mkdir()
     said = []
@@ -135,7 +139,12 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     try:
         sess.open(duplex_prompt)
         t0 = time.monotonic()                       # user-audio sample 0 is "played" now
-        run_paced(sess, wav, pace="realtime", tail_silence_s=1.0, max_extra_s=10.0, drain=True)
+        if reactive:
+            ru = _reactive_feed(sess, eng, wav, track, frozen, player, ad, ctl, d, holding_turns_fn=lambda: {
+                h["adapter_turn"] for h in d.holding if h["ok"]})
+            wav = wav[: ru.sent]
+        else:
+            run_paced(sess, wav, pace="realtime", tail_silence_s=1.0, max_extra_s=10.0, drain=True)
         t_end_loop = time.monotonic()
         sess.close("normal")
     finally:
@@ -150,7 +159,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
         time.sleep(0.05)
     pump()
     drained_s = round(time.monotonic() - t_drain, 1)
-    for ev in proc.close():                         # the talker's stats arrive with its quit (G0: read too early)
+    for ev in (proc.reset() if keep_proc else proc.close()):   # stats arrive with quit / reset (G0: read too early)
         if ev.get("ev") not in ("audio",):
             tlog.write({k: v for k, v in ev.items() if k not in ("step_ms", "decode_ms", "pcm")})
     frames.close()
@@ -171,14 +180,18 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     fr = [json.loads(x) for x in open(od / "frames.jsonl")]
     dt = [(b["t_ns"] - a["t_ns"]) / 1e6 for a, b in zip(fr, fr[1:])]
     frame_k_t = {r["k"]: r["t_ns"] / 1e9 for r in fr}
-    tl = frozen["timeline"]
-    # live vs frozen words, per user turn
+    ftl = {u["label"]: (i, u) for i, u in enumerate(frozen["timeline"])}
+    tl = [{"label": x["label"], "start_k": x["start_k"], "end_k": x["end_k"]} for x in ru.timeline
+          if "end_k" in x] if reactive else frozen["timeline"]
+    # live vs frozen words, per user turn (frozen words in the frozen track's window of the same utterance)
     live_words = [{"k": k, "word": wd} for k, ws in sorted(d.words_at.items()) for wd in ws]
     by_turn = {}
     for i, u in enumerate(tl):
         hi = tl[i + 1]["start_k"] if i + 1 < len(tl) else 10 ** 9
         lw = [x for x in live_words if u["start_k"] <= x["k"] < hi]
-        fw = [x for x in frozen["words"] if u["start_k"] <= x["k"] < hi]
+        fi, fu = ftl[u["label"]]
+        fhi = frozen["timeline"][fi + 1]["start_k"] if fi + 1 < len(frozen["timeline"]) else 10 ** 9
+        fw = [x for x in frozen["words"] if fu["start_k"] <= x["k"] < fhi]
         by_turn[u["label"]] = {"live": " ".join(x["word"] for x in lw), "frozen": " ".join(x["word"] for x in fw),
                                "same_text": " ".join(x["word"] for x in lw) == " ".join(x["word"] for x in fw),
                                "last_word_k": {"live": lw[-1]["k"] if lw else None,
@@ -250,7 +263,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
                        "stale_dropped": len(player.stale), "cuts": player.cuts,
                        "replay": [replay_player(plog, pb, 24000) for pb in (0.0, 0.16, 0.32, 0.64, 1.0, 1.5)]},
           "first_audio_after_user_end": first_audio, "first_audio_processing_clock": first_audio_proc,
-          "loop_lag_s": lag, "barge_in": barge, "drained_s": drained_s, "audio_aware": audio_aware,
+          "loop_lag_s": lag, "barge_in": barge, "reactive": reactive,
+          "user_timeline": tl, "reactive_waits": ru.waits if reactive else None, "drained_s": drained_s, "audio_aware": audio_aware,
           "holding": d.holding}
     (od / "g0.json").write_text(json.dumps(g0, indent=1, ensure_ascii=False, default=str))
     # ---------------------------------------------------------------- listening files
@@ -263,6 +277,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     st[: len(user24), 0] = user24
     st[: len(agent), 1] = agent
     sf.write(od / "agent_24k.wav", agent, 24000)
+    sf.write(od / "user_fed_16k.wav", np.asarray(wav, dtype=np.float32), 16000)
     sf.write(od / "mix_stereo_24k.wav", st, 24000)
     if listen_dir is not None:
         import shutil
@@ -274,3 +289,47 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
 
 class _NoGate:
     dropped_stale = flushed_frames = played_frames = 0
+
+
+def _reactive_feed(sess, eng, buf, track, frozen, player, ad, ctl, d, holding_turns_fn,
+                   max_s: float = 200.0):  # pragma: no cover - GPU
+    """G3b arm B: pace the reactive user's chunks in real time (as run_paced does), writing each chunk into ``buf``
+    before the engine sees it (the live ASR reads the same buffer)."""
+    import torch
+    from e1.reactive_user import ReactiveUser, Utt
+    from frankenstein_s2s.controller import St
+    tl = frozen["timeline"]
+    utts = [Utt(u["label"], track[u["start_k"] * 1280:(u["end_k"] + 1) * 1280], barge=(i == len(tl) - 1))
+            for i, u in enumerate(tl)]
+    gen = torch.Generator().manual_seed(0)
+
+    class World:
+        def audible(self, now):
+            return player.audible(now)
+
+        def agent_idle(self, now):
+            return ctl.state is St.LISTENING and not ad.busy and not player.audible(now)
+
+        def audio_starts_after(self, t, real_only):
+            hold = holding_turns_fn() if real_only else set()
+            xs = [it.t_start for it in player.items if not it.dropped and it.t_start > t and it.turn not in hold]
+            return min(xs) if xs else None
+    cs = eng.chunk_samples
+    ru = ReactiveUser(utts, chunk_samples=cs, noise=lambda n: torch.randn(n, generator=gen) * 3e-4,
+                      cat=lambda xs: torch.cat([torch.as_tensor(x, dtype=torch.float32) for x in xs]))
+    w = World()
+    dur = cs / 16000
+    t0 = time.monotonic()
+    c = 0
+    while not ru.done and c * dur < max_s and (c + 1) * cs <= buf.numel():
+        wait = t0 + c * dur - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        ch = ru.next_chunk(time.monotonic(), w)
+        buf[c * cs:(c + 1) * cs] = ch
+        sess.feed_chunk(ch)
+        c += 1
+    sess.drain_fc(post_fc_s=1.0, max_extra_s=2.0, realtime=True)
+    sess.flush(0.0)
+    ru.sent = c * cs
+    return ru

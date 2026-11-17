@@ -15,6 +15,8 @@ on the wall clock:
           {"op": "append", "epoch", "turn", "seg", "text"}   more committed text for that segment
           {"op": "final",  "epoch", "turn", "seg"}           text complete: tts_eos, let the codec EOS end it
           {"op": "cancel", "epoch", "new_epoch"}             drop every segment of that epoch (and older)
+          {"op": "reset"}                                    emit stats, then forget every segment / epoch / stat
+                                                              (a second session on the same loaded talker)
           {"op": "quit"}
   stdout  {"ev": "ready", ...} | {"ev": "audio", "epoch", "turn", "seg", "a", "b", "t_ns", "sr", "pcm16": b64}
           | {"ev": "done", ..., "frames", "ended"} | {"ev": "cancelled", ...} | {"ev": "stats", ...}
@@ -204,6 +206,19 @@ def main():  # pragma: no cover - GPU, talker env
                 if op == "quit":
                     emit({"ev": "stats", **stats})
                     return
+                if op == "reset":
+                    emit({"ev": "stats", **stats})
+                    pending.clear()
+                    by_key.clear()
+                    dead_epochs.clear()
+                    for kk in ("step_ms", "prefill_ms", "decode_ms", "cp_ms", "segments"):
+                        stats[kk] = []
+                    stats["cancels"] = 0
+                    try:
+                        cmd = cmds.get_nowait()
+                    except queue.Empty:
+                        cmd = None
+                    continue
                 key = (cmd.get("epoch"), cmd.get("turn"), cmd.get("seg"))
                 if op == "cancel":
                     stats["cancels"] += 1

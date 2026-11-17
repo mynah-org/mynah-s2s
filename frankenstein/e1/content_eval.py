@@ -75,3 +75,58 @@ def main():  # pragma: no cover - model run on the GPU host (CPU)
 
 if __name__ == "__main__":
     main()
+
+
+def played_spans(run: Path):
+    """turn -> (t_lo, t_hi) wall-clock span of the audio the player scheduled, plus ended / cancelled sets."""
+    spans, ended, cancelled = {}, {}, set()
+    for e in map(json.loads, open(run / "talker.jsonl")):
+        if e.get("ev") == "audio" and e.get("t_play") is not None:
+            lo, hi = e["t_play"], e["t_play"] + e["n"] / 24000
+            a0, a1 = spans.get(e["turn"], (lo, hi))
+            spans[e["turn"]] = (min(a0, lo), max(a1, hi))
+        elif e.get("ev") == "done":
+            ended[e["turn"]] = e.get("ended")
+        elif e.get("ev") == "cancelled":
+            cancelled.add(e["turn"])
+    return spans, ended, cancelled
+
+
+def build_items(run: Path, items_dir: Path, prefix: str) -> dict:
+    """G3b: one <items_dir>/<prefix>_t<turn>/output.wav (16-bit PCM, 24 kHz) per played agent turn, for the offline
+    evaluation ASR (v2/scripts/asr_eval.py layout). Returns {item: {ref, complete, holding}}."""
+    import numpy as np
+    import soundfile as sf
+    s = json.load(open(run / "summary.json"))
+    fr = [json.loads(x) for x in open(run / "frames.jsonl")]
+    t0 = fr[0]["t_ns"] / 1e9 - 0.16
+    agent, sr = sf.read(run / "agent_24k.wav", dtype="float32")
+    spans, ended, cancelled = played_spans(run)
+    refs = {}
+    for t in s["spoken_turns"]:
+        turn = t["turn"]
+        if turn not in spans:
+            continue
+        lo, hi = spans[turn]
+        x = agent[max(0, int((lo - t0 - 0.1) * sr)): min(len(agent), int((hi - t0 + 0.2) * sr))]
+        if len(x) < sr // 4:
+            continue
+        name = f"{prefix}_t{turn:02d}"
+        (items_dir / name).mkdir(parents=True, exist_ok=False)
+        sf.write(items_dir / name / "output.wav", np.clip(x, -1, 1), sr, subtype="PCM_16")
+        refs[name] = {"ref": t["text"], "holding": bool(t.get("holding")),
+                      "complete": ended.get(turn) == "eos" and turn not in cancelled}
+    return refs
+
+
+def score_items(items_dir: Path, refs: dict, tag: str = "omni3b") -> dict:
+    from e1.g23 import wer_cer
+    asr = {r["scenario"]: " ".join(x["text"] for x in r["segments"])
+           for r in json.load(open(items_dir / f"asr_{tag}.json"))["sessions"]}
+    rows = {k: {**v, "hyp": asr.get(k, ""), **wer_cer(v["ref"], asr.get(k, ""))} for k, v in refs.items()}
+    out = {"items": rows}
+    for prefix in sorted({k.rsplit("_t", 1)[0] for k in rows}):
+        comp = [r for k, r in rows.items() if k.startswith(prefix + "_t") and r["complete"]]
+        out[prefix] = {"complete_turns": len(comp), **wer_cer(" ".join(r["ref"] for r in comp),
+                                                              " ".join(r["hyp"] for r in comp))}
+    return out

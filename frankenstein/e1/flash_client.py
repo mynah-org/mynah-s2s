@@ -187,6 +187,17 @@ class FlashProc:  # pragma: no cover - process plumbing, exercised on the GPU ho
                 self.stats = ev
             out.append(ev)
 
+    def reset(self, timeout: float = 20.0) -> list:
+        """Stats of the session so far, then a clean talker for the next one (no reload). Returns other events seen."""
+        self.stats = None
+        self._send({"op": "reset"})
+        t_end = time.monotonic() + timeout
+        rest = []
+        while time.monotonic() < t_end and self.stats is None:
+            rest += self.poll()
+            time.sleep(0.02)
+        return rest
+
     def close(self, timeout: float = 20.0):
         if self.p is None or self.p.poll() is not None:
             return []
