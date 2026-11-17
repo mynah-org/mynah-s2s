@@ -132,6 +132,10 @@ class M1Force:
                  no_new_words_gate: bool = False, hold_cps: float = 0.0, fallback: bool = True,
                  sotc_turn: bool = False, open_rule: str = "eou", min_blank: int = 2, fake_opener: bool = True):
         self.fake_opener = fake_opener
+        # trailing ASR emissions of the utterance that just ended (lookahead + smoothing) are not a barge-in:
+        # user speech counts for the adapter only from this many frames after the turn opened (E1f: an on-time
+        # turn at frame 152 was cancelled at 154 by the tail of the caller's own words)
+        self.barge_guard_frames, self.turn_open_k = 6, -10 ** 9
         self.req_seq, self.active_rid, self.async_stats = 0, None, {"stale_tokens": 0, "requests": []}
         assert mode in ("force", "observe", "shell")
         self.forcing = mode in ("force", "shell")     # shell: the controller drives the talker, never gen_text
@@ -275,8 +279,11 @@ class M1Force:
             to_adapter = s.to_adapter if not duplex_change else emitted
         else:
             to_adapter = emitted
+        if self.forcing and self.forcer.state is not ForceState.LISTEN and state_before is ForceState.LISTEN:
+            self.turn_open_k = t
+        speech_for_adapter = u["speech"] and (t - self.turn_open_k >= self.barge_guard_frames)
         n_cmd = len(self.adapter.commands)
-        self.adapter.feed(Frame(t, to_adapter, user_speech=u["speech"]))
+        self.adapter.feed(Frame(t, to_adapter, user_speech=speech_for_adapter))
         if self.forcing and any(type(c).__name__ == "Cancel" for c in self.adapter.commands[n_cmd:]):
             self.forcer.cut()
             self.debounce_until = t + self.debounce_frames

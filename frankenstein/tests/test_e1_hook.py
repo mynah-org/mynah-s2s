@@ -355,9 +355,10 @@ class FakeAsyncBrain:
 
 def test_async_worker_tokens_flow_and_stale_after_cut():
     v = FakeVocab()
-    first = [v.id(p) for p in [" Uno", " due", " tre", " quattro", " cinque", "."]]
+    first = [v.id(p) for p in [" Uno", " due", " tre", " quattro", " cinque", " sei", " sette", " otto", " nove",
+                               " dieci", " undici", "."]]
     second = [v.id(p) for p in [" Si", "."]]
-    asr = {"words": [{"k": 3, "word": "ciao"}, {"k": 30, "word": "ancora"}], "nonblank": [1, 2, 3, 24, 25, 26, 27],
+    asr = {"words": [{"k": 3, "word": "ciao"}, {"k": 30, "word": "ancora"}], "nonblank": [1, 2, 3, 24, 25, 26, 27, 28, 29],
            "eou": [13, 37]}
     w = FakeWrapper()
     tr = Tracer()
