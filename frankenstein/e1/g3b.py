@@ -191,6 +191,7 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--ids-per-frame", type=int, default=1, help="G6: reply ids handed to the talker per frame")
     ap.add_argument("--nano-int4", action="store_true", help="G7: INT4 decode-only text LLM (as G6 chose)")
     ap.add_argument("--gpu-gate", action="store_true", help="G7: time-slice frames and text-LLM work (GpuGate)")
+    ap.add_argument("--gate-budget-ms", type=float, default=0.0, help="G7b: text-LLM time after each frame")
     ap.add_argument("--suite-ref", default="", help="G7: g6_suite.json; the INT4 suite again, compared to its bf16")
     ap.add_argument("--thinker-ref", default="", help="G7: frames.jsonl of a fixed-track arm; Thinker ids compared")
     ap.add_argument("--standalone-bench", action="store_true",
@@ -288,7 +289,7 @@ def main():  # pragma: no cover - GPU
     if a.gpu_gate:
         import torch
         from e1.gpu_gate import GpuGate
-        gate = GpuGate(sync=torch.cuda.synchronize)
+        gate = GpuGate(sync=torch.cuda.synchronize, unit_budget_ms=a.gate_budget_ms)
     if a.g6_bench:
         nano_graph = g6(a, res, save, spec, tok, m, B2, lab)
     w = eng.wrapper
