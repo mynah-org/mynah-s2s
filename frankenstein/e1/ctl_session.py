@@ -8,14 +8,15 @@ import time
 from pathlib import Path
 
 
-def _spoken_turns(ad, tok) -> list:
-    """The text the talker adapter received, per agent turn (to compare with the text LLM's output)."""
+def _spoken_turns(ad, tok, holding_turns=()) -> list:
+    """The text the talker adapter received, per agent turn (to compare with the text LLM's output). Holding-phrase
+    turns are marked (E1l): they are not part of any LLM reply."""
     turns, cur = [], None
     for c in ad.commands:
         n = type(c).__name__
         if n == "StartSegment":
             if cur is None or c.turn != cur["turn"]:
-                cur = {"turn": c.turn, "text": ""}
+                cur = {"turn": c.turn, "text": "", "holding": c.turn in holding_turns, "k": c.k, "epoch": c.epoch}
                 turns.append(cur)
             cur["text"] += (" " if cur["text"] else "") + c.text
         elif n == "AppendText" and cur is not None:
@@ -24,7 +25,8 @@ def _spoken_turns(ad, tok) -> list:
 
 
 def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir: Path, cut_s: float,
-        lab_agentbench: Path, tool_schemas, timer=None, reuse: bool = False) -> dict:  # pragma: no cover - GPU
+        lab_agentbench: Path, tool_schemas, timer=None, reuse: bool = False, holding: bool = False,
+        constrained: bool = False) -> dict:  # pragma: no cover - GPU
     import sys
     sys.path.insert(0, str(lab_agentbench))
     from m0_runner import load_16k, render_prompt, set_model_cfg
@@ -59,7 +61,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     duplex_prompt = render_prompt(reg.schemas, with_language(spec["system_prompt"], L))
     system = spec["system_prompt"] + "\n" + policy_it + " /no_think"
     worker = NanoWorker(tok, model, system, tool_schemas(reg), bound, backend, None, max_new=80, tool_step=True,
-                        reuse=reuse)
+                        reuse=reuse, constrained=constrained)
     import llm_text_bench as B2
     worker.parse = B2.parse_toolcall
     worker.start()
@@ -68,10 +70,11 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     ad = TalkerAdapter([drv, gate], decode=lambda ids: tok.decode(ids),
                        config=AdapterConfig(talker_lang=L.talker_lang, barge_in="thinker"), tracer=ftr)
     ctl = Controller(ControllerConfig(min_blank=2, debounce=8, reply_timeout=100, tool_timeout=150, merge_frames=12,
-                                      barge_guard=6, barge_in_frames=3, barge_after_open=True), tracer=ftr)
+                                      barge_guard=6, barge_in_frames=3, barge_after_open=True,
+                                      holding_phrase=holding), tracer=ftr)
     frames, blog = FrameLog(od / "frames.jsonl"), FrameLog(od / "brain.jsonl")
     seed_all()
-    d = CtlDriver(w, worker, tok, asr, ad, ftr, frames, blog, ctl)
+    d = CtlDriver(w, worker, tok, asr, ad, ftr, frames, blog, ctl, lang="it")
     d.pump = lambda: pump(ad, drv, gate)
     old = set_model_cfg(w.model_cfg, "force_turn_taking", False)
     uninstall = d.install()
@@ -96,7 +99,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
                ledger=[{"name": c.name, "status": c.status.value} for c in led.calls.values()],
                adapter=adapter_summary(ad, gate), wall_s=round(time.monotonic() - t0, 1),
                comp_timer=timer.report() if timer is not None else None, worker_alive_after_close=worker.is_alive(),
-               spoken_turns=_spoken_turns(ad, tok), reuse=reuse)
+               spoken_turns=_spoken_turns(ad, tok, {h["adapter_turn"] for h in d.holding if h["ok"]}), reuse=reuse,
+               holding_on=holding, constrained=constrained)
     ftr.close()
     (od / "summary.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False, default=str))
     fr = [json.loads(x) for x in open(od / "frames.jsonl")]

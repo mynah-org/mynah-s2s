@@ -5,6 +5,7 @@ Interface used by the per-frame hook (non-blocking):
   submit(rid, messages)   queue a request (a copy of the history is taken)
   cancel(rid)             stop decoding that request as soon as possible (epoch: its tokens become stale)
   poll() -> [events]      ("tok", rid, id, t_ns) | ("tool", rid, call dict) | ("done", rid, text, new_messages, info)
+                          | ("decided", rid, "TOOL") right after the tool step chose a call (E1l: holding phrase)
 The worker runs on the DEFAULT CUDA stream (see the note in __init__): kernels of the Thinker and of Nano
 interleave on one stream, each thread's own ops stay in order.
 Per request: an explicit tool step (call-or-reply question on a copy, 3 tokens), on "call" the call text with the
@@ -24,6 +25,33 @@ import time
 from e1.tool_step_probe import STEP_Q
 
 STOPS = (12, 11, 2)
+
+
+class _TorchLM:
+    """The LM interface of e1.constrained_call on a live hybrid cache (E1l G2)."""
+
+    def __init__(self, wk, cache, h):
+        self.wk, self.cache = wk, cache
+        self.logits = wk.m.lm_head(h[:, -1]).float()
+
+    def pick(self, allowed=None):
+        lg = self.logits[0]
+        if allowed:
+            idx = self.wk.torch.tensor(sorted(allowed), device=lg.device)
+            return int(idx[int(lg[idx].argmax())])
+        return int(lg.argmax())
+
+    def feed(self, ids):
+        wk = self.wk
+        if len(ids) == 1:
+            h = wk.llm(inputs_embeds=wk.llm.embeddings(wk.torch.tensor([ids], device=wk.dev)), cache_params=self.cache,
+                       use_cache=True).last_hidden_state
+        else:
+            h = wk._continue(self.cache, list(ids))
+        self.logits = wk.m.lm_head(h[:, -1]).float()
+
+    def decode(self, ids):
+        return self.wk.tok.decode(ids, skip_special_tokens=False)
 
 
 class QueueWorker(threading.Thread):
@@ -80,120 +108,16 @@ class QueueWorker(threading.Thread):
     def _serve_job(self, rid, msgs, t_req):
         self._serve(rid, msgs, t_req)
 
-    # ------------------------------------------------------------------ E1k: KV / SSM reuse across the steps of a turn
-    def _prefill(self, ids):
-        torch = self.torch
-        cache = self.cache_cls(self.llm.config, 1, dtype=self.dtype, device=self.dev, ssm_dtype=torch.float32)
-        h = self.llm(inputs_embeds=self.llm.embeddings(torch.tensor([ids], device=self.dev)), cache_params=cache,
-                     use_cache=True).last_hidden_state
-        return cache, h
-
-    def _continue(self, cache, ids):
-        """T known positions on an existing cache in one call (V2's continuation_forward: GEMMs on T rows, the Mamba
-        recurrence advanced token by token with the decode kernels, explicit causal mask for attention)."""
-        from mynah_v2.model.fc_phase2_prefill import continuation_forward
-        return continuation_forward(self.llm, self.llm.embeddings(self.torch.tensor([ids], device=self.dev)), cache,
-                                    chunk=16)
-
-    def _decode_from(self, rid, cache, h, max_new, emit, stop_text=None):
-        torch = self.torch
-        t0 = time.monotonic_ns()
-        logits = self.m.lm_head(h[:, -1]).float()
-        out, t_first = [], None
-        for _ in range(max_new):
-            if rid in self.cancelled:
-                break
-            nxt = int(logits.argmax(-1))
-            if nxt in STOPS:
-                break
-            out.append(nxt)
-            if t_first is None:
-                t_first = time.monotonic_ns()
-            if emit:
-                self.q_out.put(("tok", rid, nxt, time.monotonic_ns()))
-            if stop_text and stop_text in self.tok.decode(out[-8:]):
-                break
-            hh = self.llm(inputs_embeds=self.llm.embeddings(torch.tensor([[nxt]], device=self.dev)), cache_params=cache,
-                          use_cache=True).last_hidden_state
-            logits = self.m.lm_head(hh[:, -1]).float()
-        torch.cuda.current_stream().synchronize()
-        return out, {"n": len(out), "first_ms": round(((t_first or time.monotonic_ns()) - t0) / 1e6, 1),
-                     "ms": round((time.monotonic_ns() - t0) / 1e6, 1)}
-
-    def _branch(self, base, cp, ids):
-        """A copy of the shared-prefix cache continued with ids[cp:] -> (cache, hidden). ids[:cp] must equal the
-        prefix that built ``base``."""
-        import copy
-        c = copy.deepcopy(base)
-        return c, self._continue(c, ids[cp:])
-
-    def _serve_reuse(self, rid, msgs, t_req):
-        info = {"t_req_ns": t_req, "t_start_ns": time.monotonic_ns(), "steps": [], "reuse": True}
-        new_msgs = []
-        user = msgs[-1]["content"] if msgs and msgs[-1]["role"] == "user" else ""
-        if self.backend is not None and user:
-            self.backend._said.append(user)
-        ctx = msgs if msgs else [{"role": "user", "content": "[call connected]"}]
-        reply_ids = self._ids(ctx)
-        pre = self.tok.encode("<TOOLCALL>[", add_special_tokens=False)
-        dec_ids = self._ids(msgs + [{"role": "user", "content": STEP_Q}]) if (self.tool_step and user) else reply_ids
-        cp = 0
-        for a, b in zip(dec_ids, reply_ids):
-            if a != b:
-                break
-            cp += 1
-        cp = min(cp, len(reply_ids) - 1, len(dec_ids) - 1)       # every branch continues with >= 1 token
-        t0 = time.monotonic_ns()
-        base, _ = self._prefill(reply_ids[:cp])
-        info["shared_prefix"] = cp
-        info["prefill_ms"] = round((time.monotonic_ns() - t0) / 1e6, 1)
-        if self.tool_step and user:
-            c, h = self._branch(base, cp, dec_ids)
-            d, st = self._decode_from(rid, c, h, 3, False)
-            dtxt = self.tok.decode(d, skip_special_tokens=True)
-            info["steps"].append(dict(st, step="decide", out=dtxt, suffix=len(dec_ids) - cp))
-            if "TOOL" in dtxt.upper() and rid not in self.cancelled:
-                c, h = self._branch(base, cp, reply_ids + pre)
-                cl, st = self._decode_from(rid, c, h, 60, False, stop_text="</TOOLCALL>")
-                ctext = "<TOOLCALL>[" + self.tok.decode(cl, skip_special_tokens=False)
-                if "</TOOLCALL>" in ctext:
-                    ctext = ctext[: ctext.index("</TOOLCALL>") + len("</TOOLCALL>")]
-                info["steps"].append(dict(st, step="call", out=ctext))
-                tc = self.parse(ctext)
-                if isinstance(tc, list) and tc:
-                    new_msgs.append({"role": "assistant", "content": ctext})
-                    for call in tc[:2]:
-                        name, args = call.get("name"), call.get("arguments") or {}
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except Exception:  # noqa: BLE001
-                                args = {"_raw": args}
-                        t1 = time.monotonic_ns()
-                        res = self.bound[name](args) if name in self.bound else json.dumps({"error": f"unknown {name}"})
-                        rec = {"name": name, "args": args, "result": res, "executed": name in self.bound,
-                               "exec_ms": round((time.monotonic_ns() - t1) / 1e6, 1)}
-                        self.calls.append(rec)
-                        new_msgs.append({"role": "tool", "content": res})
-                        self.q_out.put(("tool", rid, rec))
-                    reply_ids = self._ids(msgs + new_msgs)
-        c, h = self._branch(base, cp, reply_ids)               # the reply folds the tool result in on the same prefix
-        r, st = self._decode_from(rid, c, h, self.max_new, True)
-        info["steps"].append(dict(st, step="reply", suffix=len(reply_ids) - cp))
-        info["t_done_ns"] = time.monotonic_ns()
-        self.q_out.put(("done", rid, self.tok.decode(r, skip_special_tokens=True), new_msgs, info))
-
-    def _serve(self, rid, msgs, t_req):
-        if self.reuse:
-            return self._serve_reuse(rid, msgs, t_req)  # pragma: no cover - abstract
+    def _serve(self, rid, msgs, t_req):  # pragma: no cover - abstract
         raise NotImplementedError
 
 
 class NanoWorker(QueueWorker):
     def __init__(self, tok, model, system: str, tools: list, bound: dict, backend=None, parse=None,
-                 max_new: int = 80, tool_step: bool = True, reuse: bool = False):
+                 max_new: int = 80, tool_step: bool = True, reuse: bool = False, constrained: bool = False):
         super().__init__(name="nano-worker")
         self.reuse = reuse
+        self.constrained = constrained
         import torch
         from mynah_v2.model.llm_cache import _hybrid_cache_cls, cache_passing_attention, position_injecting_forward
         self.torch = torch
@@ -337,6 +261,7 @@ class NanoWorker(QueueWorker):
             dtxt = self.tok.decode(d, skip_special_tokens=True)
             info["steps"].append(dict(st, step="decide", out=dtxt, suffix=len(dec_ids) - cp))
             if "TOOL" in dtxt.upper() and rid not in self.cancelled:
+                self.q_out.put(("decided", rid, "TOOL"))
                 c, h = self._branch(base, cp, reply_ids + pre)
                 cl, st = self._decode_from(rid, c, h, 60, False, stop_text="</TOOLCALL>")
                 ctext = "<TOOLCALL>[" + self.tok.decode(cl, skip_special_tokens=False)
@@ -367,6 +292,18 @@ class NanoWorker(QueueWorker):
         info["t_done_ns"] = time.monotonic_ns()
         self.q_out.put(("done", rid, self.tok.decode(r, skip_special_tokens=True), new_msgs, info))
 
+    def _constrained_call(self, ids):
+        """E1l G2: prefill the call context (ending with the <TOOLCALL>[ prefix), then the schema-constrained call."""
+        from e1.constrained_call import ConstrainedCall
+        t0 = time.monotonic_ns()
+        cache, h = self._prefill(ids)
+        t1 = time.monotonic_ns()
+        ctext, st = ConstrainedCall(self.tools, lambda t: self.tok.encode(t, add_special_tokens=False),
+                                    stop_ids=STOPS).run(_TorchLM(self, cache, h))
+        self.torch.cuda.current_stream().synchronize()
+        st.update(ctx=len(ids), prefill_ms=round((t1 - t0) / 1e6, 1), ms=round((time.monotonic_ns() - t0) / 1e6, 1))
+        return ctext, st
+
     def _serve(self, rid, msgs, t_req):
         if self.reuse:
             return self._serve_reuse(rid, msgs, t_req)
@@ -381,12 +318,16 @@ class NanoWorker(QueueWorker):
             dtxt = self.tok.decode(d, skip_special_tokens=True)
             info["steps"].append(dict(st, step="decide", out=dtxt))
             if "TOOL" in dtxt.upper() and rid not in self.cancelled:
+                self.q_out.put(("decided", rid, "TOOL"))
                 pre = self.tok.encode("<TOOLCALL>[", add_special_tokens=False)
-                c, st = self._greedy(rid, self._ids(msgs, pre), 60, False, stop_text="</TOOLCALL>")
-                ctext = "<TOOLCALL>[" + self.tok.decode(c, skip_special_tokens=False)
-                if "</TOOLCALL>" in ctext:
-                    ctext = ctext[: ctext.index("</TOOLCALL>") + len("</TOOLCALL>")]
-                info["steps"].append(dict(st, step="call", out=ctext))
+                if self.constrained:
+                    ctext, st = self._constrained_call(self._ids(msgs, pre))
+                else:
+                    c, st = self._greedy(rid, self._ids(msgs, pre), 60, False, stop_text="</TOOLCALL>")
+                    ctext = "<TOOLCALL>[" + self.tok.decode(c, skip_special_tokens=False)
+                    if "</TOOLCALL>" in ctext:
+                        ctext = ctext[: ctext.index("</TOOLCALL>") + len("</TOOLCALL>")]
+                info["steps"].append(dict(st, step="call", out=ctext, constrained=self.constrained))
                 tc = self.parse(ctext)
                 if isinstance(tc, list) and tc:
                     new_msgs.append({"role": "assistant", "content": ctext})

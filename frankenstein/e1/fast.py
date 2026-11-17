@@ -47,6 +47,10 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--reuse", action="store_true", help="E1k: Nano KV/SSM reuse across decision -> call -> reply")
     ap.add_argument("--microbench-int4", action="store_true", help="E1k: INT4 linear micro-bench (M=800, M=1)")
     ap.add_argument("--reuse-check", action="store_true", help="E1k: reuse vs no-reuse on one tool prompt first")
+    ap.add_argument("--holding", action="store_true", help="E1l G1: holding phrase when Nano decides TOOL")
+    ap.add_argument("--constrained", action="store_true", help="E1l G2: schema-constrained tool-call decoding")
+    ap.add_argument("--call-ab", default="", help="E1l: summary.json of a previous session; free vs constrained call "
+                                                  "on each of its tool prompts before the session")
     ap.add_argument("--int4-dispatch", action="store_true", help="E1k: the INT4 Nano variant uses Int4Dispatch")
     ap.add_argument("--int4-nano-variant-after-s", type=float, default=0.0,
                     help="E1j: after the bf16 session, quantize Nano INT4 and rerun if the job is younger than this")
@@ -137,10 +141,15 @@ def main():  # pragma: no cover - GPU
         print("REUSE_CHECK", json.dumps({k: v for k, v in rc.items() if k != "runs"}, ensure_ascii=False), flush=True)
         a.reuse = a.reuse and rc["same_call"] and rc["same_decision"]
         print("REUSE in session:", a.reuse, flush=True)
+    if a.call_ab:
+        ab = call_ab(tok, m, spec, POLICY["it"], tool_schemas, Path(a.call_ab))
+        (out / "call_ab.json").write_text(json.dumps(ab, indent=1, ensure_ascii=False))
+        print("CALL_AB", json.dumps(ab["summary"], ensure_ascii=False), flush=True)
     if a.ctl:
         from e1 import ctl_session
         res = ctl_session.run(out, "ctl_bf16", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), a.cut_s,
-                              lab / "agentbench", tool_schemas, timer=timer, reuse=a.reuse)
+                              lab / "agentbench", tool_schemas, timer=timer, reuse=a.reuse, holding=a.holding,
+                              constrained=a.constrained)
         print("SPEED ctl_bf16", json.dumps(res["speed"], default=str)[:1500], flush=True)
         el = time.monotonic() - T_START
         if a.int4_nano_variant_after_s and el < a.int4_nano_variant_after_s:
@@ -262,6 +271,50 @@ def reuse_check(tok, m, spec, policy_it, lab, tool_schemas) -> dict:  # pragma: 
             "same_reply": a_["text"] == b_["text"], "first_tok_ms": {"no_reuse": a_["first_tok_ms"],
                                                                      "reuse": b_["first_tok_ms"]},
             "wall_ms": {"no_reuse": a_["wall_ms"], "reuse": b_["wall_ms"]}, "runs": runs}
+
+
+def call_ab(tok, m, spec, policy_it, tool_schemas, summary_path: Path) -> dict:  # pragma: no cover - GPU
+    """E1l G2: for every tool prompt of a recorded session (the history up to a user message whose answer was a
+    call), the free call step vs the schema-constrained one: parsed call, generated tokens, time."""
+    import llm_text_bench as B2
+    from mynah_v2.agent.tools import ToolLedger, ToolRegistry
+    from tenant_backend import TenantBackend
+    from e1.nano_worker import NanoWorker
+    msgs = json.load(open(summary_path))["messages"]
+    be = TenantBackend(spec)
+    reg = ToolRegistry()
+    for t in spec["tools"]:
+        reg.register(t["name"], be.handlers()[t["name"]], t["description"], t["parameters"])
+    bound = reg.bind(ToolLedger("ab", None), lambda: 0, lambda: None, timeout_s=None)
+    wk = NanoWorker(tok, m, spec["system_prompt"] + "\n" + policy_it + " /no_think", tool_schemas(reg), bound, be,
+                    B2.parse_toolcall, max_new=60, tool_step=True)
+    pre = tok.encode("<TOOLCALL>[", add_special_tokens=False)
+    rows = []
+    import torch
+    with torch.inference_mode():
+        wk._greedy(0, wk._ids(msgs[:2], pre), 4, False)                       # warm-up (not measured)
+        for i, mm in enumerate(msgs):
+            if mm["role"] != "user" or i + 1 >= len(msgs) or not msgs[i + 1]["content"].startswith("<TOOLCALL>"):
+                continue
+            ids = wk._ids(msgs[: i + 1], pre)
+            c, st_f = wk._greedy(0, ids, 60, False, stop_text="</TOOLCALL>")
+            free = "<TOOLCALL>[" + tok.decode(c, skip_special_tokens=False)
+            free = free[: free.index("</TOOLCALL>") + 11] if "</TOOLCALL>" in free else free
+            con, st_c = wk._constrained_call(ids)
+            pf, pc, rec = B2.parse_toolcall(free), B2.parse_toolcall(con), B2.parse_toolcall(msgs[i + 1]["content"])
+            norm = lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False) if x else None   # noqa: E731
+            rows.append({"user": mm["content"], "recorded": msgs[i + 1]["content"], "free": free, "constrained": con,
+                         "free_eq_recorded": norm(pf) == norm(rec), "constrained_eq_free": norm(pc) == norm(pf),
+                         "free_tokens": st_f["n"], "free_ms": st_f["ms"], "constrained_generated": st_c["generated"],
+                         "constrained_forced": st_c["forced"], "constrained_feeds": st_c["feeds"],
+                         "constrained_ms": st_c["ms"], "constrained_prefill_ms": st_c["prefill_ms"]})
+    n = len(rows)
+    return {"summary": {"n": n, "constrained_eq_free": sum(r["constrained_eq_free"] for r in rows),
+                        "free_eq_recorded": sum(r["free_eq_recorded"] for r in rows),
+                        "free_tokens": [r["free_tokens"] for r in rows],
+                        "constrained_generated": [r["constrained_generated"] for r in rows],
+                        "free_ms": [r["free_ms"] for r in rows], "constrained_ms": [r["constrained_ms"] for r in rows]},
+            "rows": rows}
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ class St(Enum):
 PRIORITY = {
     "USER_SPEECH_START": 0, "USER_SPEECH": 0,         # barge-in evidence
     "CANCEL": 1,
-    "TOOL_CALL": 2, "TOOL_RESULT": 2, "TOOL_TIMEOUT": 2,
+    "TOOL_DECIDED": 2, "TOOL_CALL": 2, "TOOL_RESULT": 2, "TOOL_TIMEOUT": 2,
     "REPLY_TOKENS": 3, "REPLY_DONE": 4,               # tokens of a frame before the end that follows them
     "YIELD": 5,
     "WORDS": 6,                                       # a word closed (before a new one opens in the same frame)
@@ -91,6 +91,8 @@ class ControllerConfig:
                                    # are merged into a NEW request that supersedes the pending one
     barge_guard: int = 0           # user speech counts for barge-in only from this many frames after the turn opened
                                    # (the ASR tail of the words just spoken is not a barge-in)
+    holding_phrase: bool = False   # E1l: speak a short per-language holding phrase once per turn when the text LLM
+                                   # decides to call a tool (before the call is generated)
     barge_after_open: bool = False # E1k: only a speech run that STARTS after the turn opened can be a barge-in (a run
                                    # that began before the open is the tail of the caller's own turn)
 
@@ -119,6 +121,7 @@ class Controller:
         self.tool_since_k = None
         self.open_word = False
         self.spoken_in_turn = False
+        self.holding_done = False        # a holding phrase was already spoken in this turn (never repeated)
         self.held: list = []             # current-request reply intents that arrived during TOOL_WAIT (E1k)
 
     # ------------------------------------------------------------------ input
@@ -174,6 +177,7 @@ class Controller:
         self.spoken_in_turn = False
         self.deferred = None
         self.held = []
+        self.holding_done = False
         self._act("OPEN_TURN", k, reason)
         self._act("REQUEST_REPLY", k, reason, request_id=self.request_id, user_text=user_text)
 
@@ -295,6 +299,17 @@ class Controller:
         if why or self.state not in (St.PENDING, St.SPEAKING):
             return self._stale(it, k, why or f"state_{self.state.value}")
         self._close(k, "reply_done")
+
+    def _on_tool_decided(self, it, k):
+        """The text LLM decided to call a tool (before generating the call). With ``holding_phrase``: say a short
+        holding phrase now, once per turn, only if nothing of the reply was spoken yet."""
+        why = self._is_stale(it)
+        if why or self.state not in (St.PENDING, St.TOOL_WAIT):
+            return self._stale(it, k, why or f"state_{self.state.value}")
+        if not self.cfg.holding_phrase or self.holding_done or self.spoken_in_turn:
+            return
+        self.holding_done = True
+        self._act("HOLDING_PHRASE", k, "tool_decided", request_id=it.request_id)
 
     def _on_tool_call(self, it, k):
         why = self._is_stale(it)

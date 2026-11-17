@@ -11,7 +11,10 @@ wrapper's loop (instance-level wraps, no NVIDIA / v2 code edited):
   controller.tick(k)   -> actions, executed here: OPEN_TURN (BOS to the talker adapter), REQUEST_REPLY (submit to
                                 the worker; a superseded request is cancelled there), SPEAK (ids queued, one per
                                 frame to the adapter), CANCEL (adapter cancel + flush, worker cancel), CLOSE_TURN
-                                (EOS to the adapter once the queued ids are out)
+                                (EOS to the adapter once the queued ids are out), HOLDING_PHRASE (E1l: the
+                                per-language phrase as its own short adapter turn; when the real reply starts while
+                                the phrase is still audible, the phrase is cut with an adapter cancel = new epoch,
+                                and the reply opens a fresh turn in that epoch)
 The controller is the only writer of turn state; the adapter's own barge-in is off (barge_in="thinker").
 """
 
@@ -28,7 +31,7 @@ TAG = ("<", ">")
 
 class CtlDriver:
     def __init__(self, wrapper, worker, tok, asr: dict, adapter, ftr, frames, brain_log, controller: Controller,
-                 sotc_turn: bool = True):
+                 sotc_turn: bool = True, lang: str = "it"):
         self.w, self.worker, self.tok, self.adapter, self.ftr = wrapper, worker, tok, adapter, ftr
         self.frames, self.blog, self.ctl, self.sotc_turn = frames, brain_log, controller, sotc_turn
         self.pieces = {int(k): [p for p in v if not (p.strip().startswith(TAG[0]) and p.strip().endswith(TAG[1]))]
@@ -58,6 +61,9 @@ class CtlDriver:
         self.fc_suppressed: list = []
         self.pump = None
         self._orig = {}
+        self.lang = lang
+        self.holding: list = []          # one record per holding phrase said
+        self.reply_bos_needed = False    # a holding phrase closed the turn: the reply opens a new one
 
     # ------------------------------------------------------------------ install
     def install(self):
@@ -145,6 +151,9 @@ class CtlDriver:
                     r.update(done_k=t, text=ev[2], info=ev[4], new_msgs=ev[3])
                 self.ctl.post(Intent("REPLY_DONE", "nano", t, request_id=rid, epoch=ep))
                 self.blog.write({"ev": "brain.done", "k": t, "rid": rid, "reply": ev[2], "info": ev[4]})
+            elif kind == "decided":
+                self.ctl.post(Intent("TOOL_DECIDED", "nano", t, request_id=rid, epoch=ep))
+                self.blog.write({"ev": "brain.decided", "k": t, "rid": rid, "what": ev[2]})
             elif kind == "skipped":
                 self.blog.write({"ev": "brain.skipped", "k": t, "rid": rid})
 
@@ -156,6 +165,18 @@ class CtlDriver:
         if a.kind == "OPEN_TURN":
             self.pending_bos = True
             self.queue, self.close_pending, self.spoken = [], False, []
+            self.reply_bos_needed = False
+        elif a.kind == "HOLDING_PHRASE":
+            from frankenstein_s2s.holding import holding_phrase
+            text = holding_phrase(self.lang)
+            self.pending_bos = False                 # the phrase is its own adapter turn
+            self.adapter.end_turn(t)                 # closes the empty reply turn opened by BOS (if any)
+            ok = self.adapter.inject_utterance(t, text, reason="holding")
+            self.holding.append({"k": t, "text": text, "ok": ok, "epoch": self.adapter.epoch,
+                                 "adapter_turn": self.adapter.turns_started if ok else None,
+                                 "request_id": a.data.get("request_id"), "cut_k": None})
+            self.reply_bos_needed = True
+            self.blog.write({"ev": "brain.holding", "k": t, "text": text, "ok": ok})
         elif a.kind == "REQUEST_REPLY":
             text = self._caller_text(t)
             sup = a.data.get("supersedes")
@@ -174,11 +195,19 @@ class CtlDriver:
             self.worker.submit(rid, self.messages)
             self.blog.write({"ev": "brain.submit", "k": t, "rid": rid, "user": text, "supersedes": sup})
         elif a.kind == "SPEAK":
+            if self.reply_bos_needed:
+                self.reply_bos_needed = False
+                if self.adapter.busy:                # the phrase is still audible: cut it (new epoch)
+                    self.adapter.cancel(t, "holding_cut")
+                    if self.holding:
+                        self.holding[-1]["cut_k"] = t
+                self.pending_bos = True
             self.queue += list(a.data.get("ids", []))
         elif a.kind == "CLOSE_TURN":
             self.close_pending = True
             self._history(t, a.reason)
         elif a.kind == "CANCEL":
+            self.reply_bos_needed = False
             self.adapter.cancel(t, a.reason)
             self.worker.cancel(self.active_rid)
             self.queue, self.close_pending, self.pending_bos = [], False, False
@@ -211,7 +240,7 @@ class CtlDriver:
 
     def summary(self) -> dict:
         return {"hook_calls": self.n_hook, "frames_last": self.last_t, "n_gaps": len(self.gaps), "gaps": self.gaps[:20],
-                "fc_suppressed": self.fc_suppressed, "stale_tokens": self.stale,
+                "fc_suppressed": self.fc_suppressed, "stale_tokens": self.stale, "holding": self.holding,
                 "requests": [{k: v for k, v in r.items() if k != "new_msgs"} for r in self.req.values()],
                 "actions": [{"k": a.k, "kind": a.kind, "reason": a.reason, "epoch": a.epoch, "turn": a.turn,
                              **{x: y for x, y in a.data.items() if x != "ids"}} for a in self.ctl.actions],

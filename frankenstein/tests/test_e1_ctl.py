@@ -178,3 +178,105 @@ def test_true_barge_in_after_open_still_cancels():
                                 cfg=ControllerConfig(reply_timeout=100, barge_after_open=True))
     c = [a for a in d.ctl.actions if a.kind == "CANCEL"]
     assert c and c[0].k == 20 and c[0].reason == "barge_in"          # 18, 19, 20: three lexical frames
+
+
+class ToolWorker(FakeWorker):
+    """Says 'decided TOOL' after `delay` polls, then waits `call` polls (the call step) before streaming the reply."""
+
+    def __init__(self, replies, delay=2, call=6):
+        super().__init__(replies, delay)
+        self.call = call
+
+    def submit(self, rid, messages):
+        super().submit(rid, messages)
+        self.jobs[-1].update(decided=False, call=self.call)
+
+    def poll(self):
+        out = []
+        for j in self.jobs:
+            if j["wait"] == 0 and not j["decided"] and j["rid"] not in self.cancelled:
+                j["decided"] = True
+                out.append(("decided", j["rid"], "TOOL"))
+                continue
+            if j["decided"] and j["call"] > 0:
+                j["call"] -= 1
+                continue
+            out += FakeWorker.poll(_One(self, j))
+        return out
+
+
+class _One:
+    def __init__(self, w, j):
+        self.jobs, self.cancelled = [j], w.cancelled
+
+
+def tool_rig(cfg, n_model=60, call=6):
+    asr = {"words": [{"k": 4, "word": "dov'è il mio ordine"}], "pieces": {"3": ["▁dov"]}, "nonblank": [],
+           "eou": [8]}
+    model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * n_model
+    v = FakeVocab()
+    reply = [v.id(p) for p in [" Il", " suo", " ordine", " arriva", " domani", "."]]
+    w, tr = FakeWrapper(), Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode,
+                       config=AdapterConfig(barge_in="thinker"), tracer=tr)
+    wk = ToolWorker({1: reply}, delay=2, call=call)
+    ctl = Controller(cfg, tracer=tr)
+    d = CtlDriver(w, wk, Tok(v), asr, ad, tr, Log(), Log(), ctl, lang="it")
+    un = d.install()
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    return d, ad
+
+
+def _segments(ad):
+    return [(type(c).__name__, c.epoch, getattr(c, "turn", None), getattr(c, "text", "")) for c in ad.commands]
+
+
+def test_holding_phrase_once_then_cut_by_the_reply_in_a_new_epoch():
+    d, ad = tool_rig(ControllerConfig(reply_timeout=100, holding_phrase=True))
+    kinds = [a.kind for a in d.ctl.actions]
+    assert kinds.count("HOLDING_PHRASE") == 1
+    h = d.holding[0]
+    assert h["ok"] and h["text"] == "Un momento, controllo." and h["cut_k"] is not None
+    seg = _segments(ad)
+    starts = [s for s in seg if s[0] == "StartSegment"]
+    assert starts[0][3] == "Un momento, controllo." and starts[0][1] == 0
+    cancel = [s for s in seg if s[0] == "Cancel"]
+    assert len(cancel) == 1                                         # the cut
+    assert starts[1][1] == 1 and starts[1][2] != starts[0][2]      # the reply: new epoch, new adapter turn
+    reply = "".join(s[3] for s in seg if s[0] in ("StartSegment", "AppendText") and s[1] == 1)
+    assert reply == "Il suo ordine arriva domani."
+
+
+def test_holding_phrase_off_by_default_and_reply_unchanged():
+    d, ad = tool_rig(ControllerConfig(reply_timeout=100))
+    assert "HOLDING_PHRASE" not in [a.kind for a in d.ctl.actions] and d.holding == []
+    assert "".join(c.text for c in ad.commands if hasattr(c, "text")) == "Il suo ordine arriva domani."
+    assert not any(type(c).__name__ == "Cancel" for c in ad.commands)
+
+
+def test_holding_phrase_not_repeated_and_not_after_speech():
+    from frankenstein_s2s.controller import Intent
+    c = Controller(ControllerConfig(holding_phrase=True))
+    c.post(Intent("WORDS", "asr", 1))
+    c.tick(1)
+    c.post(Intent("TAKE_TURN", "thinker", 4))
+    c.tick(4)
+    for k in (5, 6):
+        c.post(Intent("TOOL_DECIDED", "nano", k, request_id=1, epoch=0))
+        c.tick(k)
+    assert [a.kind for a in c.actions].count("HOLDING_PHRASE") == 1
+    c2 = Controller(ControllerConfig(holding_phrase=True))
+    c2.post(Intent("WORDS", "asr", 1))
+    c2.tick(1)
+    c2.post(Intent("TAKE_TURN", "thinker", 4))
+    c2.tick(4)
+    c2.post(Intent("REPLY_TOKENS", "nano", 5, payload=[1001], request_id=1, epoch=0))
+    c2.tick(5)
+    c2.post(Intent("TOOL_DECIDED", "nano", 6, request_id=1, epoch=0))
+    c2.post(Intent("TOOL_DECIDED", "nano", 7, request_id=0, epoch=0))   # stale request
+    c2.tick(7)
+    assert "HOLDING_PHRASE" not in [a.kind for a in c2.actions]
