@@ -265,3 +265,27 @@ def test_audio_timeout_closes_a_turn_without_audio_end():
     c = _drain_ctl(audio_timeout=10)
     out = run(c, {}, 20)
     assert any(o[1:] == ("CLOSE_TURN", "audio_timeout") for o in out)
+
+
+def test_faster_barge_in_only_while_our_audio_is_audible():
+    c = _drain_ctl(barge_in_frames=3, barge_in_frames_audible=2)
+    c.agent_audible = True
+    out = run(c, {10: [I("USER_SPEECH", "asr", 10)], 11: [I("USER_SPEECH", "asr", 11)]}, 11)
+    assert (11, "CANCEL", "barge_in") in out
+    c2 = _drain_ctl(barge_in_frames=3, barge_in_frames_audible=2)
+    c2.agent_audible = False
+    out2 = run(c2, {10: [I("USER_SPEECH", "asr", 10)], 11: [I("USER_SPEECH", "asr", 11)]}, 11)
+    assert not any(o[1] == "CANCEL" for o in out2)
+
+
+def test_sentence_end_for_the_reply_soft_cap():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("nw", Path(__file__).resolve().parents[1] / "e1" / "nano_worker.py")
+    src = spec.loader.get_source("nw")
+    ns: dict = {}
+    exec(src.split("class _TorchLM")[0].split("STOPS = (12, 11, 2)")[1], ns)
+    se = ns["sentence_end"]
+    assert se(" domani.") and se("ok!") and not se("prezzo:") and not se("e poi...") and not se("")

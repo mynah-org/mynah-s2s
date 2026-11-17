@@ -62,6 +62,7 @@ class CtlDriver:
         self.pump = None
         self.pump_every = 5
         self.audible = None              # G0: callable -> is agent audio still playing (default: adapter.busy)
+        self.fast_barge = False          # G4: see _rnnt_hook
         self.holding_cut = "audible"     # "audible": cut a still-audible phrase when the reply starts (E1l);
                                          # "never": the reply queues behind the phrase (G0: a cut in a talker
                                          # underrun dropped the end of the phrase)
@@ -104,7 +105,11 @@ class CtlDriver:
     def _rnnt_hook(self, t, gen_text, *rest, **kw):
         self.n_hook += 1
         t = int(t)
+        if self.fast_barge or self.audible is not None:
+            self.ctl.agent_audible = bool(self.audible()) if self.audible is not None else False
         if self.live is not None:
+            if self.fast_barge:                          # G4: ASR stride 4 while our audio is audible, else 8
+                self.live.every = 4 if self.ctl.agent_audible else 8
             self._ingest_live(t, self.live.step(t, self.wav))
         predicted = int(gen_text[0, t])
         out = self._orig["rnnt"](t, gen_text, *rest, **kw)
@@ -155,7 +160,8 @@ class CtlDriver:
             self.pieces[t] = list(ev["pieces"])
             if any(ch.isalnum() for p in ev["pieces"] for ch in p):
                 self.lex_live.add(t)
-        n = max(3, getattr(self.live, "every", 3))      # smoothing >= the ASR stride (G3)
+        post = getattr(self.live, "post", None)
+        n = max(3, getattr(post, "smooth", 3))           # smoothing >= the (largest) ASR stride (G3)
         if any(j in self.lex_live for j in range(t - n + 1, t + 1)):
             self.nonblank.add(t)
         for w in ev["words"]:

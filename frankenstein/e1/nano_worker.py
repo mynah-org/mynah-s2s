@@ -27,6 +27,12 @@ from e1.tool_step_probe import STEP_Q
 STOPS = (12, 11, 2)
 
 
+def sentence_end(tail: str) -> bool:
+    """A decoded tail that closes a sentence (., !, ?, or a colon/semicolon is NOT an end)."""
+    t = tail.rstrip()
+    return bool(t) and t[-1] in ".!?" and not t.endswith("...")
+
+
 class _TorchLM:
     """The LM interface of e1.constrained_call on a live hybrid cache (E1l G2)."""
 
@@ -118,6 +124,7 @@ class NanoWorker(QueueWorker):
         super().__init__(name="nano-worker")
         self.reuse = reuse
         self.constrained = constrained
+        self.reply_soft_cap = None       # G4: after this many reply tokens, stop at the next sentence end
         import torch
         from mynah_v2.model.llm_cache import _hybrid_cache_cls, cache_passing_attention, position_injecting_forward
         self.torch = torch
@@ -149,7 +156,7 @@ class NanoWorker(QueueWorker):
                                            add_generation_prompt=True)
         return list(ids) + list(extra or [])
 
-    def _greedy(self, rid, ids, max_new, emit, stop_text=None, ignore_stops=False, cache_info=False):
+    def _greedy(self, rid, ids, max_new, emit, stop_text=None, ignore_stops=False, cache_info=False, soft_cap=None):
         torch = self.torch
         cache = self.cache_cls(self.llm.config, 1, dtype=self.dtype, device=self.dev, ssm_dtype=torch.float32)
         emb = self.llm.embeddings(torch.tensor([ids], device=self.dev))
@@ -171,6 +178,8 @@ class NanoWorker(QueueWorker):
                 self.q_out.put(("tok", rid, nxt, time.monotonic_ns()))
             if stop_text and stop_text in self.tok.decode(out[-8:]):
                 break
+            if soft_cap and len(out) >= soft_cap and sentence_end(self.tok.decode(out[-4:])):
+                break                                    # G4: brief spoken replies, cut at a sentence end
             e = self.llm.embeddings(torch.tensor([[nxt]], device=self.dev))
             h = self.llm(inputs_embeds=e, cache_params=cache, use_cache=True).last_hidden_state
             logits = self.m.lm_head(h[:, -1]).float()
@@ -346,7 +355,7 @@ class NanoWorker(QueueWorker):
                         new_msgs.append({"role": "tool", "content": res})
                         self.q_out.put(("tool", rid, rec))
                     ctx = msgs + new_msgs
-        r, st = self._greedy(rid, self._ids(ctx), self.max_new, True)
-        info["steps"].append(dict(st, step="reply"))
+        r, st = self._greedy(rid, self._ids(ctx), self.max_new, True, soft_cap=self.reply_soft_cap)
+        info["steps"].append(dict(st, step="reply", soft_cap=self.reply_soft_cap, max_new=self.max_new))
         info["t_done_ns"] = time.monotonic_ns()
         self.q_out.put(("done", rid, self.tok.decode(r, skip_special_tokens=True), new_msgs, info))

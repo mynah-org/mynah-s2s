@@ -119,6 +119,10 @@ def main():  # pragma: no cover - GPU, talker env
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fast-cp", action="store_true", help="plain loop instead of HF generate for the code predictor")
     ap.add_argument("--profile", action="store_true", help="time the code predictor separately (extra syncs)")
+    ap.add_argument("--prio", default="", choices=["", "high"],
+                    help="G4: run all talker GPU work on a highest-priority CUDA stream of this process. CUDA stream "
+                         "priorities act inside one context; across processes (the engine is another process) they "
+                         "are not guaranteed without MPS, so the effect must be measured, not assumed")
     a = ap.parse_args()
     OUT = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
     sys.stdout = sys.stderr                                 # library prints never corrupt the protocol stream
@@ -193,7 +197,13 @@ def main():  # pragma: no cover - GPU, talker env
     def can_step(g):
         return g.nxt < len(g.ids) or g.final or g.eos_fed
 
-    with torch.inference_mode():
+    import contextlib
+    if a.prio == "high":
+        lo_hi = torch.cuda.Stream.priority_range() if hasattr(torch.cuda.Stream, "priority_range") else (0, -1)
+        prio_stream = torch.cuda.Stream(priority=min(lo_hi))
+        stats["stream_priority"] = int(prio_stream.priority)
+    stream_ctx = torch.cuda.stream(prio_stream) if a.prio == "high" else contextlib.nullcontext()
+    with torch.inference_mode(), stream_ctx:
         while True:
             g = pending[0] if pending else None
             idle = g is None or (g.started and not can_step(g)) or (not g.started and not g.ids)

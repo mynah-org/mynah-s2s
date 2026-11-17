@@ -82,6 +82,7 @@ class Action:
 @dataclass
 class ControllerConfig:
     barge_in_frames: int = 3       # consecutive frames of user speech that make a barge-in (shorter = back-channel)
+    barge_in_frames_audible: int = 0  # G4: if > 0, the run needed while OUR audio is audible (faster stop)
     min_blank: int = 2             # ASR blank frames before a Thinker TAKE_TURN may open the turn
     take_turn_window: int = 12     # a deferred TAKE_TURN is kept this many frames, then dropped
     debounce: int = 8              # no new turn this many frames after a cancel
@@ -126,6 +127,7 @@ class Controller:
         self.open_word = False
         self.spoken_in_turn = False
         self.drain_since_k = None
+        self.agent_audible = False       # G4: set by the driver every frame (playback model)
         self.audio_end_k = None          # frame of the last agent audio end (G3)
         self.holding_done = False        # a holding phrase was already spoken in this turn (never repeated)
         self.held: list = []             # current-request reply intents that arrived during TOOL_WAIT (E1k)
@@ -227,7 +229,9 @@ class Controller:
                          (self.run_start_k is not None and self.run_start_k > self.opened_k))
         if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT, St.DRAINING) and started_after and \
                 (self.opened_k is None or it.k - self.opened_k >= self.cfg.barge_guard):
-            if self.speech_run >= self.cfg.barge_in_frames:
+            need = self.cfg.barge_in_frames_audible if (self.agent_audible and self.cfg.barge_in_frames_audible) \
+                else self.cfg.barge_in_frames
+            if self.speech_run >= need:
                 self._cancel(k, "barge_in")
             elif self.state is St.SPEAKING:
                 self._act("HOLD", k, "backchannel_candidate", run=self.speech_run)

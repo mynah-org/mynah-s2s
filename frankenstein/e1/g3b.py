@@ -44,6 +44,14 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--budget-s", type=float, default=575.0)
     ap.add_argument("--arm-a-min-left-s", type=float, default=170.0)
     ap.add_argument("--omni-min-left-s", type=float, default=80.0)
+    # G4 (all off = G3b behaviour)
+    ap.add_argument("--tag", default="g3b", help="run-dir prefix of the arms; content item prefix = TAG upper-cased")
+    ap.add_argument("--talker-prio", action="store_true", help="G4: talker on a highest-priority CUDA stream")
+    ap.add_argument("--brief", action="store_true", help="G4: brief spoken replies (prompt + sentence-aware cap)")
+    ap.add_argument("--fast-barge", action="store_true", help="G4: 2 evidence frames + ASR stride 4 while audible")
+    ap.add_argument("--codes-ref", default="", help="G4: g1.json; the G1 texts through this talker, codes vs G1 fast")
+    ap.add_argument("--content-run", action="append", default=[], help="NAME=RUN_IT_DIR for the content check")
+    ap.add_argument("--single-content", action="store_true", help="G4: one content check at the end (all runs)")
     a = ap.parse_args()
     T0 = time.monotonic()
     left = lambda: a.budget_s - (time.monotonic() - T0)            # noqa: E731
@@ -86,7 +94,8 @@ def main():  # pragma: no cover - GPU
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     proc = FlashProc([a.flash_python, str(Path(__file__).resolve().parent / "flash_server.py"), "--harness",
-                      a.flash_harness, "--root", a.flash_root, "--voice", a.flash_voice, "--lang", "it", "--fast-cp"],
+                      a.flash_harness, "--root", a.flash_root, "--voice", a.flash_voice, "--lang", "it", "--fast-cp",
+                      *(["--prio", "high"] if a.talker_prio else [])],
                      env, str(out / "flash_server.log"))
     proc.start()
     res["flash_ready"] = proc.wait_ready(240)
@@ -115,10 +124,10 @@ def main():  # pragma: no cover - GPU
     def run_arm(arm, reactive):
         live.reset(window_s=12.0, every=8)
         t0 = time.monotonic()
-        r = g0_session.run(out, f"g3b_{arm}", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), 52.0,
+        r = g0_session.run(out, f"{a.tag}_{arm}", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), 52.0,
                            lab / "agentbench", tool_schemas, live, proc, timer=timer, prebuffer_s=0.32,
                            listen_dir=listen / arm, holding_cut="never", audio_aware=True, reactive=reactive,
-                           keep_proc=True)
+                           keep_proc=True, brief=a.brief, fast_barge=a.fast_barge)
         g = r["g0"]
         res["arms"][arm] = {"status": "DONE", "session_s": round(time.monotonic() - t0, 1)}
         save()
@@ -132,8 +141,10 @@ def main():  # pragma: no cover - GPU
     def content(tag):
         items = out / f"asr_items_{tag}"
         refs = {}
-        for name, run in (("G0", Path(a.g0_it)), ("G3", Path(a.g3_it)), ("G3bB", out / "g3b_B"),
-                          ("G3bA", out / "g3b_A")):
+        extra = [(x.split("=", 1)[0], Path(x.split("=", 1)[1])) for x in a.content_run]
+        T = a.tag.upper().replace("G3B", "G3b")
+        for name, run in [("G0", Path(a.g0_it)), ("G3", Path(a.g3_it))] + extra + [(T + "B", out / f"{a.tag}_B"),
+                                                                                   (T + "A", out / f"{a.tag}_A")]:
             if (run / "summary.json").exists() and (run / "talker.jsonl").exists() and \
                     not any(k.startswith(name + "_t") for k in res.get("content_done", [])):
                 refs.update(build_items(run, items, name))
@@ -164,15 +175,44 @@ def main():  # pragma: no cover - GPU
         save()
         print("CONTENT", tag, json.dumps(res[f"content_{tag}"])[:1500], flush=True)
 
+    def codes_check():
+        """G4: the G1 texts through THIS talker process (priority stream, fast predictor): codes vs G1 fast."""
+        ref = json.load(open(a.codes_ref))
+        proc.reset()
+        same, segs = [], []
+        for i, (text, rs) in enumerate(zip(ref["texts"], ref["fast"]["segments"])):
+            proc.submit_raw({"op": "start", "epoch": 0, "turn": i + 1, "seg": 0, "text": text})
+            proc.submit_raw({"op": "final", "epoch": 0, "turn": i + 1, "seg": 0})
+            done, t_end = None, time.monotonic() + 60
+            while done is None and time.monotonic() < t_end:
+                for ev in proc.poll():
+                    if ev.get("ev") == "done" and ev["turn"] == i + 1:
+                        done = ev
+                time.sleep(0.005)
+            same.append(done is not None and done["codes"] == rs.get("codes"))
+            segs.append({"frames": done["frames"] if done else None})
+        proc.reset()
+        st = proc.stats or {}
+        res["codes_check"] = {"segments": len(same), "identical": sum(same),
+                              "step_ms_mean": round(sum(st.get("step_ms", [0])) / max(1, len(st.get("step_ms", []))), 2),
+                              "stream_priority": st.get("stream_priority")}
+        save()
+        print("CODES", json.dumps(res["codes_check"]), flush=True)
+
     run_arm("B", True)                                   # owner: B first
-    content("1")                                         # then the content check (G0, G3, G3b-B)
+    if not a.single_content:
+        content("1")                                     # then the content check (G0, G3, ..., B)
     if left() >= a.arm_a_min_left_s:
         run_arm("A", False)
-        content("2")                                     # A's turns, if time is left
+        if a.codes_ref and left() > 60:
+            codes_check()
+        content("2" if not a.single_content else "all")  # A's turns (or everything), if time is left
     else:
         res["arms"]["A"] = {"status": "INCOMPLETE", "why": f"time left {left():.0f} s < {a.arm_a_min_left_s}"}
         save()
         print("ARM A SKIPPED", res["arms"]["A"], flush=True)
+        if a.single_content:
+            content("all")
     proc.close()
 
 

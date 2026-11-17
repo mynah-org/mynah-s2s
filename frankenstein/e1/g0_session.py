@@ -27,6 +27,10 @@ def _stats(xs):
             "max": round(max(xs), 2) if xs else None}
 
 
+BRIEF_IT = ("Rispondi come in una telefonata: al massimo due frasi brevi, senza elenchi puntati, senza markdown e "
+            "senza simboli; dì i prezzi a parole.")
+
+
 def replay_player(log, prebuffer_s, sr):
     from e1.flash_client import Player
     p = Player(sr=sr, prebuffer_s=prebuffer_s)
@@ -41,7 +45,8 @@ def replay_player(log, prebuffer_s, sr):
 def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir: Path, cut_s: float,
         lab_agentbench: Path, tool_schemas, live, proc, timer=None, prebuffer_s: float = 0.32,
         listen_dir: Path | None = None, drain_s: float = 15.0, holding_cut: str = "never",
-        audio_aware: bool = False, reactive: bool = False, keep_proc: bool = False) -> dict:  # pragma: no cover - GPU
+        audio_aware: bool = False, reactive: bool = False, keep_proc: bool = False, brief: bool = False,
+        fast_barge: bool = False) -> dict:  # pragma: no cover - GPU
     import sys
     import numpy as np
     import soundfile as sf
@@ -82,11 +87,13 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     led = ToolLedger(od_name, tr)
     bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=None)
     duplex_prompt = render_prompt(reg.schemas, with_language(spec["system_prompt"], L))
-    system = spec["system_prompt"] + "\n" + policy_it + " /no_think"
+    system = spec["system_prompt"] + "\n" + policy_it + (("\n" + BRIEF_IT) if brief else "") + " /no_think"
     worker = NanoWorker(tok, model, system, tool_schemas(reg), bound, backend, None, max_new=80, tool_step=True,
                         constrained=True)
     import llm_text_bench as B2
     worker.parse = B2.parse_toolcall
+    if brief:                                        # G4: short spoken replies (prompt + sentence-aware cap)
+        worker.max_new, worker.reply_soft_cap = 60, 24
     worker.start()
     ftr = FTracer(od / "fr_trace.jsonl", session_id=od_name)
     player = Player(sr=24000, prebuffer_s=prebuffer_s)
@@ -120,6 +127,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
                 tlog.write({k: v for k, v in ev.items() if k not in ("step_ms", "decode_ms")})
     ctl = Controller(ControllerConfig(min_blank=2, debounce=8, reply_timeout=100, tool_timeout=150, merge_frames=12,
                                       barge_guard=6, barge_in_frames=3, barge_after_open=True, holding_phrase=True,
+                                      barge_in_frames_audible=2 if fast_barge else 0,
                                       audio_aware=audio_aware),
                      tracer=ftr)
     frames, blog = FrameLog(od / "frames.jsonl"), FrameLog(od / "brain.jsonl")
@@ -128,6 +136,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     d = CtlDriver(w, worker, tok, empty, ad, ftr, frames, blog, ctl, lang="it", live=live, wav=wav)
     d.pump, d.pump_every = pump, 1
     d.holding_cut = holding_cut
+    d.fast_barge = fast_barge
     d.audible = lambda: player.audible(time.monotonic()) or bool(ad.busy)
     old = set_model_cfg(w.model_cfg, "force_turn_taking", False)
     uninstall = d.install()
@@ -263,7 +272,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
                        "stale_dropped": len(player.stale), "cuts": player.cuts,
                        "replay": [replay_player(plog, pb, 24000) for pb in (0.0, 0.16, 0.32, 0.64, 1.0, 1.5)]},
           "first_audio_after_user_end": first_audio, "first_audio_processing_clock": first_audio_proc,
-          "loop_lag_s": lag, "barge_in": barge, "reactive": reactive,
+          "loop_lag_s": lag, "barge_in": barge, "reactive": reactive, "brief": brief, "fast_barge": fast_barge,
           "user_timeline": tl, "reactive_waits": ru.waits if reactive else None, "drained_s": drained_s, "audio_aware": audio_aware,
           "holding": d.holding}
     (od / "g0.json").write_text(json.dumps(g0, indent=1, ensure_ascii=False, default=str))
