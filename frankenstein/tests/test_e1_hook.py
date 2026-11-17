@@ -261,3 +261,41 @@ def test_no_new_words_gate_turns_a_bare_bos_into_pad():
     un()
     assert g.d[0][42] == T.PAD_ID and any(x["why"] == "no_new_caller_words" for x in hook.suppressed)
     assert not hook.skipped
+
+
+class G2(G):
+    def __getitem__(self, ix):
+        if isinstance(ix[0], slice):
+            return [row[ix[1]] for row in self.d]
+        return super().__getitem__(ix)
+
+    def __setitem__(self, ix, v):
+        if isinstance(ix[0], slice):
+            for row in self.d:
+                row[ix[1]] = v
+            return
+        super().__setitem__(ix, v)
+
+
+def test_shell_takes_the_turn_on_a_tool_call_start():
+    asr = {"words": [{"k": 3, "word": "ciao"}], "nonblank": [1, 2, 3], "eou": [13]}
+    v = FakeVocab()
+    w = FakeWrapper()
+    tr = Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode, config=AdapterConfig(), tracer=tr)
+    hook = M1Force(w, FakeBrain([[v.id(" Va"), v.id(" bene"), v.id(".")]]), Tok(v), asr, ad, tr, Log(), Log(),
+                   lambda p: ("{}", 0.0), mode="shell", eos_hold=0, sotc_turn=True, fallback=False)
+    M1Force.brain_fp = staticmethod(lambda cache: "fp")
+    un = hook.install()
+    n = 40
+    g, f, fp = G(n), G2(n), G2(n)
+    for t in range(n):
+        f[0, t] = T.SOTC_ID if t == 20 else T.PAD_ID
+        w._apply_fc_state_machine(fc_state={}, function_predicted_token=f[:, t], gen_text=g, gen_function_text=f,
+                                  current_frame_idx=t, frame_offset=t, predicted_tokens=None,
+                                  function_predicted_tokens=fp, tool_response_text=None)
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    assert hook.sotc_turns == [{"k": 20, "taken": True, "why": "ok"}]
+    assert f[0, 20] == T.PAD_ID                                  # the engine never sees the tool-call start
+    assert "".join(c.text for c in ad.commands if hasattr(c, "text")) == "Va bene."

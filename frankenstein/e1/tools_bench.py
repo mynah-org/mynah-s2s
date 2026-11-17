@@ -72,6 +72,9 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--max-new", type=int, default=96)
     ap.add_argument("--budget-s", type=float, default=480)
     ap.add_argument("--nano-dir", default=None, help="Nano-9B-v2 snapshot with weights (overrides the lab default)")
+    ap.add_argument("--two-llm-asr-dir", default=None, help="E1d part 2: e1_asr track dir; runs the two-LLM session")
+    ap.add_argument("--two-llm-cut-s", type=float, default=52.0)
+    ap.add_argument("--two-llm-need-s", type=float, default=170.0, help="do not start part 2 with less than this left")
     a = ap.parse_args()
     T0 = time.monotonic()
     out = Path(a.out)
@@ -107,7 +110,10 @@ def main():  # pragma: no cover - GPU
                                  if "__pycache__" not in str(p)},
               "lab_sha256": {n: sha(lab / n) for n in ("multilingual/llm_text_bench.py", "agentbench/tenant_backend.py",
                                                       "agentbench/tenant_furniture.json")},
-              "asr_sha256": sha(a.asr), "nano": str(B2.NANO), "vc": str(B2.VC)}
+              "asr_sha256": sha(a.asr), "nano": str(B2.NANO), "vc": str(B2.VC),
+              "nano_weights_note": "Nano-9B-v2 revision 6533e8de downloaded from HF to this host's own cache "
+                                   "(owner-accepted); the shared cache holds only its config/tokenizer/code",
+              "nano_index_sha256": sha(B2.NANO / "model.safetensors.index.json")}
     (out / "freeze.json").write_text(json.dumps(freeze, indent=1))
 
     def build(domain, lang, sid):
@@ -231,6 +237,29 @@ def main():  # pragma: no cover - GPU
                   "|", rec["agent_text"][:140], flush=True)
         durations.append(time.monotonic() - t_arm)
         status["done"].append([arm, round(durations[-1], 1)])
+    if a.two_llm_asr_dir:
+        left = a.budget_s - (time.monotonic() - T0)
+        if loaded != "nano" or left < a.two_llm_need_s:
+            status["skipped"].append("two_llm")
+            print("BUDGET: skip two_llm", round(left), flush=True)
+        else:
+            from e1.runner import mem_available_gb
+            free = mem_available_gb()
+            print("MEM before engine", round(free, 1), "GB", flush=True)
+            if free < 45:
+                status["skipped"].append(f"two_llm: only {free:.0f} GB free")
+            else:
+                from mynah_v2.model.reference import ReferenceEngine, build_cfg
+                from e1 import two_llm
+                t0 = time.monotonic()
+                eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo")), llm_cache=True)
+                print("LOADED engine", round(time.monotonic() - t0, 1), "s, free", round(mem_available_gb(), 1), "GB",
+                      flush=True)
+                rec = two_llm.run_session(out, eng, tok, m, gen, B2.parse_toolcall, spec, POLICY["it"],
+                                          Path(a.two_llm_asr_dir), a.two_llm_cut_s, lab / "agentbench", tool_schemas)
+                status["done"].append(["two_llm", rec["wall_s"]])
+                print("DONE two_llm", rec["wall_s"], "s |", json.dumps(rec["messages"], ensure_ascii=False)[:1500],
+                      flush=True)
     status["elapsed_s"] = round(time.monotonic() - T0, 1)
     (out / "status.json").write_text(json.dumps(status, indent=1))
     print("STATUS", json.dumps(status), flush=True)

@@ -105,11 +105,13 @@ class M1Force:
     def __init__(self, wrapper, brain, tok, asr: dict, adapter, ftr, frames: FrameLog, brain_log: FrameLog,
                  execute_tool, mode: str = "force", tool_turns: bool = True, bos_gate: bool = True,
                  no_empty_turns: bool = True, eos_hold=None, debounce_frames: int = 0,
-                 no_new_words_gate: bool = False, hold_cps: float = 0.0, fallback: bool = True):
+                 no_new_words_gate: bool = False, hold_cps: float = 0.0, fallback: bool = True,
+                 sotc_turn: bool = False):
         assert mode in ("force", "observe", "shell")
         self.forcing = mode in ("force", "shell")     # shell: the controller drives the talker, never gen_text
         self.debounce_frames, self.debounce_until = debounce_frames, -1
         self.no_new_words_gate, self.hold_cps = no_new_words_gate, hold_cps
+        self.sotc_turn, self.sotc_turns, self._pending_bos = sotc_turn, [], False
         self.bos_gate, self.no_empty_turns = bos_gate, no_empty_turns
         self.opener_done = False
         self.suppressed: list = []
@@ -156,6 +158,15 @@ class M1Force:
         t = int(kw["current_frame_idx"])
         g = kw["gen_function_text"]
         wanted = int(g[0, t])
+        if wanted == T.SOTC_ID and self.sotc_turn and self.forcer.state is ForceState.LISTEN:
+            ok, why = self._turn_allowed(t) if self.bos_gate else (True, "ok")
+            self.sotc_turns.append({"k": t, "taken": ok, "why": why})
+            if ok:
+                self.forcer._open(t, write=None, why="duplex_tool_call_start")   # the Thinker took the turn
+                self._pending_bos = True
+            else:
+                self.suppressed.append({"k": t, "source": "tool_call_start", "why": why})
+                self.ftr.emit("force.bos_suppressed", t, source="tool_call_start", why=why)
         if wanted != T.PAD_ID:
             g[0, t] = T.PAD_ID
             kw["function_predicted_tokens"][:, kw["frame_offset"]] = T.PAD_ID
@@ -228,6 +239,8 @@ class M1Force:
             # timing shell: the talker follows the controller; a BOS written by the wrapper never reaches it, a
             # wrapper EOS (RNNT barge-in) does
             to_adapter = emitted if (duplex_change and emitted == T.EOS_ID) else s.to_adapter
+            if self._pending_bos:
+                to_adapter, self._pending_bos = T.BOS_ID, False
         elif self.forcing:
             to_adapter = s.to_adapter if not duplex_change else emitted
         else:
@@ -298,7 +311,8 @@ class M1Force:
         self.ftr.emit("brain.request", t, user_text=user or OPENER_USER, n_messages=len(self.messages))
         r = self.brain.run(self.messages, decide_tool=self.tool_turns and bool(user))
         rec = {"ev": "brain.run", "k": t, "user": user, "prefill_ms": r["prefill_ms"], "ctx_len": r["ctx_len"],
-               "tool_margin": r["tool_margin"], "func_top1": r["func_top1"], "decision": r.get("decision")}
+               "tool_margin": r["tool_margin"], "func_top1": r["func_top1"], "decision": r.get("decision"),
+               "calls": r.get("calls"), "nano_log": r.get("nano_log")}
         ms = (time.monotonic() - t0) * 1e3
         if r.get("tool"):
             call = r["tool"]
