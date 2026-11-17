@@ -40,7 +40,7 @@ def replay_player(log, prebuffer_s, sr):
 
 def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir: Path, cut_s: float,
         lab_agentbench: Path, tool_schemas, live, proc, timer=None, prebuffer_s: float = 0.32,
-        listen_dir: Path | None = None, drain_s: float = 15.0) -> dict:  # pragma: no cover - GPU
+        listen_dir: Path | None = None, drain_s: float = 15.0, holding_cut: str = "never") -> dict:  # pragma: no cover - GPU
     import sys
     import numpy as np
     import soundfile as sf
@@ -121,6 +121,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     empty = {"words": [], "pieces": {}, "eou": []}
     d = CtlDriver(w, worker, tok, empty, ad, ftr, frames, blog, ctl, lang="it", live=live, wav=wav)
     d.pump, d.pump_every = pump, 1
+    d.holding_cut = holding_cut
     d.audible = lambda: player.audible(time.monotonic()) or bool(ad.busy)
     old = set_model_cfg(w.model_cfg, "force_turn_taking", False)
     uninstall = d.install()
@@ -147,6 +148,9 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
         time.sleep(0.05)
     pump()
     drained_s = round(time.monotonic() - t_drain, 1)
+    for ev in proc.close():                         # the talker's stats arrive with its quit (G0: read too early)
+        if ev.get("ev") not in ("audio",):
+            tlog.write({k: v for k, v in ev.items() if k not in ("step_ms", "decode_ms", "pcm")})
     frames.close()
     blog.close()
     holding_turns = {h["adapter_turn"] for h in d.holding if h["ok"]}

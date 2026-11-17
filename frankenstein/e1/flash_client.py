@@ -185,6 +185,8 @@ class FlashProc:  # pragma: no cover - process plumbing, exercised on the GPU ho
             out.append(ev)
 
     def close(self, timeout: float = 20.0):
+        if self.p is None or self.p.poll() is not None:
+            return []
         try:
             self._send({"op": "quit"})
         except Exception:  # noqa: BLE001

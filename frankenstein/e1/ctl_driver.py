@@ -62,6 +62,9 @@ class CtlDriver:
         self.pump = None
         self.pump_every = 5
         self.audible = None              # G0: callable -> is agent audio still playing (default: adapter.busy)
+        self.holding_cut = "audible"     # "audible": cut a still-audible phrase when the reply starts (E1l);
+                                         # "never": the reply queues behind the phrase (G0: a cut in a talker
+                                         # underrun dropped the end of the phrase)
         self._orig = {}
         self.lang = lang
         self.live, self.wav = live, wav  # G0: live streaming ASR (e1/live_asr.py) instead of the frozen track
@@ -219,7 +222,8 @@ class CtlDriver:
         elif a.kind == "SPEAK":
             if self.reply_bos_needed:
                 self.reply_bos_needed = False
-                if self.audible() if self.audible is not None else self.adapter.busy:   # phrase still audible: cut
+                if self.holding_cut == "audible" and (self.audible() if self.audible is not None
+                                                      else self.adapter.busy):           # phrase still audible: cut
                     self.adapter.cancel(t, "holding_cut")
                     if self.holding:
                         self.holding[-1]["cut_k"] = t

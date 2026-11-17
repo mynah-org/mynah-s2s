@@ -210,7 +210,7 @@ class _One:
         self.jobs, self.cancelled = [j], w.cancelled
 
 
-def tool_rig(cfg, n_model=60, call=6):
+def tool_rig(cfg, n_model=60, call=6, holding_cut="audible"):
     asr = {"words": [{"k": 4, "word": "dov'è il mio ordine"}], "pieces": {"3": ["▁dov"]}, "nonblank": [],
            "eou": [8]}
     model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * n_model
@@ -222,6 +222,7 @@ def tool_rig(cfg, n_model=60, call=6):
     wk = ToolWorker({1: reply}, delay=2, call=call)
     ctl = Controller(cfg, tracer=tr)
     d = CtlDriver(w, wk, Tok(v), asr, ad, tr, Log(), Log(), ctl, lang="it")
+    d.holding_cut = holding_cut
     un = d.install()
     g = G(len(model))
     for t, p in enumerate(model):
@@ -280,3 +281,13 @@ def test_holding_phrase_not_repeated_and_not_after_speech():
     c2.post(Intent("TOOL_DECIDED", "nano", 7, request_id=0, epoch=0))   # stale request
     c2.tick(7)
     assert "HOLDING_PHRASE" not in [a.kind for a in c2.actions]
+
+
+def test_holding_phrase_never_cut_reply_queues_behind_it():
+    d, ad = tool_rig(ControllerConfig(reply_timeout=100, holding_phrase=True), holding_cut="never")
+    seg = _segments(ad)
+    assert not any(x[0] == "Cancel" for x in seg) and d.holding[0]["cut_k"] is None
+    starts = [x for x in seg if x[0] == "StartSegment"]
+    assert starts[0][3] == "Un momento, controllo." and starts[1][2] != starts[0][2] and starts[1][1] == 0
+    assert "".join(x[3] for x in seg if x[0] in ("StartSegment", "AppendText"))[len("Un momento, controllo."):] \
+        == "Il suo ordine arriva domani."

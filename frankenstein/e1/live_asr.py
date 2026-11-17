@@ -89,7 +89,9 @@ class LiveASR:  # pragma: no cover - GPU
         self.done_frames = 0                       # encoder frames decoded so far (multiple of chunk)
         self.g = self.st = None
         self._fresh()
-        self.post = ASRPost()
+        # pieces arrive in 4-frame batches: a word may only close after a gap longer than one chunk (G0: with
+        # close_after 3 words were split at chunk boundaries, "diva no", "ave te")
+        self.post = ASRPost(close_after=self.chunk + 1)
         self.stats = {"calls": 0, "ms": [], "frames": 0, "resets": 0}
         self.per_frame: dict = {}                  # model frame k -> pieces (incl. tags), for the record
 
