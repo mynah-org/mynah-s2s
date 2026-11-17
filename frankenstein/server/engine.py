@@ -180,7 +180,9 @@ class FrankensteinEngine:  # pragma: no cover - GPU (the model-free parts are te
         for t in self.spec["tools"]:
             reg.register(t["name"], backend.handlers()[t["name"]], t["description"], t["parameters"])
         led = ToolLedger(getattr(self.tracer, "session_id", "frank"), self.tracer)
-        bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=None)
+        turn_of = {"ctl": None}                 # tool events carry the controller's turn id (I1b: they said 0)
+        bound = reg.bind(led, lambda: turn_of["ctl"].turn if turn_of["ctl"] is not None else 0, lambda: None,
+                         timeout_s=None)
         base = system_prompt or self.spec["system_prompt"]
         policy = self.policy.get(L.code) or self.policy["en"]
         system = with_language(base, L) + "\n" + policy + "\n" + self.brief.get(L.code, self.brief["en"]) + " /no_think"
@@ -209,6 +211,7 @@ class FrankensteinEngine:  # pragma: no cover - GPU (the model-free parts are te
                                           merge_frames=12, barge_guard=6, barge_in_frames=3, barge_after_open=True,
                                           holding_phrase=self.holding, audio_aware=True, barge_in_frames_audible=2),
                          tracer=tr)
+        turn_of["ctl"] = ctl
         self.live.reset(window_s=12.0, every=8)
         self.live.lang_idx = __import__("e1.live_asr", fromlist=["LANG_IDX"]).LANG_IDX.get(L.code, 101)
         empty = {"words": [], "pieces": {}, "eou": []}
