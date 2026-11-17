@@ -133,6 +133,20 @@ def score_session(d: Path, asr: dict) -> dict:
             cur = None
         elif cur is not None and tid is not None and tid >= 1000:
             cur["ids"].append(tid)
+    nb = set(asr["nonblank"])
+    wk = sorted(w["k"] for w in asr["words"])
+    ek = sorted(asr["eou"])
+
+    def premature(k):
+        if any((k - j) in nb for j in range(0, 5)):
+            return "asr_speech_recent"
+        lw = max([x for x in wk if x <= k], default=-1)
+        le = max([x for x in ek if x <= k], default=-1)
+        return "no_eou_after_last_word" if lw > le else None
+    for t in turns:
+        t["premature"] = premature(t["bos_k"])
+    # model BOS predictions (wanted) while listening, attributed the same way (from the per-frame log)
+    wanted_bos = [r["k"] for r in fr if r.get("predicted") == 1]
     for t in turns:
         t["after_user"] = turn_of(t["bos_k"], tl)
         t["n_text"] = len(t["ids"])
@@ -145,7 +159,10 @@ def score_session(d: Path, asr: dict) -> dict:
     for t in turns:
         if t["bos_k"] <= u4["start_k"] and (t["eos_k"] is None or t["eos_k"] > u4["start_k"]):
             speaking_at_u4 = t
-    out["duplex"] = {"agent_turns": turns, "turn_open_sources": src, "turn_closes": closes, "barge_in_events": barge,
+    out["duplex"] = {"n_agent_turns": len(turns), "n_premature_emitted_bos": sum(1 for t in turns if t["premature"]),
+                     "model_wanted_bos": [(k, premature(k)) for k in wanted_bos],
+                     "bos_suppressed": s.get("bos_suppressed"), "brain_skipped": s.get("brain_skipped"),
+                     "agent_turns": turns, "turn_open_sources": src, "turn_closes": closes, "barge_in_events": barge,
                      "u4_start_k": u4["start_k"], "agent_turn_open_at_u4": speaking_at_u4,
                      "adapter_cancels": [c for c in s["adapter"]["commands"] if c["type"] == "Cancel"],
                      "gate": s["adapter"]["gate"],
@@ -160,6 +177,8 @@ def score_session(d: Path, asr: dict) -> dict:
             calls = [{"name": c.get("name"), "args": c.get("arguments")} for c in calls]
             spoken = None
             replies.append({"k": b["k"], "label": label, "user": b.get("user"), "reply": reply,
+                            "decision": b.get("decision"), "call_parsed": (b.get("call") or {}).get("parsed"),
+                            "resume_text": (b.get("resume") or {}).get("text"),
                             "lang_id": lang_id(reply)[0], "tool_margin": b.get("tool_margin"),
                             "call_text": (b.get("call") or {}).get("text"), "tool_result": b.get("tool_result"),
                             "content": content(label, reply, calls) if label in GOLD else None,
@@ -167,6 +186,12 @@ def score_session(d: Path, asr: dict) -> dict:
                             "decode_ms_per_tok": b.get("decode_ms_per_tok"), "spoken": spoken})
         hist = [x for x in br if x.get("ev") == "history.agent"]
         out["history_spoken"] = [(h["k"], h.get("why"), h.get("spoken")) for h in hist]
+        out["brain_skips"] = [x for x in br if x.get("ev") == "brain.skip"]
+    out["ledger_tool_events"] = [{k: e.get(k) for k in ("ev", "model_step", "name", "call_id", "status", "args")}
+                                 for e in v2 if str(e.get("ev", "")).startswith(("tool.", "function."))]
+    out["summary_calls"] = s.get("calls")
+    if False:
+        pass
     else:
         text = s.get("agent_text_v2", "")
         out["agent_text_v2"] = text

@@ -60,6 +60,25 @@ class TextBrain:
         k = next(j for j in range(min(len(a), len(b))) if a[j] != b[j])
         self.call_prefix = a[:k]                      # '<TOOLCALL>[{"name": "' as the tokenizer splits it
         self.last_cache = None
+        self.yes_ids = sorted({tok.encode(w, add_special_tokens=False)[0] for w in ("yes", "Yes", " yes", " Yes")})
+        self.no_ids = sorted({tok.encode(w, add_special_tokens=False)[0] for w in ("no", "No", " no", " No")})
+
+    DECISION_Q = ("[Internal check, not from the caller] To answer the caller's last message correctly, do you have to "
+                  "call one of the tools first (find_customer, search_catalog, prepare_return, commit_return, "
+                  "escalate_to_human)? Answer with one word: yes or no.")
+
+    @torch.no_grad()
+    def decide(self, messages: list) -> dict:
+        """Explicit tool-decision step: the same weights, text path, own cache, a yes/no question appended to a COPY
+        of the history (never kept). Decision = max logit over yes-forms vs no-forms at the first reply position."""
+        ids = self.context(messages + [{"role": "user", "content": self.DECISION_Q}])
+        cache = self._new_cache()
+        t0 = time.monotonic()
+        ans, cache = self._fwd(self.e(torch.tensor([ids], device=self.dev)).to(self.dtype), cache)
+        lg = ans["text_logits"][0, -1].float()
+        y, n = float(lg[self.yes_ids].max()), float(lg[self.no_ids].max())
+        return {"decision": y > n, "yes_logit": round(y, 3), "no_logit": round(n, 3),
+                "top1": self.tok.decode([int(lg.argmax())]), "ms": round((time.monotonic() - t0) * 1e3, 1)}
 
     def context(self, messages: list) -> list:
         return self.tok.apply_chat_template([{"role": "system", "content": self.system}] + messages,
@@ -73,7 +92,7 @@ class TextBrain:
         return ans, ans.get("cache", cache)
 
     @torch.no_grad()
-    def run(self, messages: list, decide_tool: bool = True) -> dict:
+    def run(self, messages: list, decide_tool: bool = True, decision: str = "ask") -> dict:
         """One brain turn. Returns {'ctx_len', 'prefill_ms', 'tool': {...} | None, 'ids': [...] (reply, only if no
         call), 'text', 'decode_ms_per_tok', 'cache_fp'}. A call is returned WITHOUT a reply: the runner executes the
         tool, appends the result and calls run() again (resume)."""
@@ -89,9 +108,15 @@ class TextBrain:
         margin = float(fl[SOTC] - fl[PAD])
         out["tool_margin"] = round(margin, 3)
         out["func_top1"] = int(fl.argmax())
-        if decide_tool and margin > 0:
-            out["tool"] = self._call(cache)
-            return out
+        if decide_tool:
+            if decision == "ask":
+                out["decision"] = self.decide(messages)
+                call = out["decision"]["decision"]
+            else:
+                call = margin > 0
+            if call:
+                out["tool"] = self._call(cache)
+                return out
         lg = ans["text_logits"][0, -1].float()
         gen, t1 = [], time.monotonic()
         for i in range(self.max_new):

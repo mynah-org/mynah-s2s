@@ -177,3 +177,26 @@ def test_unreleased_ids_of_a_cut_turn_never_reach_the_next_turn():
     after_second_bos = [x for x in g.d[0][20:] if x >= 1000]
     assert not set(after_second_bos) & set(first)
     assert any(e.get("why") == "drop_unreleased_reply_ids" for e in tr.of("force.turn_close"))
+
+
+def test_bos_during_user_speech_is_suppressed_and_logged():
+    asr = {"words": [{"k": 3, "word": "ciao"}, {"k": 12, "word": "vorrei"}], "nonblank": list(range(1, 14)),
+           "eou": [23]}
+    model = [T.PAD_ID] * 8 + [T.BOS_ID] + [1500] * 3 + [T.PAD_ID] * 13 + [T.BOS_ID] + [T.PAD_ID] * 12
+    hook, w, g, ad, v, tr = rig(model, asr, [[" Si", "."]])
+    assert g.d[0][8] == T.PAD_ID                               # BOS while the caller speaks: not taken
+    assert hook.suppressed[0]["k"] == 8 and hook.suppressed[0]["why"] == "asr_speech_recent"
+    assert tr.of("force.bos_suppressed")
+    assert g.d[0][25] == T.BOS_ID                              # after the ASR end of utterance: taken
+    assert hook.brain.calls[0][-1]["content"] == "ciao vorrei"
+
+
+def test_no_empty_user_turn_after_the_opener():
+    asr = {"words": [{"k": 3, "word": "ciao"}], "nonblank": [1, 2, 3], "eou": [13]}
+    model = ([T.BOS_ID] + [T.PAD_ID] * 12 + [T.EOS_ID] + [T.PAD_ID] * 12 + [T.BOS_ID] + [T.PAD_ID] * 8 + [T.EOS_ID]
+             + [T.PAD_ID] * 21 + [T.BOS_ID] + [T.PAD_ID] * 5)
+    hook, w, g, ad, v, tr = rig(model, asr, [[" Benvenuto", "."], [" Bene", "."]])
+    users = [m[-1]["content"] for m in hook.brain.calls]
+    assert users == ["[call connected]", "ciao"]               # the third BOS (no new words) is not sent
+    assert hook.skipped and hook.skipped[0]["why"] == "empty_user_turn"
+    assert g.d[0][58] == T.EOS_ID                               # the empty turn is closed at the next frame

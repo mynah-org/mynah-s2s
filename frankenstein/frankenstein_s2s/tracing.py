@@ -27,13 +27,14 @@ FRANKENSTEIN = {
     # duplex Thinker, per real frame: predicted id, id fed back, function id
     "thinker.frame",
     # M1-force: content forcing on the agent channel
-    "force.turn_open", "force.override", "force.underrun", "force.turn_close",
+    "force.turn_open", "force.override", "force.underrun", "force.turn_close", "force.bos_suppressed",
     # M1-ctx: transcript inserted as extra steps
     "insert.span",
     # user side: multilingual streaming ASR and external turn-taking
     "asr.partial", "asr.word", "asr.revised", "asr.final", "asr.drop", "turn.bou", "turn.eou",
     # text-mode brain (same Thinker weights, text path)
-    "brain.request", "brain.first_token", "brain.last_token", "brain.text", "brain.tool_decision",
+    "brain.request", "brain.first_token", "brain.last_token", "brain.text", "brain.tool_decision", "brain.skip",
+    "brain.tool_call", "brain.tool_result",
     # adapter (state machine decisions)
     "adapter.turn_open", "adapter.turn_close", "adapter.turn_restart", "adapter.turn_implicit",
     "adapter.commit_word", "adapter.segment_start", "adapter.segment_restart", "adapter.burst_commit",

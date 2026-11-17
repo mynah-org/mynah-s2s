@@ -60,22 +60,40 @@ def _caller_cache():
 class UserSide:
     """Causal view of the frozen ASR track: what is known at frame k."""
 
-    def __init__(self, asr: dict):
+    def __init__(self, asr: dict, recent: int = 5):
         self.words = sorted(asr["words"], key=lambda w: w["k"])
         self.nonblank = set(asr["nonblank"])
         self.eou = set(asr["eou"])
         self.i = 0
         self.pending: list = []
         self.run = 0
+        self.recent = recent
+        self.last_word_k = -1
+        self.last_eou_k = -1
+        self.last_speech_k = -10 ** 9
 
     def advance(self, k: int) -> dict:
         new = []
         while self.i < len(self.words) and self.words[self.i]["k"] <= k:
             new.append(self.words[self.i]["word"])
+            self.last_word_k = self.words[self.i]["k"]
             self.i += 1
         self.pending += new
         self.run = self.run + 1 if k in self.nonblank else 0
+        if k in self.nonblank:
+            self.last_speech_k = k
+        if k in self.eou:
+            self.last_eou_k = k
         return {"new_words": new, "eou": k in self.eou, "speech": k in self.nonblank, "run": self.run}
+
+    def turn_open(self, k: int) -> tuple:
+        """May the agent take the turn at k? Not while the ASR reports speech in the last ``recent`` frames, and not
+        while heard words have no ASR end of utterance after them. Returns (allowed, reason)."""
+        if k - self.last_speech_k < self.recent:
+            return False, "asr_speech_recent"
+        if self.last_word_k > self.last_eou_k:
+            return False, "no_eou_after_last_word"
+        return True, "ok"
 
     def take_turn(self) -> str:
         text = " ".join(self.pending).strip()
@@ -85,8 +103,13 @@ class UserSide:
 
 class M1Force:
     def __init__(self, wrapper, brain, tok, asr: dict, adapter, ftr, frames: FrameLog, brain_log: FrameLog,
-                 execute_tool, mode: str = "force", tool_turns: bool = True):
+                 execute_tool, mode: str = "force", tool_turns: bool = True, bos_gate: bool = True,
+                 no_empty_turns: bool = True):
         assert mode in ("force", "observe")
+        self.bos_gate, self.no_empty_turns = bos_gate, no_empty_turns
+        self.opener_done = False
+        self.suppressed: list = []
+        self.skipped: list = []
         self.w, self.brain, self.tok, self.adapter, self.ftr = wrapper, brain, tok, adapter, ftr
         self.frames, self.brain_log, self.execute_tool = frames, brain_log, execute_tool
         self.mode = mode
@@ -154,7 +177,16 @@ class M1Force:
                 _, ids, done = self.sched.pop(0)
                 self.forcer.add_reply(ids, done=done)
             state_before = self.forcer.state
-            s = self.forcer.step(t, predicted)
+            pred_in = predicted
+            if self.bos_gate and predicted == T.BOS_ID and state_before is ForceState.LISTEN:
+                ok, why = self.user.turn_open(t)
+                if not ok:
+                    pred_in = T.PAD_ID                      # the BOS is not taken: PAD is written instead
+                    self.suppressed.append({"k": t, "source": "model_bos", "why": why})
+                    self.ftr.emit("force.bos_suppressed", t, source="model_bos", why=why)
+            s = self.forcer.step(t, pred_in)
+            if pred_in != predicted and s.write is None:
+                s = type(s)(T.PAD_ID, T.PAD_ID)
             if s.write is not None:
                 gen_text[0, t] = s.write
                 written = s.write
@@ -165,7 +197,16 @@ class M1Force:
         if duplex_change and self.mode == "force":
             self.mismatch.append({"k": t, "expected": expected, "emitted": emitted})
             if emitted == T.BOS_ID and state_before is ForceState.LISTEN and self.forcer.state is ForceState.LISTEN:
-                self.forcer._open(t, write=None, why="duplex_wrapper_bos")   # the audio path's own timing decision
+                ok, why = self.user.turn_open(t) if self.bos_gate else (True, "ok")
+                if ok:
+                    self.forcer._open(t, write=None, why="duplex_wrapper_bos")   # the audio path's own decision
+                else:
+                    # written by the wrapper's own turn-taking after our hook: not undone in the duplex state, not
+                    # adopted (no reply, the talker gets PAD)
+                    self.suppressed.append({"k": t, "source": "wrapper_bos", "why": why})
+                    self.ftr.emit("force.bos_suppressed", t, source="wrapper_bos", why=why, undone=False)
+                    duplex_change = False
+                    s = type(s)(s.write, T.PAD_ID)
             if emitted == T.EOS_ID and state_before in (ForceState.WAIT_TEXT, ForceState.FORCING):
                 self.ftr.emit("adapter.barge_in", t, source="duplex_rnnt", what="wrapper_forced_eos",
                               action="cut forced reply")
@@ -216,8 +257,15 @@ class M1Force:
 
     def _start_brain(self, t):
         self.forcer.need_reply = False
-        self.job_active = True
         user = self.user.take_turn()
+        if not user and self.no_empty_turns and self.opener_done:
+            self.forcer.cut()                       # empty turn: EOS at the next frame, nothing sent to the brain
+            self.skipped.append({"k": t, "why": "empty_user_turn"})
+            self.ftr.emit("brain.skip", t, why="empty_user_turn")
+            self.brain_log.write({"ev": "brain.skip", "k": t, "why": "empty_user_turn"})
+            return
+        self.opener_done = True
+        self.job_active = True
         self.messages.append({"role": "user", "content": user or OPENER_USER})
         dup = _caller_cache()
         fp0 = self.brain_fp(dup)
@@ -225,13 +273,16 @@ class M1Force:
         self.ftr.emit("brain.request", t, user_text=user or OPENER_USER, n_messages=len(self.messages))
         r = self.brain.run(self.messages, decide_tool=self.tool_turns and bool(user))
         rec = {"ev": "brain.run", "k": t, "user": user, "prefill_ms": r["prefill_ms"], "ctx_len": r["ctx_len"],
-               "tool_margin": r["tool_margin"], "func_top1": r["func_top1"]}
+               "tool_margin": r["tool_margin"], "func_top1": r["func_top1"], "decision": r.get("decision")}
         ms = (time.monotonic() - t0) * 1e3
         if r.get("tool"):
             call = r["tool"]
             rec["call"] = call
-            self.ftr.emit("brain.tool_decision", t, decision="call", margin=r["tool_margin"], call_text=call["text"])
+            self.ftr.emit("brain.tool_decision", t, decision="call", margin=r["tool_margin"],
+                          step=r.get("decision"))
+            self.ftr.emit("brain.tool_call", t, call_text=call["text"], parsed=call.get("parsed"), eotc=call["eotc"])
             result, exec_ms = self.execute_tool(call.get("parsed"))
+            self.ftr.emit("brain.tool_result", t, result=result[:400], exec_ms=exec_ms)
             rec["tool_result"], rec["tool_exec_ms"] = result, exec_ms
             self.messages.append({"role": "assistant", "content": call["text"]})
             self.messages.append({"role": "user", "content": f"<TOOL_RESPONSE>[{result}]</TOOL_RESPONSE>"})
@@ -242,7 +293,7 @@ class M1Force:
             rec["resume"] = {"prefill_ms": r2["prefill_ms"], "text": r2["text"]}
             r = r2
         else:
-            self.ftr.emit("brain.tool_decision", t, decision="none", margin=r["tool_margin"])
+            self.ftr.emit("brain.tool_decision", t, decision="none", margin=r["tool_margin"], step=r.get("decision"))
         ms_total = (time.monotonic() - t0) * 1e3
         fp1 = self.brain_fp(dup)
         self.cache_checks.append({"k": t, "before": fp0, "after": fp1, "same": fp0 == fp1,

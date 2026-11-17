@@ -216,6 +216,7 @@ def main():  # pragma: no cover - GPU
                        "frames_last": hook.last_t, "mismatch": hook.mismatch[:50], "n_mismatch": len(hook.mismatch),
                        "gaps": hook.gaps[:50], "n_gaps": len(hook.gaps),
                        "fc_suppressed": hook.fc_suppressed, "cache_checks": hook.cache_checks,
+                       "bos_suppressed": hook.suppressed, "brain_skipped": hook.skipped,
                        "forcer": {"overrides": hook.forcer.overrides, "agreements": hook.forcer.agreements,
                                   "log": [list(map(str, x)) for x in hook.forcer.log]},
                        "messages": hook.messages,
@@ -276,11 +277,19 @@ def run_cascade(asr, brain, tok, ad, drv, gate, ftr, frames, blog, reg, backend,
             t = pending_request
             pending_request = None
             utext = user.take_turn()
+            if not utext and k > 0:                 # never an empty user turn after the opener
+                ftr.emit("brain.skip", k, why="empty_user_turn")
+                blog.write({"ev": "brain.skip", "k": k, "why": "empty_user_turn"})
+                ad.feed(Frame(k, T.PAD_ID, user_speech=u["speech"]))
+                frames.write({"k": k, "emitted": T.PAD_ID, "speech": u["speech"], "eou": u["eou"],
+                              "new_words": u["new_words"] or None})
+                continue
             messages.append({"role": "user", "content": utext or OPENER_USER})
             t0 = _t.monotonic()
             ftr.emit("brain.request", k, user_text=utext or OPENER_USER)
             r = brain.run(messages, decide_tool=bool(utext))
-            row = {"ev": "brain.run", "k": k, "user": utext, "tool_margin": r["tool_margin"], "prefill_ms": r["prefill_ms"]}
+            row = {"ev": "brain.run", "k": k, "user": utext, "tool_margin": r["tool_margin"], "prefill_ms": r["prefill_ms"],
+                   "decision": r.get("decision")}
             if r.get("tool"):
                 call = r["tool"]
                 parsed = call.get("parsed")
