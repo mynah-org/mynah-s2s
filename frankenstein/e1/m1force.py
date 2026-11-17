@@ -71,6 +71,12 @@ class UserSide:
         self.last_word_k = -1
         self.last_eou_k = -1
         self.last_speech_k = -10 ** 9
+        # raw ASR emissions (frame -> pieces, language tags excluded): the "blank frames" rule and the turn text
+        self.pieces = {int(k): [p for p in v if not (p.strip().startswith("<") and p.strip().endswith(">"))]
+                       for k, v in (asr.get("pieces") or {}).items()}
+        self.raw = sorted(k for k, v in self.pieces.items() if v)
+        self.last_raw_k = -10 ** 9
+        self.last_take_k = -1
 
     def advance(self, k: int) -> dict:
         new = []
@@ -82,6 +88,8 @@ class UserSide:
         self.run = self.run + 1 if k in self.nonblank else 0
         if k in self.nonblank:
             self.last_speech_k = k
+        if self.pieces.get(k):
+            self.last_raw_k = k
         if k in self.eou:
             self.last_eou_k = k
         return {"new_words": new, "eou": k in self.eou, "speech": k in self.nonblank, "run": self.run}
@@ -95,7 +103,23 @@ class UserSide:
             return False, "no_eou_after_last_word"
         return True, "ok"
 
-    def take_turn(self) -> str:
+    def blank_frames(self, k: int) -> int:
+        """Frames since the last raw ASR emission (0 = a piece at k)."""
+        return k - self.last_raw_k
+
+    def has_new_speech(self, k: int) -> bool:
+        if self.pieces:
+            return any(self.last_take_k < j <= k for j in self.raw)
+        return bool(self.pending)
+
+    def take_turn(self, k: int | None = None) -> str:
+        """The caller's turn text heard so far. With raw pieces: every piece emitted in (last take, k], open word
+        included (causal: nothing after k). Without: the closed words since the last take."""
+        if self.pieces and k is not None:
+            ps = [p for j in self.raw if self.last_take_k < j <= k for p in self.pieces[j]]
+            self.last_take_k = k
+            self.pending = []
+            return " ".join("".join(ps).replace("\u2581", " ").split())
         text = " ".join(self.pending).strip()
         self.pending = []
         return text
@@ -106,12 +130,15 @@ class M1Force:
                  execute_tool, mode: str = "force", tool_turns: bool = True, bos_gate: bool = True,
                  no_empty_turns: bool = True, eos_hold=None, debounce_frames: int = 0,
                  no_new_words_gate: bool = False, hold_cps: float = 0.0, fallback: bool = True,
-                 sotc_turn: bool = False):
+                 sotc_turn: bool = False, open_rule: str = "eou", min_blank: int = 2, fake_opener: bool = True):
+        self.fake_opener = fake_opener
         assert mode in ("force", "observe", "shell")
         self.forcing = mode in ("force", "shell")     # shell: the controller drives the talker, never gen_text
         self.debounce_frames, self.debounce_until = debounce_frames, -1
         self.no_new_words_gate, self.hold_cps = no_new_words_gate, hold_cps
         self.sotc_turn, self.sotc_turns, self._pending_bos = sotc_turn, [], False
+        assert open_rule in ("eou", "blank")
+        self.open_rule, self.min_blank, self.signals = open_rule, min_blank, []
         self.bos_gate, self.no_empty_turns = bos_gate, no_empty_turns
         self.opener_done = False
         self.suppressed: list = []
@@ -159,7 +186,7 @@ class M1Force:
         g = kw["gen_function_text"]
         wanted = int(g[0, t])
         if wanted == T.SOTC_ID and self.sotc_turn and self.forcer.state is ForceState.LISTEN:
-            ok, why = self._turn_allowed(t) if self.bos_gate else (True, "ok")
+            ok, why = self._turn_allowed(t, "tool_call_start") if self.bos_gate else (True, "ok")
             self.sotc_turns.append({"k": t, "taken": ok, "why": why})
             if ok:
                 self.forcer._open(t, write=None, why="duplex_tool_call_start")   # the Thinker took the turn
@@ -196,7 +223,7 @@ class M1Force:
             state_before = self.forcer.state
             pred_in = predicted
             if self.bos_gate and predicted == T.BOS_ID and state_before is ForceState.LISTEN:
-                ok, why = self._turn_allowed(t)
+                ok, why = self._turn_allowed(t, "model_bos")
                 if not ok:
                     pred_in = T.PAD_ID                      # the BOS is not taken: PAD is written instead
                     self.suppressed.append({"k": t, "source": "model_bos", "why": why})
@@ -219,7 +246,7 @@ class M1Force:
         if duplex_change and self.forcing:
             self.mismatch.append({"k": t, "expected": expected, "emitted": emitted})
             if emitted == T.BOS_ID and state_before is ForceState.LISTEN and self.forcer.state is ForceState.LISTEN:
-                ok, why = self._turn_allowed(t) if self.bos_gate else (True, "ok")
+                ok, why = self._turn_allowed(t, "wrapper_bos") if self.bos_gate else (True, "ok")
                 if ok:
                     self.forcer._open(t, write=None, why="duplex_wrapper_bos")   # the audio path's own decision
                 else:
@@ -270,12 +297,17 @@ class M1Force:
                 self._start_brain(t)
         return out
 
-    def _turn_allowed(self, t):
-        ok, why = self.user.turn_open(t)
+    def _turn_allowed(self, t, source: str = "?"):
+        if self.open_rule == "blank":
+            b = self.user.blank_frames(t)
+            ok, why = (True, f"asr_blank_{b}") if b >= self.min_blank else (False, f"asr_speech_recent_{b}")
+        else:
+            ok, why = self.user.turn_open(t)
         if ok and t < self.debounce_until:
             ok, why = False, "debounce_after_cancel"
-        if ok and self.no_new_words_gate and self.opener_done and not self.user.pending:
+        if ok and self.no_new_words_gate and self.opener_done and not self.user.has_new_speech(t):
             ok, why = False, "no_new_caller_words"
+        self.signals.append({"k": t, "source": source, "allowed": ok, "why": why})
         return ok, why
 
     # ---------------------------------------------------------------------------------------- brain
@@ -295,7 +327,7 @@ class M1Force:
 
     def _start_brain(self, t):
         self.forcer.need_reply = False
-        user = self.user.take_turn()
+        user = self.user.take_turn(t)
         if not user and self.no_empty_turns and self.opener_done:
             self.forcer.cut()                       # empty turn: EOS at the next frame, nothing sent to the brain
             self.skipped.append({"k": t, "why": "empty_user_turn"})
@@ -304,7 +336,8 @@ class M1Force:
             return
         self.opener_done = True
         self.job_active = True
-        self.messages.append({"role": "user", "content": user or OPENER_USER})
+        if user or self.fake_opener:
+            self.messages.append({"role": "user", "content": user or OPENER_USER})
         dup = _caller_cache()
         fp0 = self.brain_fp(dup)
         t0 = time.monotonic()

@@ -299,3 +299,28 @@ def test_shell_takes_the_turn_on_a_tool_call_start():
     assert hook.sotc_turns == [{"k": 20, "taken": True, "why": "ok"}]
     assert f[0, 20] == T.PAD_ID                                  # the engine never sees the tool-call start
     assert "".join(c.text for c in ad.commands if hasattr(c, "text")) == "Va bene."
+
+
+def test_blank_rule_and_piece_based_turn_text():
+    # pieces: "▁vor" "rei" at 3,4 ; "▁due" at 6 ; "▁div" at 9 (open word "div...") ; nothing after
+    asr = {"words": [{"k": 8, "word": "vorrei"}, {"k": 9, "word": "due"}], "nonblank": list(range(3, 12)),
+           "eou": [25], "pieces": {"3": ["▁vor"], "4": ["rei"], "6": ["▁due"], "9": ["▁div", "<it-IT>"]}}
+    v = FakeVocab()
+    w = FakeWrapper()
+    tr = Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode, config=AdapterConfig(), tracer=tr)
+    brain = FakeBrain([[v.id(" Ok"), v.id(".")]])
+    hook = M1Force(w, brain, Tok(v), asr, ad, tr, Log(), Log(), lambda p: ("{}", 0.0), open_rule="blank",
+                   min_blank=2, eos_hold=0, fallback=False)
+    hook.opener_done = True
+    M1Force.brain_fp = staticmethod(lambda cache: "fp")
+    un = hook.install()
+    model = [T.PAD_ID] * 10 + [T.BOS_ID, T.BOS_ID] + [T.PAD_ID] * 10
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    sig = [(s["k"], s["allowed"], s["why"]) for s in hook.signals]
+    assert sig[0] == (10, False, "asr_speech_recent_1") and sig[1] == (11, True, "asr_blank_2")
+    assert brain.calls[0][-1]["content"] == "vorrei due div"          # open word included, tag dropped, nothing later

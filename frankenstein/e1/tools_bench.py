@@ -74,6 +74,8 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--nano-dir", default=None, help="Nano-9B-v2 snapshot with weights (overrides the lab default)")
     ap.add_argument("--two-llm-asr-dir", default=None, help="E1d part 2: e1_asr track dir; runs the two-LLM session")
     ap.add_argument("--two-llm-cut-s", type=float, default=52.0)
+    ap.add_argument("--two-llm-fixes", action="store_true",
+                    help="E1f: blank-frames turn opening, explicit tool step, no synthetic opener turn")
     ap.add_argument("--two-llm-need-s", type=float, default=170.0, help="do not start part 2 with less than this left")
     a = ap.parse_args()
     T0 = time.monotonic()
@@ -266,7 +268,8 @@ def main():  # pragma: no cover - GPU
             print("LOADED nano", loads, flush=True)
             (out / "loads.json").write_text(json.dumps(loads, indent=1))
             rec = two_llm.run_session(out, eng, tok, m, gen, B2.parse_toolcall, spec, POLICY["it"],
-                                      Path(a.two_llm_asr_dir), a.two_llm_cut_s, lab / "agentbench", tool_schemas)
+                                      Path(a.two_llm_asr_dir), a.two_llm_cut_s, lab / "agentbench", tool_schemas,
+                                      fixes=a.two_llm_fixes)
             status["done"].append(["two_llm", rec["wall_s"]])
             print("DONE two_llm", rec["wall_s"], "s |", json.dumps(rec["messages"], ensure_ascii=False)[:1500],
                   flush=True)
