@@ -125,6 +125,7 @@ class NanoWorker(QueueWorker):
         self.reuse = reuse
         self.constrained = constrained
         self.graph = None                # G6: e1.nano_graph.NanoGraph for the decode steps (None = eager)
+        self.graph_reply_only = False    # G8: use the decode graph for the spoken reply only
         self.gate = None                 # G7: e1.gpu_gate.GpuGate shared with the frame loop (None = no time-slicing)
         self.reply_soft_cap = None       # G4: after this many reply tokens, stop at the next sentence end
         import torch
@@ -344,6 +345,9 @@ class NanoWorker(QueueWorker):
         if self.backend is not None and user:
             self.backend._said.append(user)
         ctx = msgs if msgs else [{"role": "user", "content": "[call connected]"}]
+        graph_saved = self.graph
+        if self.graph_reply_only:                # G8: the tool step (decision + call) always eager: the decode
+            self.graph = None                    # graph changed 2/24 calls in G6; the reply may use the graph
         if self.tool_step and user:
             d, st = self._greedy(rid, self._ids(msgs + [{"role": "user", "content": STEP_Q}]), 3, False)
             dtxt = self.tok.decode(d, skip_special_tokens=True)
@@ -377,6 +381,7 @@ class NanoWorker(QueueWorker):
                         new_msgs.append({"role": "tool", "content": res})
                         self.q_out.put(("tool", rid, rec))
                     ctx = msgs + new_msgs
+        self.graph = graph_saved
         r, st = self._greedy(rid, self._ids(ctx), self.max_new, True, soft_cap=self.reply_soft_cap)
         info["steps"].append(dict(st, step="reply", soft_cap=self.reply_soft_cap, max_new=self.max_new))
         info["t_done_ns"] = time.monotonic_ns()

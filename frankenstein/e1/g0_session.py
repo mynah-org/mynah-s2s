@@ -46,7 +46,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
         lab_agentbench: Path, tool_schemas, live, proc, timer=None, prebuffer_s: float = 0.32,
         listen_dir: Path | None = None, drain_s: float = 15.0, holding_cut: str = "never",
         audio_aware: bool = False, reactive: bool = False, keep_proc: bool = False, brief: bool = False,
-        fast_barge: bool = False, nano_graph=None, ids_per_frame: int = 1, gate=None) -> dict:  # pragma: no cover - GPU
+        fast_barge: bool = False, nano_graph=None, ids_per_frame: int = 1, gate=None,
+        graph_reply_only: bool = False) -> dict:  # pragma: no cover - GPU
     import sys
     import numpy as np
     import soundfile as sf
@@ -93,6 +94,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     import llm_text_bench as B2
     worker.parse = B2.parse_toolcall
     worker.graph = nano_graph                        # G6: Nano decode CUDA graph (None = eager)
+    worker.graph_reply_only = graph_reply_only       # G8: tool step eager, reply on the graph
     worker.gate = gate                               # G7: frame loop / text LLM time-slicing (None = off)
     if brief:                                        # G4: short spoken replies (prompt + sentence-aware cap)
         worker.max_new, worker.reply_soft_cap = 60, 24

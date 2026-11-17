@@ -56,7 +56,25 @@ def run_codes_check(proc, ref_path):  # pragma: no cover - GPU
                                                           "fps": ref["fast"]["fps"]}}
 
 
-def suite_check(a, spec, tok, m, B2):  # pragma: no cover - GPU
+def warm_graph(graph, spec, tok, m, B2):  # pragma: no cover - GPU
+    """Capture the decode graph's buckets before any session (no capture while the frame loop runs)."""
+    import torch
+    from e1.nano_worker import NanoWorker
+    wk = NanoWorker(tok, m, spec["system_prompt"] + " /no_think", [], {}, None, B2.parse_toolcall, max_new=8)
+    wk.graph = graph
+    out = {}
+    with torch.inference_mode():
+        for n in (10, 1300):
+            ids = wk._ids([{"role": "user", "content": "parola " * n}])
+            cache, h = wk._prefill(ids)
+            for _ in range(3):
+                h = wk._step(wk.llm.embeddings(torch.tensor([[1000]], device=wk.dev)), cache)
+            out[str(len(ids))] = True
+    out["stats"] = graph.stats()
+    return out
+
+
+def suite_check(a, spec, tok, m, B2, graph=None):  # pragma: no cover - GPU
     """G7: the G6 tool suite with the INT4 decode-only text LLM, compared to G6's bf16 reference rows."""
     from mynah_v2.agent.tools import ToolLedger, ToolRegistry
     from tenant_backend import TenantBackend
@@ -79,8 +97,10 @@ def suite_check(a, spec, tok, m, B2):  # pragma: no cover - GPU
         wk = NanoWorker(tok, m, system, tool_schemas(reg), bound, be, B2.parse_toolcall, max_new=60,
                         tool_step=True, constrained=True)
         wk.reply_soft_cap = 24
+        wk.graph, wk.graph_reply_only = graph, graph is not None
         return wk
-    r = run_suite(make_worker, suite_items(spec, a.suite_session or None), "int4")
+    r = run_suite(make_worker, suite_items(spec, a.suite_session or None),
+                  "int4_graph_reply" if graph is not None else "int4")
     return {"per_token_ms_suite": r["per_token_ms_mean"], "vs_g6_bf16": compare(ref, r)}
 
 
@@ -192,6 +212,8 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--nano-int4", action="store_true", help="G7: INT4 decode-only text LLM (as G6 chose)")
     ap.add_argument("--gpu-gate", action="store_true", help="G7: time-slice frames and text-LLM work (GpuGate)")
     ap.add_argument("--gate-budget-ms", type=float, default=0.0, help="G7b: text-LLM time after each frame")
+    ap.add_argument("--nano-graph-reply", action="store_true",
+                    help="G8: Nano decode graph for the reply step only (tool step eager); suite-checked")
     ap.add_argument("--suite-ref", default="", help="G7: g6_suite.json; the INT4 suite again, compared to its bf16")
     ap.add_argument("--thinker-ref", default="", help="G7: frames.jsonl of a fixed-track arm; Thinker ids compared")
     ap.add_argument("--standalone-bench", action="store_true",
@@ -282,8 +304,13 @@ def main():  # pragma: no cover - GPU
     if a.nano_int4:
         from e1.int4_dispatch import quantize_int4_decode_only
         res["int4_decode_only"] = quantize_int4_decode_only(m.backbone)
+    if a.nano_graph_reply:
+        import torch
+        from e1.nano_graph import NanoGraph
+        nano_graph = NanoGraph(m.backbone, lmax=4096)
+        res["nano_graph_warm"] = warm_graph(nano_graph, spec, tok, m, B2)
     if a.suite_ref:
-        res["suite"] = suite_check(a, spec, tok, m, B2)
+        res["suite"] = suite_check(a, spec, tok, m, B2, graph=nano_graph)
         save()
         print("SUITE", json.dumps(res["suite"])[:1500], flush=True)
     if a.gpu_gate:
@@ -310,7 +337,7 @@ def main():  # pragma: no cover - GPU
                            lab / "agentbench", tool_schemas, live, proc, timer=timer, prebuffer_s=0.32,
                            listen_dir=listen / arm, holding_cut="never", audio_aware=True, reactive=reactive,
                            keep_proc=True, brief=a.brief, fast_barge=a.fast_barge, nano_graph=nano_graph,
-                           ids_per_frame=a.ids_per_frame, gate=gate)
+                           ids_per_frame=a.ids_per_frame, gate=gate, graph_reply_only=a.nano_graph_reply)
         if gate is not None:
             res["arms"][arm + "_gate"] = dict(gate.stats)
         g = r["g0"]
