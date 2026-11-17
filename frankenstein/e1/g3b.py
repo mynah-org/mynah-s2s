@@ -56,6 +56,34 @@ def run_codes_check(proc, ref_path):  # pragma: no cover - GPU
                                                           "fps": ref["fast"]["fps"]}}
 
 
+def suite_check(a, spec, tok, m, B2):  # pragma: no cover - GPU
+    """G7: the G6 tool suite with the INT4 decode-only text LLM, compared to G6's bf16 reference rows."""
+    from mynah_v2.agent.tools import ToolLedger, ToolRegistry
+    from tenant_backend import TenantBackend
+    from e1.g0_session import BRIEF_IT
+    from e1.g6_bench import compare, run_suite, suite_items
+    from e1.nano_worker import NanoWorker
+    from e1.tools_bench import POLICY, tool_schemas
+    brief = {"it": BRIEF_IT, "en": "Answer as on a phone call: at most two short sentences, no lists, no markdown."}
+    ref = json.load(open(a.suite_ref))["bf16"]
+
+    def make_worker(lang):
+        said = []
+        be = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
+        be._said = said
+        reg = ToolRegistry()
+        for t in spec["tools"]:
+            reg.register(t["name"], be.handlers()[t["name"]], t["description"], t["parameters"])
+        bound = reg.bind(ToolLedger("g7", None), lambda: 0, lambda: None, timeout_s=None)
+        system = spec["system_prompt"] + "\n" + POLICY[lang] + "\n" + brief[lang] + " /no_think"
+        wk = NanoWorker(tok, m, system, tool_schemas(reg), bound, be, B2.parse_toolcall, max_new=60,
+                        tool_step=True, constrained=True)
+        wk.reply_soft_cap = 24
+        return wk
+    r = run_suite(make_worker, suite_items(spec, a.suite_session or None), "int4")
+    return {"per_token_ms_suite": r["per_token_ms_mean"], "vs_g6_bf16": compare(ref, r)}
+
+
 def g6(a, res, save, spec, tok, m, B2, lab):  # pragma: no cover - GPU
     """G6 a) + b) + d): suite per Nano variant, per-token decode ms, NVFP4 probe. Returns the graph to use (or None)
     and leaves Int4DecodeOnly.active as decided."""
@@ -161,6 +189,10 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--suite-session", default="", help="G6: summary.json whose tool prompts join the suite")
     ap.add_argument("--wo-gemv", default="", help="G6: copy of the web UI tree's Triton GEMV file (NVFP4 probe)")
     ap.add_argument("--ids-per-frame", type=int, default=1, help="G6: reply ids handed to the talker per frame")
+    ap.add_argument("--nano-int4", action="store_true", help="G7: INT4 decode-only text LLM (as G6 chose)")
+    ap.add_argument("--gpu-gate", action="store_true", help="G7: time-slice frames and text-LLM work (GpuGate)")
+    ap.add_argument("--suite-ref", default="", help="G7: g6_suite.json; the INT4 suite again, compared to its bf16")
+    ap.add_argument("--thinker-ref", default="", help="G7: frames.jsonl of a fixed-track arm; Thinker ids compared")
     ap.add_argument("--standalone-bench", action="store_true",
                     help="G5: before the engine loads, the G1 texts through the talker alone (codes vs G1, speed)")
     ap.add_argument("--stop-if-codes-differ", action="store_true",
@@ -245,6 +277,18 @@ def main():  # pragma: no cover - GPU
         return
     spec = json.load(open(lab / "agentbench" / "tenant_furniture.json"))
     nano_graph = None
+    gate = None
+    if a.nano_int4:
+        from e1.int4_dispatch import quantize_int4_decode_only
+        res["int4_decode_only"] = quantize_int4_decode_only(m.backbone)
+    if a.suite_ref:
+        res["suite"] = suite_check(a, spec, tok, m, B2)
+        save()
+        print("SUITE", json.dumps(res["suite"])[:1500], flush=True)
+    if a.gpu_gate:
+        import torch
+        from e1.gpu_gate import GpuGate
+        gate = GpuGate(sync=torch.cuda.synchronize)
     if a.g6_bench:
         nano_graph = g6(a, res, save, spec, tok, m, B2, lab)
     w = eng.wrapper
@@ -265,7 +309,9 @@ def main():  # pragma: no cover - GPU
                            lab / "agentbench", tool_schemas, live, proc, timer=timer, prebuffer_s=0.32,
                            listen_dir=listen / arm, holding_cut="never", audio_aware=True, reactive=reactive,
                            keep_proc=True, brief=a.brief, fast_barge=a.fast_barge, nano_graph=nano_graph,
-                           ids_per_frame=a.ids_per_frame)
+                           ids_per_frame=a.ids_per_frame, gate=gate)
+        if gate is not None:
+            res["arms"][arm + "_gate"] = dict(gate.stats)
         g = r["g0"]
         res["arms"][arm] = {"status": "DONE", "session_s": round(time.monotonic() - t0, 1)}
         save()
@@ -318,11 +364,24 @@ def main():  # pragma: no cover - GPU
         save()
         print("CODES", json.dumps(res["codes_check"]), flush=True)
 
+    def thinker_check():
+        ref = [json.loads(x) for x in open(a.thinker_ref)]
+        new = [json.loads(x) for x in open(out / f"{a.tag}_A" / "frames.jsonl")]
+        n = min(len(ref), len(new))
+        same = sum(r["predicted"] == x["predicted"] for r, x in zip(ref[:n], new[:n]))
+        res["thinker_identity"] = {"frames": n, "identical_predicted": same,
+                                   "first_diff": next((i for i in range(n) if ref[i]["predicted"] != new[i]["predicted"]),
+                                                      None)}
+        save()
+        print("THINKER", json.dumps(res["thinker_identity"]), flush=True)
+
     run_arm("B", True)                                   # owner: B first
     if not a.single_content:
         content("1")                                     # then the content check (G0, G3, ..., B)
     if left() >= a.arm_a_min_left_s:
         run_arm("A", False)
+        if a.thinker_ref:
+            thinker_check()
         if a.codes_ref and left() > 60:
             codes_check()
         content("2" if not a.single_content else "all")  # A's turns (or everything), if time is left

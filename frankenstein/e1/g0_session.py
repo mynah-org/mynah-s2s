@@ -46,7 +46,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
         lab_agentbench: Path, tool_schemas, live, proc, timer=None, prebuffer_s: float = 0.32,
         listen_dir: Path | None = None, drain_s: float = 15.0, holding_cut: str = "never",
         audio_aware: bool = False, reactive: bool = False, keep_proc: bool = False, brief: bool = False,
-        fast_barge: bool = False, nano_graph=None, ids_per_frame: int = 1) -> dict:  # pragma: no cover - GPU
+        fast_barge: bool = False, nano_graph=None, ids_per_frame: int = 1, gate=None) -> dict:  # pragma: no cover - GPU
     import sys
     import numpy as np
     import soundfile as sf
@@ -93,6 +93,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     import llm_text_bench as B2
     worker.parse = B2.parse_toolcall
     worker.graph = nano_graph                        # G6: Nano decode CUDA graph (None = eager)
+    worker.gate = gate                               # G7: frame loop / text LLM time-slicing (None = off)
     if brief:                                        # G4: short spoken replies (prompt + sentence-aware cap)
         worker.max_new, worker.reply_soft_cap = 60, 24
     worker.start()
@@ -145,6 +146,14 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     eng.bind_session_tools({})
     if timer is not None:
         timer.reset()
+    step_orig = None
+    if gate is not None:                             # G7: every engine chunk is one frame-side unit of the gate
+        step_orig = eng.step
+
+        def gated_step(*a_, **kw_):
+            with gate.frame():
+                return step_orig(*a_, **kw_)
+        eng.step = gated_step
     sess = Session(eng, tr, Mode.REFERENCE, None, on_audio=lambda x: None, controller=None)
     t_wall0 = time.monotonic()
     try:
@@ -160,6 +169,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
         sess.close("normal")
     finally:
         uninstall()
+        if step_orig is not None:
+            del eng.step                             # back to the class method
         tr.close()
         set_model_cfg(w.model_cfg, "force_turn_taking", old)
         worker.close(timeout=30)
@@ -276,6 +287,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
                        "replay": [replay_player(plog, pb, 24000) for pb in (0.0, 0.16, 0.32, 0.64, 1.0, 1.5)]},
           "first_audio_after_user_end": first_audio, "first_audio_processing_clock": first_audio_proc,
           "loop_lag_s": lag, "barge_in": barge, "reactive": reactive, "brief": brief, "fast_barge": fast_barge,
+          "gate": dict(gate.stats) if gate is not None else None,
           "user_timeline": tl, "reactive_waits": ru.waits if reactive else None, "drained_s": drained_s, "audio_aware": audio_aware,
           "holding": d.holding}
     (od / "g0.json").write_text(json.dumps(g0, indent=1, ensure_ascii=False, default=str))

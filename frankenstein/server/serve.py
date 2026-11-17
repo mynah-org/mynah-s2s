@@ -117,6 +117,10 @@ def main():  # pragma: no cover - GPU
     td = Path(a.trace_dir)
     td.mkdir(parents=True, exist_ok=True)
     loads = {"mem_before_gb": round(mem_available_gb(), 1)}
+    import torch
+    free, total = torch.cuda.mem_get_info()                     # I1: the first attempt died on a CUDA OOM at load
+    loads["cuda_free_gb_before"] = round(free / 2 ** 30, 1)
+    print("CUDA_MEM", loads, flush=True)
     ref = ReferenceEngine(build_cfg(output_dir=str(td / "_nemo"), overrides={"s2s.decode_audio": False}),
                           llm_cache=True)
     safe_no_audio(ref)

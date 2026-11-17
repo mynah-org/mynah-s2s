@@ -125,6 +125,7 @@ class NanoWorker(QueueWorker):
         self.reuse = reuse
         self.constrained = constrained
         self.graph = None                # G6: e1.nano_graph.NanoGraph for the decode steps (None = eager)
+        self.gate = None                 # G7: e1.gpu_gate.GpuGate shared with the frame loop (None = no time-slicing)
         self.reply_soft_cap = None       # G4: after this many reply tokens, stop at the next sentence end
         import torch
         from mynah_v2.model.llm_cache import _hybrid_cache_cls, cache_passing_attention, position_injecting_forward
@@ -162,8 +163,9 @@ class NanoWorker(QueueWorker):
         cache = self.cache_cls(self.llm.config, 1, dtype=self.dtype, device=self.dev, ssm_dtype=torch.float32)
         emb = self.llm.embeddings(torch.tensor([ids], device=self.dev))
         t0 = time.monotonic_ns()
-        h = self.llm(inputs_embeds=emb, cache_params=cache, use_cache=True).last_hidden_state
-        logits = self.m.lm_head(h[:, -1]).float()
+        with self._g():
+            h = self.llm(inputs_embeds=emb, cache_params=cache, use_cache=True).last_hidden_state
+            logits = self.m.lm_head(h[:, -1]).float()
         out, t_first = [], None
         for _ in range(max_new):
             if rid in self.cancelled:
@@ -181,9 +183,10 @@ class NanoWorker(QueueWorker):
                 break
             if soft_cap and len(out) >= soft_cap and sentence_end(self.tok.decode(out[-4:])):
                 break                                    # G4: brief spoken replies, cut at a sentence end
-            e = self.llm.embeddings(torch.tensor([[nxt]], device=self.dev))
-            h = self._step(e, cache)
-            logits = self.m.lm_head(h[:, -1]).float()
+            with self._g():
+                e = self.llm.embeddings(torch.tensor([[nxt]], device=self.dev))
+                h = self._step(e, cache)
+                logits = self.m.lm_head(h[:, -1]).float()
         torch.cuda.current_stream().synchronize()
         t_end = time.monotonic_ns()
         info = {"ctx": len(ids), "n": len(out), "first_ms": round(((t_first or t_end) - t0) / 1e6, 1),
@@ -202,16 +205,24 @@ class NanoWorker(QueueWorker):
     def _prefill(self, ids):
         torch = self.torch
         cache = self.cache_cls(self.llm.config, 1, dtype=self.dtype, device=self.dev, ssm_dtype=torch.float32)
-        h = self.llm(inputs_embeds=self.llm.embeddings(torch.tensor([ids], device=self.dev)), cache_params=cache,
-                     use_cache=True).last_hidden_state
+        with self._g():
+            h = self.llm(inputs_embeds=self.llm.embeddings(torch.tensor([ids], device=self.dev)), cache_params=cache,
+                         use_cache=True).last_hidden_state
         return cache, h
+
+    def _g(self):
+        """G7: one unit of text-LLM GPU work under the frame loop's gate (the worker waits while a frame runs and the
+        frame waits at most one unit); the unit is synchronized before the gate is released."""
+        import contextlib
+        return self.gate.unit() if self.gate is not None else contextlib.nullcontext()
 
     def _continue(self, cache, ids):
         """T known positions on an existing cache in one call (V2's continuation_forward: GEMMs on T rows, the Mamba
         recurrence advanced token by token with the decode kernels, explicit causal mask for attention)."""
         from mynah_v2.model.fc_phase2_prefill import continuation_forward
-        return continuation_forward(self.llm, self.llm.embeddings(self.torch.tensor([ids], device=self.dev)), cache,
-                                    chunk=16)
+        with self._g():
+            return continuation_forward(self.llm, self.llm.embeddings(self.torch.tensor([ids], device=self.dev)),
+                                        cache, chunk=16)
 
     def _decode_from(self, rid, cache, h, max_new, emit, stop_text=None):
         torch = self.torch
@@ -303,7 +314,11 @@ class NanoWorker(QueueWorker):
         self.q_out.put(("done", rid, self.tok.decode(r, skip_special_tokens=True), new_msgs, info))
 
     def _step(self, e, cache):
-        """One decode position: the CUDA graph when enabled (G6), else the eager backbone."""
+        """One decode position: the CUDA graph when enabled (G6), else the eager backbone. (Callers in _greedy hold
+        the gate already; the constrained-call feeds take it here.)"""
+        if self.gate is not None and not self.gate.held_by_me():
+            with self._g():
+                return self._step(e, cache)
         if self.graph is not None:
             return self.graph.step(e, cache)
         return self.llm(inputs_embeds=e, cache_params=cache, use_cache=True).last_hidden_state
