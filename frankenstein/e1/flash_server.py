@@ -1,0 +1,392 @@
+"""G0: the Sophon Flash talker as a separate process, driven by the talker adapter's commands (stdin -> stdout).
+
+Why a process: the official ``qwen_tts`` package requires transformers 4.57 while the engine's venv (NeMo + V2) pins
+4.56; importing it into the engine process fails (``check_model_inputs`` signature). The talker therefore runs in the
+talker's own, unmodified environment (python of that env), and talks JSON lines over pipes. Nothing is installed or
+changed in either environment.
+
+Model, prompt layout, sampling and per-frame seeding are the transplant harness's ``flash_rt.FlashTalker`` (imported
+read-only from ``--harness``): Qwen3-TTS-12Hz structure, zero-shot clone voice (x-vector of a reference wav), block
+mode (no step without text: the paused state is kept), codec EOS masked while the text is open, runaway cap.
+What is new here is only the INCREMENTAL driving (text arrives while frames are generated) and the chunked delivery
+on the wall clock:
+
+  stdin   {"op": "start",  "epoch", "turn", "seg", "text"}   new segment: fresh prefill (first text id)
+          {"op": "append", "epoch", "turn", "seg", "text"}   more committed text for that segment
+          {"op": "final",  "epoch", "turn", "seg"}           text complete: tts_eos, let the codec EOS end it
+          {"op": "cancel", "epoch", "new_epoch"}             drop every segment of that epoch (and older)
+          {"op": "reset"}                                    emit stats, then forget every segment / epoch / stat
+                                                              (a second session on the same loaded talker)
+          {"op": "quit"}
+  stdout  {"ev": "ready", ...} | {"ev": "audio", "epoch", "turn", "seg", "a", "b", "t_ns", "sr", "pcm16": b64}
+          | {"ev": "done", ..., "frames", "ended"} | {"ev": "cancelled", ...} | {"ev": "stats", ...}
+
+G1 options: ``--fast-cp`` replaces the code predictor's HF ``generate`` (called once per codec frame for the 15
+residual codebooks) by a plain loop over the same forward with the same sampling (float32 logits, temperature, top-k,
+softmax, multinomial: the HF warper order) -- instance-level, the package is not edited; codes must stay identical
+(checked by e1/g1_talker.py). ``--profile`` times the code predictor separately (extra syncs). ``done`` events
+carry the segment's codes so two runs can be compared.
+
+Segments of one epoch are generated in order, one at a time. Delivery: chunk ramp 2, 4, 8, 12, 16, 25 frames with
+25 frames of codec left context (flash_rt RAMP / LEFT_CTX). ``t_ns`` is CLOCK_MONOTONIC (shared with the engine
+process on Linux).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import queue
+import sys
+import threading
+import time
+from collections import deque
+
+OUT = None
+
+
+CODEC_LANG = {"it": "italian", "en": "english", "fr": "french", "de": "german", "es": "spanish", "pt": "portuguese",
+              "ru": "russian", "zh": "chinese", "ja": "japanese", "ko": "korean"}
+
+
+def emit(obj):
+    OUT.write(json.dumps(obj) + "\n")
+    OUT.flush()
+
+
+class Gen:
+    def __init__(self, epoch, turn, seg, ids):
+        self.epoch, self.turn, self.seg = epoch, turn, seg
+        self.ids, self.nxt, self.final, self.eos_fed = list(ids), 0, False, False
+        self.past = self.past_hidden = self.logits = None
+        self.hist, self.codes, self.k = [], [], 0
+        self.delivered, self.ramp_i = 0, 0
+        self.t_start_ns = time.monotonic_ns()
+        self.first_audio_ns = None
+        self.stalled_ms = 0.0
+        self.started = False
+
+
+def fast_generate(cp, torch, stats=None, profile=False):
+    """Drop-in for ``code_predictor.generate`` as called by the talker forward (inputs_embeds of 2 positions,
+    max_new_tokens = 15, sampling with top_p = 1.0)."""
+    from types import SimpleNamespace
+    from transformers.cache_utils import DynamicCache
+
+    def gen(inputs_embeds=None, max_new_tokens=15, do_sample=True, top_p=1.0, top_k=50, temperature=1.0, **kw):
+        if profile:
+            torch.cuda.synchronize()
+            c0 = time.perf_counter()
+        cache = DynamicCache()
+        out = cp(inputs_embeds=inputs_embeds, past_key_values=cache, use_cache=True)
+        gs, seq = out.generation_steps, []
+        for i in range(max_new_tokens):
+            x = out.logits[:, -1, :].to(dtype=torch.float32)
+            if do_sample:
+                x = x / temperature
+                x = x.masked_fill(x < torch.topk(x, top_k)[0][..., -1, None], -float("inf"))
+                nxt = torch.multinomial(torch.softmax(x, -1), num_samples=1)
+            else:
+                nxt = x.argmax(-1, keepdim=True)
+            seq.append(nxt)
+            if i + 1 == max_new_tokens:
+                break
+            out = cp(input_ids=nxt, past_key_values=cache, use_cache=True, generation_steps=gs)
+            gs = out.generation_steps
+        if profile:
+            torch.cuda.synchronize()
+            stats["cp_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+        return SimpleNamespace(sequences=torch.cat(seq, 1))
+    return gen
+
+
+def graph_generate(cp, torch, stats, profile=False):
+    """G5: the plain code-predictor loop (prefill of 2 positions + 14 one-token steps + sampling) captured as ONE CUDA
+    graph and replayed per codec frame. The loop has the same shapes every frame (positions 2..16, DynamicCache
+    growing by cat inside the graph's private pool), so no static-cache rewrite of the attention math is needed and
+    the numerics are the eager loop's. Sampling (torch.multinomial) is captured with the graph-safe CUDA RNG: a replay
+    reads the generator's current seed / offset, so the per-frame torch.manual_seed of the talker step still applies.
+    The CUDA RNG state is restored after warm-up + capture, so the first frame draws exactly what the eager loop
+    would. Any capture error -> the eager loop for the rest of the process (recorded in stats)."""
+    from types import SimpleNamespace
+    eager = fast_generate(cp, torch)
+    st = {"g": None, "key": None, "inp": None, "out": None, "failed": None}
+    info = {"captured": False, "failed": None, "replays": 0, "eager_calls": 0}
+    stats["cp_graph"] = info                     # JSON-safe view (the graph and its buffers stay in `st`)
+
+    def gen(inputs_embeds=None, max_new_tokens=15, do_sample=True, top_p=1.0, top_k=50, temperature=1.0, **kw):
+        args = dict(max_new_tokens=max_new_tokens, do_sample=do_sample, top_p=top_p, top_k=top_k,
+                    temperature=temperature)
+        key = (tuple(inputs_embeds.shape), inputs_embeds.dtype, max_new_tokens, do_sample, top_k, temperature)
+        if st["failed"] or (st["g"] is not None and st["key"] != key):
+            info["eager_calls"] += 1
+            return eager(inputs_embeds=inputs_embeds, **args)
+        if profile:
+            torch.cuda.synchronize()
+            c0 = time.perf_counter()
+        if st["g"] is None:
+            rng = torch.cuda.get_rng_state()
+            try:
+                inp = inputs_embeds.clone()
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        eager(inputs_embeds=inp, **args)
+                torch.cuda.current_stream().wait_stream(side)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    out = eager(inputs_embeds=inp, **args).sequences
+                st.update(g=g, key=key, inp=inp, out=out)
+                info["captured"] = True
+            except Exception as e:  # noqa: BLE001
+                st["failed"] = info["failed"] = repr(e)[:400]
+                info["eager_calls"] += 1
+                torch.cuda.synchronize()
+                torch.cuda.set_rng_state(rng)
+                return eager(inputs_embeds=inputs_embeds, **args)
+            torch.cuda.synchronize()
+            torch.cuda.set_rng_state(rng)
+        st["inp"].copy_(inputs_embeds)
+        st["g"].replay()
+        info["replays"] += 1
+        res = SimpleNamespace(sequences=st["out"].clone())
+        if profile:
+            torch.cuda.synchronize()
+            stats["cp_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+        return res
+    return gen
+
+
+def timed_generate(orig, torch, stats):
+    def gen(*a, **kw):
+        torch.cuda.synchronize()
+        c0 = time.perf_counter()
+        r = orig(*a, **kw)
+        torch.cuda.synchronize()
+        stats["cp_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+        return r
+    return gen
+
+
+def main():  # pragma: no cover - GPU, talker env
+    global OUT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--harness", required=True, help="directory of flash_rt.py (read-only import)")
+    ap.add_argument("--root", required=True, help="Flash snapshot (contains talker/)")
+    ap.add_argument("--voice", required=True, help="reference wav (zero-shot clone) or a built-in voice name")
+    ap.add_argument("--lang", default="it")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--fast-cp", action="store_true", help="plain loop instead of HF generate for the code predictor")
+    ap.add_argument("--profile", action="store_true", help="time the code predictor separately (extra syncs)")
+    ap.add_argument("--cp-graph", action="store_true", help="G5: the code-predictor loop as one CUDA graph")
+    ap.add_argument("--clone", action="append", default=[], help="NAME=reference.wav: a selectable clone voice")
+    ap.add_argument("--prio", default="", choices=["", "high"],
+                    help="G4: run all talker GPU work on a highest-priority CUDA stream of this process. CUDA stream "
+                         "priorities act inside one context; across processes (the engine is another process) they "
+                         "are not guaranteed without MPS, so the effect must be measured, not assumed")
+    a = ap.parse_args()
+    OUT = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    sys.stdout = sys.stderr                                 # library prints never corrupt the protocol stream
+    sys.path.insert(0, a.harness)
+    import numpy as np
+    import torch
+    from flash_rt import LEFT_CTX, RAMP, ROLE, FRAME_S, FlashTalker, Sampling
+    t0 = time.monotonic()
+    ft = FlashTalker(a.root)
+    clones = dict(x.split("=", 1) for x in a.clone)
+    xvec, vname = ft.voice(clones.get(a.voice, a.voice), a.lang)
+    cur = {"lang": a.lang, "xvec": xvec, "voice": vname}
+    builtin = sorted(p.stem for p in (ft.root / "voices").glob("*.pt")) if (ft.root / "voices").exists() else []
+    s = Sampling()
+    load_s = round(time.monotonic() - t0, 1)
+    emit({"ev": "ready", "load_s": load_s, "voice": vname, "lang": a.lang,
+          "languages": sorted(ft.tc.codec_language_id), "voices": sorted(set(clones) | set(builtin)),
+          "mem_alloc_gb": round(torch.cuda.memory_allocated() / 2 ** 30, 2)})
+
+    def prefill(first_id):
+        """flash_rt.FlashTalker.prefill_embeds with the codec language NAME of the session (any language of the
+        talker's codec table, not only flash_rt's short list)."""
+        lid = ft.tc.codec_language_id[CODEC_LANG.get(cur["lang"], cur["lang"])]
+        codec = torch.cat([ft.ce([ft.tc.codec_think_id, ft.tc.codec_think_bos_id, lid, ft.tc.codec_think_eos_id]),
+                           cur["xvec"], ft.ce([ft.tc.codec_pad_id, ft.tc.codec_bos_id])], 1)
+        body = torch.cat([ft.pad.expand(-1, codec.shape[1] - 2, -1), ft.bos], 1) + codec[:, :-1]
+        first = ft.te([first_id]) + codec[:, -1:]
+        return torch.cat([ft.te(ROLE), body, first], 1)
+
+    cmds: queue.Queue = queue.Queue()
+
+    def reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                cmds.put(json.loads(line))
+        cmds.put({"op": "quit"})
+    threading.Thread(target=reader, daemon=True).start()
+
+    pending: deque = deque()          # Gen objects not finished, in order
+    by_key: dict = {}
+    dead_epochs: set = set()
+    stats = {"step_ms": [], "prefill_ms": [], "decode_ms": [], "cp_ms": [], "segments": [], "cancels": 0,
+             "fast_cp": a.fast_cp, "profile": a.profile, "cp_graph_on": a.cp_graph}
+    cp = ft.tk.code_predictor
+    if a.cp_graph:
+        cp.generate = graph_generate(cp, torch, stats, a.profile)
+    elif a.fast_cp:
+        cp.generate = fast_generate(cp, torch, stats, a.profile)
+    elif a.profile:
+        cp.generate = timed_generate(cp.generate, torch, stats)
+    sync = torch.cuda.synchronize
+    V = ft.tc.codec_eos_token_id
+
+    def deliver(g, last=False):
+        while g.delivered < len(g.codes):
+            n = RAMP[min(g.ramp_i, len(RAMP) - 1)]
+            b = g.delivered + n
+            if b > len(g.codes):
+                if not last:
+                    return
+                b = len(g.codes)
+            a_, lo = g.delivered, max(0, g.delivered - LEFT_CTX)
+            sync()
+            c0 = time.perf_counter()
+            w, sr = ft.decode(torch.tensor(g.codes[lo:b], dtype=torch.long))
+            stats["decode_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+            spf = sr * FRAME_S
+            piece = w[int(round((a_ - lo) * spf)):int(round((b - lo) * spf))]
+            pcm16 = (np.clip(piece, -1, 1) * 32767).astype(np.int16).tobytes()
+            t = time.monotonic_ns()
+            if g.first_audio_ns is None:
+                g.first_audio_ns = t
+            emit({"ev": "audio", "epoch": g.epoch, "turn": g.turn, "seg": g.seg, "a": a_, "b": b, "t_ns": t, "sr": sr,
+                  "pcm16": base64.b64encode(pcm16).decode()})
+            g.delivered, g.ramp_i = b, g.ramp_i + 1
+
+    def finish(g, ended):
+        deliver(g, last=True)
+        rec = {"epoch": g.epoch, "turn": g.turn, "seg": g.seg, "frames": len(g.codes), "ended": ended,
+               "text_ids": len(g.ids), "first_audio_ms": round((g.first_audio_ns - g.t_start_ns) / 1e6, 1)
+               if g.first_audio_ns else None}
+        stats["segments"].append(rec)
+        emit({"ev": "done", **rec, "t_ns": time.monotonic_ns(), "codes": g.codes})
+        pending.remove(g)
+        by_key.pop((g.epoch, g.turn, g.seg), None)
+
+    def can_step(g):
+        return g.nxt < len(g.ids) or g.final or g.eos_fed
+
+    import contextlib
+    if a.prio == "high":
+        lo_hi = torch.cuda.Stream.priority_range() if hasattr(torch.cuda.Stream, "priority_range") else (0, -1)
+        prio_stream = torch.cuda.Stream(priority=min(lo_hi))
+        stats["stream_priority"] = int(prio_stream.priority)
+    stream_ctx = torch.cuda.stream(prio_stream) if a.prio == "high" else contextlib.nullcontext()
+    with torch.inference_mode(), stream_ctx:
+        while True:
+            g = pending[0] if pending else None
+            idle = g is None or (g.started and not can_step(g)) or (not g.started and not g.ids)
+            try:
+                cmd = cmds.get(timeout=0.2) if idle else cmds.get_nowait()
+            except queue.Empty:
+                cmd = None
+            while cmd is not None:
+                op = cmd["op"]
+                if op == "quit":
+                    emit({"ev": "stats", **stats})
+                    return
+                if op == "reset":
+                    emit({"ev": "stats", **stats})
+                    pending.clear()
+                    by_key.clear()
+                    dead_epochs.clear()
+                    for kk in ("step_ms", "prefill_ms", "decode_ms", "cp_ms", "segments"):
+                        stats[kk] = []
+                    stats["cancels"] = 0
+                    try:
+                        cmd = cmds.get_nowait()
+                    except queue.Empty:
+                        cmd = None
+                    continue
+                key = (cmd.get("epoch"), cmd.get("turn"), cmd.get("seg"))
+                if op == "cancel":
+                    stats["cancels"] += 1
+                    dead_epochs.update(range(0, cmd["new_epoch"]))
+                    for x in [x for x in pending if x.epoch < cmd["new_epoch"]]:
+                        pending.remove(x)
+                        by_key.pop((x.epoch, x.turn, x.seg), None)
+                        emit({"ev": "cancelled", "epoch": x.epoch, "turn": x.turn, "seg": x.seg,
+                              "frames": len(x.codes), "t_ns": time.monotonic_ns()})
+                elif key[0] in dead_epochs:
+                    pass
+                elif op == "session":                       # server engine: language + voice of a session
+                    if cmd.get("lang"):
+                        cur["lang"] = cmd["lang"]
+                    if cmd.get("voice"):
+                        v = cmd["voice"]
+                        cur["xvec"], cur["voice"] = ft.voice(clones.get(v, v), cur["lang"])
+                    emit({"ev": "session", "lang": cur["lang"], "voice": cur["voice"]})
+                elif op == "start":
+                    gg = Gen(*key, ft.encode_text(cmd["text"]))
+                    pending.append(gg)
+                    by_key[key] = gg
+                elif op == "append" and key in by_key:
+                    by_key[key].ids += ft.encode_text(cmd["text"])
+                elif op == "final" and key in by_key:
+                    by_key[key].final = True
+                try:
+                    cmd = cmds.get_nowait()
+                except queue.Empty:
+                    cmd = None
+            g = pending[0] if pending else None
+            if g is None:
+                continue
+            if not g.started:
+                if not g.ids:
+                    if g.final:
+                        finish(g, "empty")
+                    continue
+                sync()
+                c0 = time.perf_counter()
+                out = ft.tk(inputs_embeds=prefill(g.ids[0]), use_cache=True,
+                            attention_mask=None, generation_step=None)
+                sync()
+                stats["prefill_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+                g.past, g.past_hidden, g.logits = out.past_key_values, out.past_hidden, out.logits
+                g.nxt, g.started = 1, True
+            if not can_step(g):
+                continue
+            c = ft._sample0(g.logits, g.hist, g.k, not g.eos_fed, s, a.seed)
+            if c == V:
+                finish(g, "eos")
+                continue
+            if g.nxt < len(g.ids):
+                add = ft.te([g.ids[g.nxt]])
+                g.nxt += 1
+            elif not g.eos_fed:
+                add, g.eos_fed = ft.eos, True
+            else:
+                add = ft.pad
+            torch.manual_seed(a.seed * 100003 + g.k + 7919)
+            sync()
+            c0 = time.perf_counter()
+            out = ft.tk(input_ids=torch.tensor([[c]], device=ft.dev), past_key_values=g.past,
+                        past_hidden=g.past_hidden, trailing_text_hidden=add, tts_pad_embed=ft.pad, generation_step=0,
+                        use_cache=True, subtalker_dosample=True, subtalker_top_k=s.sub_top_k, subtalker_top_p=1.0,
+                        subtalker_temperature=s.sub_temperature)
+            g.codes.append(out.hidden_states[1][0].tolist())
+            sync()
+            stats["step_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+            g.past, g.past_hidden, g.logits = out.past_key_values, out.past_hidden, out.logits
+            g.hist.append(c)
+            g.k += 1
+            deliver(g)
+            if g.eos_fed and g.k > s.frames_per_token_cap * len(g.ids) + 60:
+                finish(g, "cap")
+            elif g.k >= 1500:
+                finish(g, "max")
+
+
+if __name__ == "__main__":
+    main()

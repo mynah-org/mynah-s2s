@@ -1,0 +1,388 @@
+"""E1g: Nano off the frame loop. A worker thread with its own CUDA stream runs the text LLM with a hybrid KV/SSM cache
+and STREAMING greedy decode (one forward per token, no HF generate), pushing every reply token with its wall time.
+
+Interface used by the per-frame hook (non-blocking):
+  submit(rid, messages)   queue a request (a copy of the history is taken)
+  cancel(rid)             stop decoding that request as soon as possible (epoch: its tokens become stale)
+  poll() -> [events]      ("tok", rid, id, t_ns) | ("tool", rid, call dict) | ("done", rid, text, new_messages, info)
+                          | ("decided", rid, "TOOL") right after the tool step chose a call (E1l: holding phrase)
+The worker runs on the DEFAULT CUDA stream (see the note in __init__): kernels of the Thinker and of Nano
+interleave on one stream, each thread's own ops stay in order.
+Per request: an explicit tool step (call-or-reply question on a copy, 3 tokens), on "call" the call text with the
+<TOOLCALL>[ prefix forced, the call executed through the real handlers (V2 ToolRegistry / ToolLedger), then the reply.
+Cache: the V2 hybrid-cache fix (mynah_v2.model.llm_cache) applied to the Nano backbone instance; each generation
+prefills its full context once (no prefix cache across requests yet: a clone of the hybrid cache plus a multi-token
+continuation is not supported by that fix outside its experimental path).
+"""
+
+from __future__ import annotations
+
+import json
+import queue
+import threading
+import time
+
+from e1.tool_step_probe import STEP_Q
+
+STOPS = (12, 11, 2)
+
+
+def sentence_end(tail: str) -> bool:
+    """A decoded tail that closes a sentence (., !, ?, or a colon/semicolon is NOT an end)."""
+    t = tail.rstrip()
+    return bool(t) and t[-1] in ".!?" and not t.endswith("...")
+
+
+class _TorchLM:
+    """The LM interface of e1.constrained_call on a live hybrid cache (E1l G2)."""
+
+    def __init__(self, wk, cache, h):
+        self.wk, self.cache = wk, cache
+        self.logits = wk.m.lm_head(h[:, -1]).float()
+
+    def pick(self, allowed=None):
+        lg = self.logits[0]
+        if allowed:
+            idx = self.wk.torch.tensor(sorted(allowed), device=lg.device)
+            return int(idx[int(lg[idx].argmax())])
+        return int(lg.argmax())
+
+    def feed(self, ids):
+        wk = self.wk
+        if len(ids) == 1 or wk.graph is not None:      # G6: with the decode graph, forced text goes one position
+            for i in ids:                                  # at a time (no multi-position call on a converted cache)
+                h = wk._step(wk.llm.embeddings(wk.torch.tensor([[i]], device=wk.dev)), self.cache)
+        else:
+            h = wk._continue(self.cache, list(ids))
+        self.logits = wk.m.lm_head(h[:, -1]).float()
+
+    def decode(self, ids):
+        return self.wk.tok.decode(ids, skip_special_tokens=False)
+
+
+class QueueWorker(threading.Thread):
+    """Thread + request queue + cancel / close, model-free (unit-tested). Subclasses implement _serve()."""
+
+    def __init__(self, name: str = "worker"):
+        super().__init__(daemon=True, name=name)
+        self.q_in: queue.Queue = queue.Queue()
+        self.q_out: queue.Queue = queue.Queue()
+        self.cancelled: set = set()
+        self.calls: list = []
+        self.stop_flag = False
+        self.served: list = []
+
+    def submit(self, rid: int, messages: list) -> None:
+        self.q_in.put((rid, [dict(m) for m in messages], time.monotonic_ns()))
+
+    def cancel(self, rid) -> None:
+        if rid is not None:
+            self.cancelled.add(rid)
+
+    def poll(self) -> list:
+        out = []
+        while True:
+            try:
+                out.append(self.q_out.get_nowait())
+            except queue.Empty:
+                return out
+
+    def close(self, timeout: float = 30.0) -> None:
+        """Stop after the current request and wait for the thread (E1i aborted at interpreter exit with the worker
+        still decoding: 'terminate called without an active exception')."""
+        self.stop_flag = True
+        self.cancelled.update(range(0, 10 ** 6))
+        self.q_in.put(None)
+        if self.is_alive():
+            self.join(timeout)
+
+    def run(self):
+        while not self.stop_flag:
+            job = self.q_in.get()
+            if job is None:
+                break
+            rid, msgs, t_req = job
+            if rid in self.cancelled:                     # superseded before it started: never served
+                self.q_out.put(("skipped", rid))
+                continue
+            self.served.append(rid)
+            try:
+                self._serve_job(rid, msgs, t_req)
+            except Exception as e:  # noqa: BLE001 - a failed request must not kill the worker
+                self.q_out.put(("done", rid, "", [], {"error": repr(e)}))
+
+    def _serve_job(self, rid, msgs, t_req):
+        self._serve(rid, msgs, t_req)
+
+    def _serve(self, rid, msgs, t_req):  # pragma: no cover - abstract
+        raise NotImplementedError
+
+
+class NanoWorker(QueueWorker):
+    def __init__(self, tok, model, system: str, tools: list, bound: dict, backend=None, parse=None,
+                 max_new: int = 80, tool_step: bool = True, reuse: bool = False, constrained: bool = False):
+        super().__init__(name="nano-worker")
+        self.reuse = reuse
+        self.constrained = constrained
+        self.graph = None                # G6: e1.nano_graph.NanoGraph for the decode steps (None = eager)
+        self.graph_reply_only = False    # G8: use the decode graph for the spoken reply only
+        self.gate = None                 # G7: e1.gpu_gate.GpuGate shared with the frame loop (None = no time-slicing)
+        self.reply_soft_cap = None       # G4: after this many reply tokens, stop at the next sentence end
+        import torch
+        from mynah_v2.model.llm_cache import _hybrid_cache_cls, cache_passing_attention, position_injecting_forward
+        self.torch = torch
+        self.tok, self.m = tok, model
+        self.system, self.tools, self.bound, self.backend, self.parse = system, tools, bound, backend, parse
+        self.max_new, self.tool_step = max_new, tool_step
+        llm = model.backbone
+        if not hasattr(llm.forward, "__wrapped_v2__"):
+            llm.forward = position_injecting_forward(llm.forward, holder=llm)
+        for layer in llm.layers:
+            if getattr(layer, "block_type", None) == "attention" and not hasattr(layer.mixer.forward, "__wrapped_v2__"):
+                layer.mixer.forward = cache_passing_attention(layer.mixer.forward, llm)
+        self.llm = llm
+        self.cache_cls = _hybrid_cache_cls(llm)
+        p = next(model.parameters())
+        self.dtype, self.dev = p.dtype, p.device
+        # NO private CUDA stream (E1h): the NemotronH remote code runs every block inside
+        # torch.cuda.stream(torch.cuda.default_stream(...)) (modeling_nemotron_h.py:767), so on a side stream the
+        # block kernels and our embedding / attention-cache / lm_head ops ran on two streams without ordering; the
+        # decode diverged from token 1. On the default stream the cached decode equals the no-cache greedy ids.
+        self.stream = None
+
+    def _serve_job(self, rid, msgs, t_req):
+        with self.torch.inference_mode():
+            self._serve(rid, msgs, t_req)
+
+    def _ids(self, msgs, extra=None):
+        ids = self.tok.apply_chat_template([{"role": "system", "content": self.system}] + msgs, tools=self.tools,
+                                           add_generation_prompt=True)
+        return list(ids) + list(extra or [])
+
+    def _greedy(self, rid, ids, max_new, emit, stop_text=None, ignore_stops=False, cache_info=False, soft_cap=None):
+        torch = self.torch
+        cache = self.cache_cls(self.llm.config, 1, dtype=self.dtype, device=self.dev, ssm_dtype=torch.float32)
+        emb = self.llm.embeddings(torch.tensor([ids], device=self.dev))
+        t0 = time.monotonic_ns()
+        with self._g():
+            h = self.llm(inputs_embeds=emb, cache_params=cache, use_cache=True).last_hidden_state
+            logits = self.m.lm_head(h[:, -1]).float()
+        out, t_first = [], None
+        for _ in range(max_new):
+            if rid in self.cancelled:
+                break
+            nxt = int(logits.argmax(-1))
+            if nxt in STOPS and not ignore_stops:
+                break
+            out.append(nxt)
+            if t_first is None:
+                torch.cuda.current_stream().synchronize()
+                t_first = time.monotonic_ns()
+            if emit:
+                self.q_out.put(("tok", rid, nxt, time.monotonic_ns()))
+            if stop_text and stop_text in self.tok.decode(out[-8:]):
+                break
+            if soft_cap and len(out) >= soft_cap and sentence_end(self.tok.decode(out[-4:])):
+                break                                    # G4: brief spoken replies, cut at a sentence end
+            with self._g():
+                e = self.llm.embeddings(torch.tensor([[nxt]], device=self.dev))
+                h = self._step(e, cache)
+                logits = self.m.lm_head(h[:, -1]).float()
+        torch.cuda.current_stream().synchronize()
+        t_end = time.monotonic_ns()
+        info = {"ctx": len(ids), "n": len(out), "first_ms": round(((t_first or t_end) - t0) / 1e6, 1),
+                "ms": round((t_end - t0) / 1e6, 1)}
+        if cache_info:
+            keys = [k for k in getattr(cache, "key_cache", []) if isinstance(k, torch.Tensor) and k.numel()]
+            convs = [c for c in getattr(cache, "conv_states", []) if isinstance(c, torch.Tensor) and c.numel()]
+            info.update(cache_pos=int(getattr(cache, "_v2_pos", -1)), n_key=len(keys), n_conv=len(convs),
+                        key_shape=list(keys[0].shape) if keys else None,
+                        key_dev=str(keys[0].device) if keys else None, key_dtype=str(keys[0].dtype) if keys else None,
+                        conv_dtype=str(convs[0].dtype) if convs else None, cache_cls=type(cache).__name__,
+                        stream=str(torch.cuda.current_stream()))
+        return out, info
+
+    # ------------------------------------------------------------------ E1k: KV / SSM reuse across the steps of a turn
+    def _prefill(self, ids):
+        torch = self.torch
+        cache = self.cache_cls(self.llm.config, 1, dtype=self.dtype, device=self.dev, ssm_dtype=torch.float32)
+        with self._g():
+            h = self.llm(inputs_embeds=self.llm.embeddings(torch.tensor([ids], device=self.dev)), cache_params=cache,
+                         use_cache=True).last_hidden_state
+        return cache, h
+
+    def _g(self):
+        """G7: one unit of text-LLM GPU work under the frame loop's gate (the worker waits while a frame runs and the
+        frame waits at most one unit); the unit is synchronized before the gate is released."""
+        import contextlib
+        return self.gate.unit() if self.gate is not None else contextlib.nullcontext()
+
+    def _continue(self, cache, ids):
+        """T known positions on an existing cache in one call (V2's continuation_forward: GEMMs on T rows, the Mamba
+        recurrence advanced token by token with the decode kernels, explicit causal mask for attention)."""
+        from mynah_v2.model.fc_phase2_prefill import continuation_forward
+        with self._g():
+            return continuation_forward(self.llm, self.llm.embeddings(self.torch.tensor([ids], device=self.dev)),
+                                        cache, chunk=16)
+
+    def _decode_from(self, rid, cache, h, max_new, emit, stop_text=None):
+        torch = self.torch
+        t0 = time.monotonic_ns()
+        logits = self.m.lm_head(h[:, -1]).float()
+        out, t_first = [], None
+        for _ in range(max_new):
+            if rid in self.cancelled:
+                break
+            nxt = int(logits.argmax(-1))
+            if nxt in STOPS:
+                break
+            out.append(nxt)
+            if t_first is None:
+                t_first = time.monotonic_ns()
+            if emit:
+                self.q_out.put(("tok", rid, nxt, time.monotonic_ns()))
+            if stop_text and stop_text in self.tok.decode(out[-8:]):
+                break
+            hh = self.llm(inputs_embeds=self.llm.embeddings(torch.tensor([[nxt]], device=self.dev)), cache_params=cache,
+                          use_cache=True).last_hidden_state
+            logits = self.m.lm_head(hh[:, -1]).float()
+        torch.cuda.current_stream().synchronize()
+        return out, {"n": len(out), "first_ms": round(((t_first or time.monotonic_ns()) - t0) / 1e6, 1),
+                     "ms": round((time.monotonic_ns() - t0) / 1e6, 1)}
+
+    def _branch(self, base, cp, ids):
+        """A copy of the shared-prefix cache continued with ids[cp:] -> (cache, hidden). ids[:cp] must equal the
+        prefix that built ``base``."""
+        import copy
+        c = copy.deepcopy(base)
+        return c, self._continue(c, ids[cp:])
+
+    def _serve_reuse(self, rid, msgs, t_req):
+        info = {"t_req_ns": t_req, "t_start_ns": time.monotonic_ns(), "steps": [], "reuse": True}
+        new_msgs = []
+        user = msgs[-1]["content"] if msgs and msgs[-1]["role"] == "user" else ""
+        if self.backend is not None and user:
+            self.backend._said.append(user)
+        ctx = msgs if msgs else [{"role": "user", "content": "[call connected]"}]
+        reply_ids = self._ids(ctx)
+        pre = self.tok.encode("<TOOLCALL>[", add_special_tokens=False)
+        dec_ids = self._ids(msgs + [{"role": "user", "content": STEP_Q}]) if (self.tool_step and user) else reply_ids
+        cp = 0
+        for a, b in zip(dec_ids, reply_ids):
+            if a != b:
+                break
+            cp += 1
+        cp = min(cp, len(reply_ids) - 1, len(dec_ids) - 1)       # every branch continues with >= 1 token
+        t0 = time.monotonic_ns()
+        base, _ = self._prefill(reply_ids[:cp])
+        info["shared_prefix"] = cp
+        info["prefill_ms"] = round((time.monotonic_ns() - t0) / 1e6, 1)
+        if self.tool_step and user:
+            c, h = self._branch(base, cp, dec_ids)
+            d, st = self._decode_from(rid, c, h, 3, False)
+            dtxt = self.tok.decode(d, skip_special_tokens=True)
+            info["steps"].append(dict(st, step="decide", out=dtxt, suffix=len(dec_ids) - cp))
+            if "TOOL" in dtxt.upper() and rid not in self.cancelled:
+                self.q_out.put(("decided", rid, "TOOL"))
+                c, h = self._branch(base, cp, reply_ids + pre)
+                cl, st = self._decode_from(rid, c, h, 60, False, stop_text="</TOOLCALL>")
+                ctext = "<TOOLCALL>[" + self.tok.decode(cl, skip_special_tokens=False)
+                if "</TOOLCALL>" in ctext:
+                    ctext = ctext[: ctext.index("</TOOLCALL>") + len("</TOOLCALL>")]
+                info["steps"].append(dict(st, step="call", out=ctext))
+                tc = self.parse(ctext)
+                if isinstance(tc, list) and tc:
+                    new_msgs.append({"role": "assistant", "content": ctext})
+                    for call in tc[:2]:
+                        name, args = call.get("name"), call.get("arguments") or {}
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:  # noqa: BLE001
+                                args = {"_raw": args}
+                        t1 = time.monotonic_ns()
+                        res = self.bound[name](args) if name in self.bound else json.dumps({"error": f"unknown {name}"})
+                        rec = {"name": name, "args": args, "result": res, "executed": name in self.bound,
+                               "exec_ms": round((time.monotonic_ns() - t1) / 1e6, 1)}
+                        self.calls.append(rec)
+                        new_msgs.append({"role": "tool", "content": res})
+                        self.q_out.put(("tool", rid, rec))
+                    reply_ids = self._ids(msgs + new_msgs)
+        c, h = self._branch(base, cp, reply_ids)               # the reply folds the tool result in on the same prefix
+        r, st = self._decode_from(rid, c, h, self.max_new, True)
+        info["steps"].append(dict(st, step="reply", suffix=len(reply_ids) - cp))
+        info["t_done_ns"] = time.monotonic_ns()
+        self.q_out.put(("done", rid, self.tok.decode(r, skip_special_tokens=True), new_msgs, info))
+
+    def _step(self, e, cache):
+        """One decode position: the CUDA graph when enabled (G6), else the eager backbone. (Callers in _greedy hold
+        the gate already; the constrained-call feeds take it here.)"""
+        if self.gate is not None and not self.gate.held_by_me():
+            with self._g():
+                return self._step(e, cache)
+        if self.graph is not None:
+            return self.graph.step(e, cache)
+        return self.llm(inputs_embeds=e, cache_params=cache, use_cache=True).last_hidden_state
+
+    def _constrained_call(self, ids):
+        """E1l G2: prefill the call context (ending with the <TOOLCALL>[ prefix), then the schema-constrained call."""
+        from e1.constrained_call import ConstrainedCall
+        t0 = time.monotonic_ns()
+        cache, h = self._prefill(ids)
+        t1 = time.monotonic_ns()
+        ctext, st = ConstrainedCall(self.tools, lambda t: self.tok.encode(t, add_special_tokens=False),
+                                    stop_ids=STOPS).run(_TorchLM(self, cache, h))
+        self.torch.cuda.current_stream().synchronize()
+        st.update(ctx=len(ids), prefill_ms=round((t1 - t0) / 1e6, 1), ms=round((time.monotonic_ns() - t0) / 1e6, 1))
+        return ctext, st
+
+    def _serve(self, rid, msgs, t_req):
+        if self.reuse:
+            return self._serve_reuse(rid, msgs, t_req)
+        info = {"t_req_ns": t_req, "t_start_ns": time.monotonic_ns(), "steps": []}
+        new_msgs = []
+        user = msgs[-1]["content"] if msgs and msgs[-1]["role"] == "user" else ""
+        if self.backend is not None and user:
+            self.backend._said.append(user)
+        ctx = msgs if msgs else [{"role": "user", "content": "[call connected]"}]
+        graph_saved = self.graph
+        if self.graph_reply_only:                # G8: the tool step (decision + call) always eager: the decode
+            self.graph = None                    # graph changed 2/24 calls in G6; the reply may use the graph
+        if self.tool_step and user:
+            d, st = self._greedy(rid, self._ids(msgs + [{"role": "user", "content": STEP_Q}]), 3, False)
+            dtxt = self.tok.decode(d, skip_special_tokens=True)
+            info["steps"].append(dict(st, step="decide", out=dtxt))
+            if "TOOL" in dtxt.upper() and rid not in self.cancelled:
+                self.q_out.put(("decided", rid, "TOOL"))
+                pre = self.tok.encode("<TOOLCALL>[", add_special_tokens=False)
+                if self.constrained:
+                    ctext, st = self._constrained_call(self._ids(msgs, pre))
+                else:
+                    c, st = self._greedy(rid, self._ids(msgs, pre), 60, False, stop_text="</TOOLCALL>")
+                    ctext = "<TOOLCALL>[" + self.tok.decode(c, skip_special_tokens=False)
+                    if "</TOOLCALL>" in ctext:
+                        ctext = ctext[: ctext.index("</TOOLCALL>") + len("</TOOLCALL>")]
+                info["steps"].append(dict(st, step="call", out=ctext, constrained=self.constrained))
+                tc = self.parse(ctext)
+                if isinstance(tc, list) and tc:
+                    new_msgs.append({"role": "assistant", "content": ctext})
+                    for call in tc[:2]:
+                        name, args = call.get("name"), call.get("arguments") or {}
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:  # noqa: BLE001
+                                args = {"_raw": args}
+                        t1 = time.monotonic_ns()
+                        res = self.bound[name](args) if name in self.bound else json.dumps({"error": f"unknown {name}"})
+                        rec = {"name": name, "args": args, "result": res, "executed": name in self.bound,
+                               "exec_ms": round((time.monotonic_ns() - t1) / 1e6, 1)}
+                        self.calls.append(rec)
+                        new_msgs.append({"role": "tool", "content": res})
+                        self.q_out.put(("tool", rid, rec))
+                    ctx = msgs + new_msgs
+        self.graph = graph_saved
+        r, st = self._greedy(rid, self._ids(ctx), self.max_new, True, soft_cap=self.reply_soft_cap)
+        info["steps"].append(dict(st, step="reply", soft_cap=self.reply_soft_cap, max_new=self.max_new))
+        info["t_done_ns"] = time.monotonic_ns()
+        self.q_out.put(("done", rid, self.tok.decode(r, skip_special_tokens=True), new_msgs, info))
