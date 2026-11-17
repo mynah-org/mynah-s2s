@@ -58,7 +58,7 @@ class ASRPost:
 
 class LiveASR:  # pragma: no cover - GPU
     def __init__(self, lab_multilingual: str, lang: str = "it", att_right: int = 3, window_s: float = 12.0,
-                 device: str = "cuda"):
+                 device: str = "cuda", every: int = 0):
         import sys
         import torch
         import yaml
@@ -85,13 +85,14 @@ class LiveASR:  # pragma: no cover - GPU
         self.dev = device
         self.chunk = att_right + 1
         self.win = int(window_s / 0.08) // self.chunk * self.chunk
+        self.every = max(self.chunk, every // self.chunk * self.chunk) if every else self.chunk   # G2: run every N frames
         self.lang_idx = LANG_IDX[lang]
         self.done_frames = 0                       # encoder frames decoded so far (multiple of chunk)
         self.g = self.st = None
         self._fresh()
         # pieces arrive in 4-frame batches: a word may only close after a gap longer than one chunk (G0: with
         # close_after 3 words were split at chunk boundaries, "diva no", "ave te")
-        self.post = ASRPost(close_after=self.chunk + 1)
+        self.post = ASRPost(close_after=self.every + 1)
         self.stats = {"calls": 0, "ms": [], "frames": 0, "resets": 0}
         self.per_frame: dict = {}                  # model frame k -> pieces (incl. tags), for the record
 
@@ -126,7 +127,7 @@ class LiveASR:  # pragma: no cover - GPU
         pieces = []
         have = (k + 1) * FRAME // FRAME                             # complete encoder frames of audio
         ready = have // self.chunk * self.chunk
-        if ready > self.done_frames:
+        if ready - self.done_frames >= self.every:
             t0 = time.monotonic_ns()
             with torch.inference_mode():
                 start = max(0, ready - self.win)
@@ -141,3 +142,30 @@ class LiveASR:  # pragma: no cover - GPU
         if pieces:
             self.per_frame[k] = pieces
         return self.post.step(k, pieces)
+
+    def reset(self, window_s: float | None = None, every: int | None = None) -> None:
+        """A fresh stream (G2: several configurations on one loaded model)."""
+        if window_s is not None:
+            self.win = int(window_s / 0.08) // self.chunk * self.chunk
+        if every is not None:
+            self.every = max(self.chunk, every // self.chunk * self.chunk)
+        self.done_frames = 0
+        self._fresh()
+        self.post = ASRPost(close_after=self.every + 1)
+        self.stats = {"calls": 0, "ms": [], "frames": 0, "resets": 0}
+        self.per_frame = {}
+
+    def transcribe(self, wav16, chunk_s: float = 30.0) -> str:
+        """Offline transcript of a whole 16 kHz signal (content evidence for the talker's audio), in 30 s pieces."""
+        torch = self.torch
+        self._fresh()
+        out = []
+        n = int(chunk_s * 16000)
+        with torch.inference_mode():
+            for i in range(0, len(wav16), n):
+                piece = wav16[i:i + n]
+                if len(piece) < 16000:
+                    break
+                out += self._decode(self.enc(piece)["out"])
+        self._fresh()
+        return "".join(p for p in out if not is_tag(p)).replace("\u2581", " ").strip()

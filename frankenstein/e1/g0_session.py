@@ -40,7 +40,8 @@ def replay_player(log, prebuffer_s, sr):
 
 def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir: Path, cut_s: float,
         lab_agentbench: Path, tool_schemas, live, proc, timer=None, prebuffer_s: float = 0.32,
-        listen_dir: Path | None = None, drain_s: float = 15.0, holding_cut: str = "never") -> dict:  # pragma: no cover - GPU
+        listen_dir: Path | None = None, drain_s: float = 15.0, holding_cut: str = "never",
+        audio_aware: bool = False) -> dict:  # pragma: no cover - GPU
     import sys
     import numpy as np
     import soundfile as sf
@@ -114,7 +115,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
             elif kind in ("cancelled", "stats", "eof"):
                 tlog.write({k: v for k, v in ev.items() if k not in ("step_ms", "decode_ms")})
     ctl = Controller(ControllerConfig(min_blank=2, debounce=8, reply_timeout=100, tool_timeout=150, merge_frames=12,
-                                      barge_guard=6, barge_in_frames=3, barge_after_open=True, holding_phrase=True),
+                                      barge_guard=6, barge_in_frames=3, barge_after_open=True, holding_phrase=True,
+                                      audio_aware=audio_aware),
                      tracer=ftr)
     frames, blog = FrameLog(od / "frames.jsonl"), FrameLog(od / "brain.jsonl")
     seed_all()
@@ -194,13 +196,44 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
             "any_s": round(min(nxt)[0] - t_end_user, 3) if nxt else None,
             "holding_s": round(min(hold)[0] - t_end_user, 3) if hold else None,
             "real_reply_s": round(min(real)[0] - t_end_user, 3) if real else None}
+    # processing clock (G0 analysis): latencies from the wall time the loop PROCESSED the user's end frame, which
+    # excludes the loop's accumulated lag behind real time; and the lag itself
+    first_play, first_ready = {}, {}
+    for it in player.items:
+        if not it.dropped and it.keep != 0:
+            first_play.setdefault(it.turn, it.t_start)
+            first_ready.setdefault(it.turn, it.t_ready)
+    seg_k = {}
+    for c in ad.commands:
+        if type(c).__name__ == "StartSegment":
+            seg_k.setdefault(c.turn, c.k)
+    first_audio_proc, lag = {}, {}
+    for u in tl:
+        e = u["end_k"]
+        if e not in frame_k_t:
+            continue
+        lag[u["label"]] = round(frame_k_t[e] - (t0 + (e + 1) * 0.08), 2)
+        row = {}
+        for kind, want in (("holding", True), ("reply", False)):
+            cand = sorted((k, turn) for turn, k in seg_k.items() if k > e and (turn in holding_turns) == want)
+            if cand:
+                k, turn = cand[0]
+                row[kind] = {"turn": turn, "text_s": round(frame_k_t.get(k, 0) - frame_k_t[e], 2),
+                             "first_play_s": round(first_play[turn] - frame_k_t[e], 2) if turn in first_play else None}
+        first_audio_proc[u["label"]] = row
+    last_k = max(frame_k_t)
+    lag["end"] = round(frame_k_t[last_k] - (t0 + (last_k + 1) * 0.08), 2)
     # barge-in: user onset -> cancel (= playback stop in the model)
     barge = []
     for a in d.ctl.actions:
         if a.kind == "CANCEL" and a.reason == "barge_in":
             onset = max((u for u in tl if u["start_k"] <= a.k), key=lambda u: u["start_k"], default=None)
             cut = next((c for c in player.cuts if c["t"] >= frame_k_t.get(a.k, 0) - 0.5), None)
+            t_proc_onset = frame_k_t.get(onset["start_k"]) if onset else None
             barge.append({"k": a.k, "utt": onset["label"] if onset else None,
+                          "onset_to_cancel_frames": a.k - onset["start_k"] if onset else None,
+                          "proc_onset_to_audio_stop_s": round(cut["t"] - t_proc_onset, 3) if cut and t_proc_onset
+                          else None,
                           "onset_to_cancel_s": round(cut["t"] - (t0 + onset["start_k"] * 0.08), 3) if onset and cut
                           else None, "audio_was_playing": cut["was_playing"] if cut else None})
     ts = proc.stats or {}
@@ -216,7 +249,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
                        "gap_total_s": round(sum(g["gap_s"] for g in player.gaps), 3), "gap_list": player.gaps[:40],
                        "stale_dropped": len(player.stale), "cuts": player.cuts,
                        "replay": [replay_player(plog, pb, 24000) for pb in (0.0, 0.16, 0.32, 0.64, 1.0, 1.5)]},
-          "first_audio_after_user_end": first_audio, "barge_in": barge, "drained_s": drained_s,
+          "first_audio_after_user_end": first_audio, "first_audio_processing_clock": first_audio_proc,
+          "loop_lag_s": lag, "barge_in": barge, "drained_s": drained_s, "audio_aware": audio_aware,
           "holding": d.holding}
     (od / "g0.json").write_text(json.dumps(g0, indent=1, ensure_ascii=False, default=str))
     # ---------------------------------------------------------------- listening files
