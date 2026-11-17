@@ -52,6 +52,8 @@ class AgentChannelForcer:
     bos_fallback_frames: int = 6     # after the user's EOU, force BOS if the duplex loop has not opened a turn
     wait_max: int = 25               # 2 s without reply text after BOS -> give up the turn (EOS)
     tail_max: int = 60               # PAD tail cap after the forced reply
+    eos_hold: Optional[int] = None   # controller-owned EOS: None = wait for the Thinker's EOS (up to tail_max);
+                                     # n = force EOS n PAD frames after the last forced id (0 = the next frame)
     state: ForceState = ForceState.LISTEN
     queue: deque = field(default_factory=deque)
     reply_done: bool = False
@@ -149,6 +151,8 @@ class AgentChannelForcer:
         self.tail += 1
         if predicted == T.EOS_ID:
             return self._close(k, "model_eos", write=None)
+        if self.eos_hold is not None and self.tail > self.eos_hold:
+            return self._close(k, "controller_eos")
         if self.tail > self.tail_max:
             return self._close(k, "tail_cap")
         if predicted != T.PAD_ID:

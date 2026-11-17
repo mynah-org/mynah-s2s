@@ -200,3 +200,44 @@ def test_no_empty_user_turn_after_the_opener():
     assert users == ["[call connected]", "ciao"]               # the third BOS (no new words) is not sent
     assert hook.skipped and hook.skipped[0]["why"] == "empty_user_turn"
     assert g.d[0][58] == T.EOS_ID                               # the empty turn is closed at the next frame
+
+
+def test_shell_mode_never_writes_but_drives_the_adapter():
+    v = FakeVocab()
+    reply = [v.id(p) for p in [" Certo", "."]]
+    w = FakeWrapper()
+    tr = Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode, config=AdapterConfig(), tracer=tr)
+    hook = M1Force(w, FakeBrain([reply]), Tok(v), ASR, ad, tr, Log(), Log(), lambda p: ("{}", 0.0), mode="shell",
+                   eos_hold=0)
+    M1Force.brain_fp = staticmethod(lambda cache: "fp")
+    un = hook.install()
+    model = [T.PAD_ID] * 10 + [T.BOS_ID] + [1500] * 8 + [T.PAD_ID] * 6
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    assert g.d[0] == model                                         # the Thinker runs free
+    assert "".join(c.text for c in ad.commands if hasattr(c, "text")) == "Certo."
+    assert any(type(c).__name__ == "FinalizeSegment" for c in ad.commands)
+
+
+def test_debounce_blocks_bos_right_after_a_cancel():
+    asr = {"words": [{"k": 3, "word": "ciao"}], "nonblank": [1, 2, 3, 30, 31, 32, 33], "eou": [13]}
+    v = FakeVocab()
+    w = FakeWrapper()
+    tr = Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode, config=AdapterConfig(), tracer=tr)
+    hook = M1Force(w, FakeBrain([[v.id(" a"), v.id(" b"), v.id(" c"), v.id(".")]] * 3), Tok(v), asr, ad, tr, Log(),
+                   Log(), lambda p: ("{}", 0.0), debounce_frames=8)
+    M1Force.brain_fp = staticmethod(lambda cache: "fp")
+    un = hook.install()
+    model = [T.PAD_ID] * 25 + [T.BOS_ID] + [T.PAD_ID] * 12 + [T.BOS_ID] * 3 + [T.PAD_ID] * 10
+    g = G(len(model))
+    for t, p in enumerate(model):
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    cancel_k = next(c.k for c in ad.commands if type(c).__name__ == "Cancel")   # caller speech 30..33 cut the reply
+    assert any(x["why"] == "debounce_after_cancel" and x["k"] < cancel_k + 8 for x in hook.suppressed)

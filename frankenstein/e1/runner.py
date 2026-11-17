@@ -101,6 +101,8 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--decode-audio", action="store_true",
                     help="keep NVIDIA's EarTTS stage running (its audio is discarded). Needed on the streaming pipeline: "
                          "with decode_audio=False its log_output() fails on audio_wave=None (E1 job 3)")
+    ap.add_argument("--eos-hold", type=int, default=None, help="controller-owned EOS n frames after the forced text")
+    ap.add_argument("--debounce-frames", type=int, default=0, help="no new BOS for n frames after a cancel")
     ap.add_argument("--smoke-s", type=float, default=20.0,
                     help="first run M1-force on the first N s of the first language and stop the job if the "
                          "TECHNICAL invariants fail (0 = no smoke)")
@@ -182,7 +184,7 @@ def main():  # pragma: no cover - GPU
             frames, blog = FrameLog(od / "frames.jsonl"), FrameLog(od / "brain.jsonl")
             seed_all()
             t_s = time.monotonic()
-            if arm in ("m1f", "m0"):
+            if arm in ("m1f", "m0", "ts"):
                 tr = V2Tracer(od / "trace.jsonl", session_id=sid)
                 led = ToolLedger(sid, tr)
                 state = {"s": None}
@@ -197,8 +199,9 @@ def main():  # pragma: no cover - GPU
                     else:
                         res = _bound[parsed["name"]](parsed.get("arguments") or {})
                     return res, round((time.monotonic() - t0) * 1e3, 1)
-                hook = M1Force(w, brain, tok, asr, ad, ftr, frames, blog, execute_tool,
-                               mode="force" if arm == "m1f" else "observe")
+                mode = {"m1f": "force", "m0": "observe", "ts": "shell"}[arm]
+                hook = M1Force(w, brain, tok, asr, ad, ftr, frames, blog, execute_tool, mode=mode,
+                               eos_hold=a.eos_hold, debounce_frames=a.debounce_frames)
                 hook.pump = lambda: pump(ad, drv, gate)
                 uninstall = hook.install()
                 sess = Session(eng, tr, Mode.REFERENCE, None, on_audio=lambda x: None, controller=None)

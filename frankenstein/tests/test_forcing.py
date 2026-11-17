@@ -106,3 +106,13 @@ def test_cut_in_tail_closes_turn():
     assert f.state is ForceState.TAIL
     f.cut()
     assert f.step(3, PAD).write == EOS and f.state is ForceState.LISTEN
+
+
+def test_controller_owned_eos_right_after_the_forced_text():
+    f = AgentChannelForcer(eos_hold=0)
+    run(f, [BOS])
+    f.add_reply([2001, 2002], done=True)
+    steps = run(f, [PAD, PAD, PAD, PAD], start=1)
+    assert [s.write for s in steps[:2]] == [2001, 2002]
+    assert steps[2].write == EOS                                 # EOS on the first frame after the forced text
+    assert f.log[-1][2] == "controller_eos"

@@ -122,7 +122,8 @@ def score_session(d: Path, asr: dict) -> dict:
             for f in firsts)
         out["technical"]["first_forced"] = firsts
     # ---------------- DUPLEX: agent turns from the emitted stream
-    emitted = [(r["k"], r["emitted"]) for r in fr]
+    # the agent stream the TALKER would get (adapter input); for m0 and the cascade it equals the emitted stream
+    emitted = [(r["k"], r["to_adapter"] if "to_adapter" in r else r["emitted"]) for r in fr]
     turns, cur = [], None
     for k, tid in emitted:
         if tid == 1:
@@ -133,6 +134,7 @@ def score_session(d: Path, asr: dict) -> dict:
             cur = None
         elif cur is not None and tid is not None and tid >= 1000:
             cur["ids"].append(tid)
+            cur["last_text_k"] = k
     nb = set(asr["nonblank"])
     wk = sorted(w["k"] for w in asr["words"])
     ek = sorted(asr["eou"])
@@ -159,7 +161,25 @@ def score_session(d: Path, asr: dict) -> dict:
     for t in turns:
         if t["bos_k"] <= u4["start_k"] and (t["eos_k"] is None or t["eos_k"] > u4["start_k"]):
             speaking_at_u4 = t
-    out["duplex"] = {"n_agent_turns": len(turns), "n_premature_emitted_bos": sum(1 for t in turns if t["premature"]),
+    # five-number view (track truth = the scripted user turns)
+    early = [t["bos_k"] for t in turns if any(u["start_k"] <= t["bos_k"] <= u["end_k"] for u in tl)]
+    miss, lat = [], []
+    for u in tl:
+        nxt = [t["bos_k"] for t in turns if u["end_k"] < t["bos_k"] <= u["end_k"] + 38]
+        if nxt:
+            lat.append(nxt[0] - u["end_k"])
+        else:
+            miss.append(u["label"])
+    eos_lat = [t["eos_k"] - t["last_text_k"] for t in turns if t.get("eos_k") and t.get("last_text_k")]
+    reonset = []
+    for a_, b_ in zip(turns, turns[1:]):
+        if a_.get("eos_k") is not None and b_["bos_k"] - a_["eos_k"] <= 12 and not any(
+                a_["eos_k"] < u["start_k"] <= b_["bos_k"] for u in tl):
+            reonset.append(b_["bos_k"])
+    five = {"bos_early": f"{len(early)}/{len(turns)}", "bos_early_frames": early,
+            "bos_miss": f"{len(miss)}/{len(tl)}", "bos_missed_turns": miss, "bos_latency_frames_after_user_end": lat,
+            "eos_latency_frames_after_text": eos_lat, "reonset_after_eos": reonset}
+    out["duplex"] = {"five": five, "n_agent_turns": len(turns), "n_premature_emitted_bos": sum(1 for t in turns if t["premature"]),
                      "model_wanted_bos": [(k, premature(k)) for k in wanted_bos],
                      "bos_suppressed": s.get("bos_suppressed"), "brain_skipped": s.get("brain_skipped"),
                      "agent_turns": turns, "turn_open_sources": src, "turn_closes": closes, "barge_in_events": barge,

@@ -104,8 +104,10 @@ class UserSide:
 class M1Force:
     def __init__(self, wrapper, brain, tok, asr: dict, adapter, ftr, frames: FrameLog, brain_log: FrameLog,
                  execute_tool, mode: str = "force", tool_turns: bool = True, bos_gate: bool = True,
-                 no_empty_turns: bool = True):
-        assert mode in ("force", "observe")
+                 no_empty_turns: bool = True, eos_hold=None, debounce_frames: int = 0):
+        assert mode in ("force", "observe", "shell")
+        self.forcing = mode in ("force", "shell")     # shell: the controller drives the talker, never gen_text
+        self.debounce_frames, self.debounce_until = debounce_frames, -1
         self.bos_gate, self.no_empty_turns = bos_gate, no_empty_turns
         self.opener_done = False
         self.suppressed: list = []
@@ -114,7 +116,8 @@ class M1Force:
         self.frames, self.brain_log, self.execute_tool = frames, brain_log, execute_tool
         self.mode = mode
         self.user = UserSide(asr)
-        self.forcer = AgentChannelForcer(bos_fallback_frames=8, wait_max=150, tail_max=60, tracer=ftr)
+        self.forcer = AgentChannelForcer(bos_fallback_frames=8, wait_max=150, tail_max=60, eos_hold=eos_hold,
+                                         tracer=ftr)
         self.messages: list = []
         self.sched: list = []          # (avail_k, [ids], done)
         self.job_active = False
@@ -134,7 +137,7 @@ class M1Force:
         self._orig["rnnt"] = w._apply_rnnt_turn_taking
         self._orig["fc"] = w._apply_fc_state_machine
         w._apply_rnnt_turn_taking = self._rnnt_hook
-        if self.mode == "force":
+        if self.forcing:
             w._apply_fc_state_machine = self._fc_hook
 
         def uninstall():
@@ -172,7 +175,7 @@ class M1Force:
         s = None
         written = None
         state_before = None
-        if self.mode == "force":
+        if self.forcing:
             while self.sched and self.sched[0][0] <= t:
                 _, ids, done = self.sched.pop(0)
                 self.forcer.add_reply(ids, done=done)
@@ -180,24 +183,33 @@ class M1Force:
             pred_in = predicted
             if self.bos_gate and predicted == T.BOS_ID and state_before is ForceState.LISTEN:
                 ok, why = self.user.turn_open(t)
+                if ok and t < self.debounce_until:
+                    ok, why = False, "debounce_after_cancel"
                 if not ok:
                     pred_in = T.PAD_ID                      # the BOS is not taken: PAD is written instead
                     self.suppressed.append({"k": t, "source": "model_bos", "why": why})
                     self.ftr.emit("force.bos_suppressed", t, source="model_bos", why=why)
+            saved_eou = None
+            if t < self.debounce_until and state_before is ForceState.LISTEN and self.forcer.eou_k is not None:
+                saved_eou, self.forcer.eou_k = self.forcer.eou_k, None      # no EOU-fallback BOS while debouncing
             s = self.forcer.step(t, pred_in)
+            if saved_eou is not None and self.forcer.state is ForceState.LISTEN:
+                self.forcer.eou_k = saved_eou
             if pred_in != predicted and s.write is None:
                 s = type(s)(T.PAD_ID, T.PAD_ID)
-            if s.write is not None:
+            if s.write is not None and self.mode == "force":
                 gen_text[0, t] = s.write
                 written = s.write
         out = self._orig["rnnt"](t, gen_text, *rest, **kw)
         emitted = int(gen_text[0, t])
         expected = written if written is not None else predicted
         duplex_change = emitted != expected
-        if duplex_change and self.mode == "force":
+        if duplex_change and self.forcing:
             self.mismatch.append({"k": t, "expected": expected, "emitted": emitted})
             if emitted == T.BOS_ID and state_before is ForceState.LISTEN and self.forcer.state is ForceState.LISTEN:
                 ok, why = self.user.turn_open(t) if self.bos_gate else (True, "ok")
+                if ok and t < self.debounce_until:
+                    ok, why = False, "debounce_after_cancel"
                 if ok:
                     self.forcer._open(t, write=None, why="duplex_wrapper_bos")   # the audio path's own decision
                 else:
@@ -211,20 +223,22 @@ class M1Force:
                 self.ftr.emit("adapter.barge_in", t, source="duplex_rnnt", what="wrapper_forced_eos",
                               action="cut forced reply")
                 self.forcer._close(t, "duplex_rnnt_eos", write=None)   # the wrapper already wrote EOS at t
+                self.debounce_until = t + self.debounce_frames
         # adapter (CPU) sees what the talker would get
-        if self.mode == "force":
+        if self.forcing:
             to_adapter = s.to_adapter if not duplex_change else emitted
         else:
             to_adapter = emitted
         n_cmd = len(self.adapter.commands)
         self.adapter.feed(Frame(t, to_adapter, user_speech=u["speech"]))
-        if self.mode == "force" and any(type(c).__name__ == "Cancel" for c in self.adapter.commands[n_cmd:]):
+        if self.forcing and any(type(c).__name__ == "Cancel" for c in self.adapter.commands[n_cmd:]):
             self.forcer.cut()
+            self.debounce_until = t + self.debounce_frames
         piece = self.tok.decode([emitted]) if emitted >= T.FIRST_TEXT_ID else None
         self.ftr.emit("thinker.frame", t, predicted=predicted, fed=emitted, forced=written is not None and written != predicted,
                       piece=piece, source=self.mode)
         row = {"k": t, "predicted": predicted, "written": written, "emitted": emitted, "to_adapter": to_adapter,
-               "forcer": self.forcer.state.value if self.mode == "force" else None,
+               "forcer": self.forcer.state.value if self.forcing else None,
                "speech": u["speech"], "eou": u["eou"], "new_words": u["new_words"] or None,
                "t_ns": time.monotonic_ns()}
         self.frames.write(row)
@@ -234,7 +248,7 @@ class M1Force:
         if self.pump is not None and t % 5 == 0:
             self.pump()
         # history bookkeeping on turn close
-        if self.mode == "force":
+        if self.forcing:
             self._maybe_close_history(t)
             if self.forcer.need_reply and not self.job_active:
                 self._start_brain(t)
