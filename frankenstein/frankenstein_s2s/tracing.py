@@ -41,6 +41,8 @@ FRANKENSTEIN = {
     "adapter.finalize", "adapter.eos_drain", "adapter.eos_ambiguous", "adapter.barge_in", "adapter.cancel",
     "adapter.epoch", "adapter.tool_wait", "adapter.drop", "adapter.inject", "adapter.retokenize",
     "adapter.stale_drop", "adapter.talker_done",
+    # controller (CONTROL.md): every intent and every action
+    "ctl.intent", "ctl.action",
     # talker and audio delivery
     "talker.prefill", "talker.append", "talker.step", "talker.block", "talker.finalize", "talker.codec_eos",
     "talker.cancel", "talker.chunk", "audio.delivered", "audio.flush", "audio.underrun", "audio.played",

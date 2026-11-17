@@ -1,0 +1,295 @@
+"""Controller: the single writer of turn state (CONTROL.md).
+
+Sources post INTENTS; the controller turns them into ACTIONS. Nothing else changes turn state.
+
+* Every intent carries its source, a model-frame stamp ``k`` (Thinker / ASR: the frame it refers to; Nano / tools /
+  talker / app: the frame at which it was delivered to the controller) and, when it answers an earlier action, the
+  ``epoch`` and ``request_id`` / ``call_id`` it belongs to.
+* Intents are queued with ``post`` and decided once per frame with ``tick(k)``. Within a tick the order of arrival
+  does not matter: intents are sorted by (priority, source rank, k, stable key) before they are applied, so the same
+  set of intents always gives the same actions (race-free by construction, tested with permutations).
+* Priority: barge-in (confirmed user speech) > cancel > tool (call / result) > speak (reply tokens) > the rest.
+* Stale = an answer to a cancelled epoch, an old request or an unknown call: dropped and traced, never applied.
+* Idempotent: an intent with an id already applied (``uid``) is ignored.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Optional
+
+from .tracing import NullTracer
+
+
+class St(Enum):
+    LISTENING = "listening"      # no agent turn
+    PENDING = "pending"          # turn opened, reply requested, nothing spoken yet
+    SPEAKING = "speaking"        # reply tokens are flowing to the talker
+    TOOL_WAIT = "tool_wait"      # a tool call is out; the turn stays open
+
+
+# intent kinds -> priority (lower = first)
+PRIORITY = {
+    "USER_SPEECH_START": 0, "USER_SPEECH": 0,         # barge-in evidence
+    "CANCEL": 1,
+    "TOOL_CALL": 2, "TOOL_RESULT": 2, "TOOL_TIMEOUT": 2,
+    "REPLY_TOKENS": 3, "REPLY_DONE": 3,
+    "YIELD": 4, "TAKE_TURN": 5, "EOU": 5, "USER_SPEECH_END": 6, "WORDS": 6,
+    "AUDIO_STARTED": 7, "AUDIO_ENDED": 7, "UNDERRUN": 7,
+}
+SOURCE_RANK = {"app": 0, "asr": 1, "tool": 2, "nano": 3, "thinker": 4, "talker": 5}
+
+
+@dataclass(frozen=True)
+class Intent:
+    kind: str
+    source: str
+    k: int
+    payload: Any = None
+    epoch: Optional[int] = None
+    request_id: Optional[int] = None
+    call_id: Optional[str] = None
+    uid: Optional[str] = None
+
+    def __post_init__(self):
+        if self.kind not in PRIORITY:
+            raise ValueError(f"unknown intent {self.kind!r}")
+        if self.source not in SOURCE_RANK:
+            raise ValueError(f"unknown source {self.source!r}")
+
+    def sort_key(self):
+        return (PRIORITY[self.kind], SOURCE_RANK[self.source], self.k, str(self.uid or ""), str(self.payload))
+
+
+@dataclass
+class Action:
+    kind: str                    # OPEN_TURN | REQUEST_REPLY | SPEAK | HOLD | CANCEL | CALL_TOOL | RESUME_AFTER_TOOL |
+    k: int                       # CLOSE_TURN | DROP_STALE | DEFER
+    epoch: int
+    turn: int
+    reason: str
+    data: dict = field(default_factory=dict)
+
+
+@dataclass
+class ControllerConfig:
+    barge_in_frames: int = 3       # consecutive frames of user speech that make a barge-in (shorter = back-channel)
+    min_blank: int = 2             # ASR blank frames before a Thinker TAKE_TURN may open the turn
+    take_turn_window: int = 12     # a deferred TAKE_TURN is kept this many frames, then dropped
+    debounce: int = 8              # no new turn this many frames after a cancel
+    reply_timeout: int = 40        # PENDING without reply tokens: close the turn (3.2 s)
+    tool_timeout: int = 100        # TOOL_WAIT without a result: resume with an error (8 s)
+    eou_fallback: bool = True      # an ASR EOU opens the turn when the Thinker stays silent
+
+
+class Controller:
+    def __init__(self, config: Optional[ControllerConfig] = None, tracer=None):
+        self.cfg = config or ControllerConfig()
+        self.tr = tracer or NullTracer()
+        self.state = St.LISTENING
+        self.epoch = 0
+        self.turn = 0
+        self.request_id = 0
+        self.inbox: list = []
+        self.applied: set = set()
+        self.actions: list = []
+        self.calls: dict = {}            # call_id -> status
+        self.speech_run = 0
+        self.last_speech_k = -10 ** 9
+        self.heard_since_turn = False
+        self.deferred: Optional[Intent] = None
+        self.debounce_until = -1
+        self.opened_k = None
+        self.last_reply_k = None
+        self.tool_since_k = None
+
+    # ------------------------------------------------------------------ input
+    def post(self, it: Intent) -> None:
+        self.tr.emit("ctl.intent", it.k, kind=it.kind, source=it.source, epoch=it.epoch, request_id=it.request_id,
+                     call_id=it.call_id, uid=it.uid)
+        self.inbox.append(it)
+
+    def tick(self, k: int) -> list:
+        """Apply every intent posted for frames <= k, in priority order; then the per-frame timers."""
+        due = sorted([i for i in self.inbox if i.k <= k], key=Intent.sort_key)
+        self.inbox = [i for i in self.inbox if i.k > k]
+        out_start = len(self.actions)
+        speech_now = any(i.kind in ("USER_SPEECH_START", "USER_SPEECH") for i in due)
+        for it in due:
+            if it.uid is not None:
+                if it.uid in self.applied:
+                    continue
+                self.applied.add(it.uid)
+            getattr(self, "_on_" + it.kind.lower())(it, k)
+        if not speech_now:
+            self.speech_run = 0
+        self._timers(k)
+        return self.actions[out_start:]
+
+    # ------------------------------------------------------------------ helpers
+    def _act(self, kind: str, k: int, reason: str, **data) -> Action:
+        a = Action(kind, k, self.epoch, self.turn, reason, data)
+        self.actions.append(a)
+        self.tr.emit("ctl.action", k, kind=kind, epoch=self.epoch, turn_id=self.turn, reason=reason,
+                     **{x: v for x, v in data.items() if isinstance(v, (int, str, float, bool, type(None)))})
+        return a
+
+    def _stale(self, it: Intent, k: int, why: str) -> None:
+        self._act("DROP_STALE", k, why, intent=it.kind, source=it.source, intent_epoch=it.epoch,
+                  request_id=it.request_id, call_id=it.call_id)
+
+    def _is_stale(self, it: Intent) -> Optional[str]:
+        if it.epoch is not None and it.epoch != self.epoch:
+            return "old_epoch"
+        if it.request_id is not None and it.request_id != self.request_id:
+            return "old_request"
+        return None
+
+    def _open(self, k: int, reason: str, user_text: str = "") -> None:
+        self.turn += 1
+        self.request_id += 1
+        self.state = St.PENDING
+        self.opened_k = k
+        self.last_reply_k = None
+        self.heard_since_turn = False
+        self.deferred = None
+        self._act("OPEN_TURN", k, reason)
+        self._act("REQUEST_REPLY", k, reason, request_id=self.request_id, user_text=user_text)
+
+    def _cancel(self, k: int, reason: str) -> None:
+        self._act("CANCEL", k, reason, flush=True, new_epoch=self.epoch + 1)
+        self.epoch += 1
+        self.request_id += 1               # any answer to the old request is now stale
+        for cid, st in self.calls.items():
+            if st == "pending":
+                self.calls[cid] = "cancelled"
+        self.state = St.LISTENING
+        self.deferred = None
+        self.debounce_until = k + self.cfg.debounce
+
+    def _close(self, k: int, reason: str) -> None:
+        self._act("CLOSE_TURN", k, reason)
+        self.state = St.LISTENING
+
+    def _may_open(self, k: int) -> Optional[str]:
+        if k < self.debounce_until:
+            return "debounce_after_cancel"
+        if k - self.last_speech_k < self.cfg.min_blank:
+            return "asr_speech_recent"
+        if self.turn > 0 and not self.heard_since_turn:
+            return "no_new_caller_words"
+        return None
+
+    # ------------------------------------------------------------------ intents
+    def _on_user_speech_start(self, it, k):
+        self._on_user_speech(it, k)
+
+    def _on_user_speech(self, it, k):
+        self.speech_run += 1
+        self.last_speech_k = it.k
+        if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT):
+            if self.speech_run >= self.cfg.barge_in_frames:
+                self._cancel(k, "barge_in")
+            elif self.state is St.SPEAKING:
+                self._act("HOLD", k, "backchannel_candidate", run=self.speech_run)
+
+    def _on_user_speech_end(self, it, k):
+        pass
+
+    def _on_words(self, it, k):
+        self.heard_since_turn = True
+
+    def _on_cancel(self, it, k):
+        if self.state is not St.LISTENING:
+            self._cancel(k, f"app:{it.payload or 'cancel'}")
+
+    def _on_take_turn(self, it, k):
+        if self.state is not St.LISTENING:
+            return                                       # already in a turn: idempotent
+        why = self._may_open(k)
+        if why is None:
+            self._open(k, f"thinker_{it.payload or 'bos'}")
+        elif why == "asr_speech_recent":
+            self.deferred = it                           # sources disagree: keep it, retry when the ASR is blank
+            self._act("DEFER", k, why, signal=it.payload or "bos")
+        else:
+            self._act("HOLD", k, why, signal=it.payload or "bos")
+
+    def _on_eou(self, it, k):
+        if self.state is St.LISTENING and self.cfg.eou_fallback and self.heard_since_turn:
+            why = self._may_open(k)
+            if why is None:
+                self._open(k, "asr_eou_fallback")
+
+    def _on_yield(self, it, k):
+        pass                                             # the Thinker's EOS is advisory; the controller owns EOS
+
+    def _on_reply_tokens(self, it, k):
+        why = self._is_stale(it)
+        if why or self.state not in (St.PENDING, St.SPEAKING):
+            return self._stale(it, k, why or f"state_{self.state.value}")
+        self.state = St.SPEAKING
+        self.last_reply_k = k
+        self._act("SPEAK", k, "reply_tokens", ids=list(it.payload or []), request_id=it.request_id)
+
+    def _on_reply_done(self, it, k):
+        why = self._is_stale(it)
+        if why or self.state not in (St.PENDING, St.SPEAKING):
+            return self._stale(it, k, why or f"state_{self.state.value}")
+        self._close(k, "reply_done")
+
+    def _on_tool_call(self, it, k):
+        why = self._is_stale(it)
+        if why or self.state not in (St.PENDING, St.SPEAKING):
+            return self._stale(it, k, why or f"state_{self.state.value}")
+        if it.call_id in self.calls:
+            return                                       # idempotent
+        self.calls[it.call_id] = "pending"
+        self.state = St.TOOL_WAIT
+        self.tool_since_k = k
+        self._act("CALL_TOOL", k, "nano_tool_call", call_id=it.call_id, name=(it.payload or {}).get("name"))
+
+    def _on_tool_result(self, it, k):
+        if self.calls.get(it.call_id) != "pending" or (it.epoch is not None and it.epoch != self.epoch):
+            return self._stale(it, k, f"call_{self.calls.get(it.call_id, 'unknown')}")
+        self.calls[it.call_id] = "done"
+        if self.state is St.TOOL_WAIT and all(v != "pending" for v in self.calls.values()):
+            self.state = St.PENDING
+            self._act("RESUME_AFTER_TOOL", k, "tool_result", call_id=it.call_id, request_id=self.request_id)
+
+    def _on_tool_timeout(self, it, k):
+        if self.calls.get(it.call_id) == "pending":
+            self.calls[it.call_id] = "timeout"
+            self.state = St.PENDING
+            self._act("RESUME_AFTER_TOOL", k, "tool_timeout", call_id=it.call_id, request_id=self.request_id)
+
+    def _on_audio_started(self, it, k):
+        if it.epoch is not None and it.epoch != self.epoch:
+            self._stale(it, k, "old_epoch_audio")
+
+    def _on_audio_ended(self, it, k):
+        pass
+
+    def _on_underrun(self, it, k):
+        pass
+
+    # ------------------------------------------------------------------ timers
+    def _timers(self, k: int) -> None:
+        if self.deferred is not None and self.state is St.LISTENING:
+            if k - self.deferred.k > self.cfg.take_turn_window:
+                self._act("HOLD", k, "deferred_take_turn_expired")
+                self.deferred = None
+            elif self._may_open(k) is None:
+                it, self.deferred = self.deferred, None
+                self._open(k, f"thinker_{it.payload or 'bos'}_deferred")
+        if self.state is St.PENDING and self.last_reply_k is None and self.opened_k is not None \
+                and k - self.opened_k > self.cfg.reply_timeout:
+            self._close(k, "reply_timeout")
+        if self.state is St.TOOL_WAIT and self.tool_since_k is not None and k - self.tool_since_k > self.cfg.tool_timeout:
+            for cid, st in self.calls.items():
+                if st == "pending":
+                    self.calls[cid] = "timeout"
+            self.state = St.PENDING
+            self.opened_k = k
+            self._act("RESUME_AFTER_TOOL", k, "tool_timeout", request_id=self.request_id)
