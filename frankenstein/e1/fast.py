@@ -51,6 +51,13 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--constrained", action="store_true", help="E1l G2: schema-constrained tool-call decoding")
     ap.add_argument("--call-ab", default="", help="E1l: summary.json of a previous session; free vs constrained call "
                                                   "on each of its tool prompts before the session")
+    ap.add_argument("--g0", action="store_true", help="G0: live ASR + the real Flash talker (separate process)")
+    ap.add_argument("--flash-python", default="", help="G0: python of the talker's own environment")
+    ap.add_argument("--flash-harness", default="", help="G0: directory of flash_rt.py (read-only import)")
+    ap.add_argument("--flash-root", default="", help="G0: Flash snapshot (contains talker/)")
+    ap.add_argument("--flash-voice", default="", help="G0: reference wav for the zero-shot clone")
+    ap.add_argument("--prebuffer", type=float, default=0.32, help="G0: playback prebuffer (s)")
+    ap.add_argument("--listen-dir", default="", help="G0: copy the listening wavs here")
     ap.add_argument("--int4-dispatch", action="store_true", help="E1k: the INT4 Nano variant uses Int4Dispatch")
     ap.add_argument("--int4-nano-variant-after-s", type=float, default=0.0,
                     help="E1j: after the bf16 session, quantize Nano INT4 and rerun if the job is younger than this")
@@ -79,6 +86,17 @@ def main():  # pragma: no cover - GPU
             "harness_sha256": {str(p.relative_to(pkg)): sha(p) for p in sorted(pkg.rglob("*.py")) if "__pycache__" not in str(p)},
             "nano": str(B2.NANO), "nano_weights_note": "revision 6533e8de downloaded to this host's own cache (owner-accepted)",
             "mem_before_engine_gb": round(mem_available_gb(), 1)}
+    proc = None
+    if a.g0:                                   # the talker loads in its own process while the engine loads
+        import os as _os
+        from e1.flash_client import FlashProc
+        env = {k: v for k, v in _os.environ.items() if k != "PYTHONPATH"}
+        env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+        proc = FlashProc([a.flash_python, str(pkg / "e1" / "flash_server.py"), "--harness", a.flash_harness,
+                          "--root", a.flash_root, "--voice", a.flash_voice, "--lang", "it"], env,
+                         str(out / "flash_server.log"))
+        proc.start()
+        print("FLASH spawned, mem", round(mem_available_gb(), 1), flush=True)
     t0 = time.monotonic()
     eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo"), overrides={"s2s.decode_audio": False}), llm_cache=True)
     safe_no_audio(eng)
@@ -141,10 +159,40 @@ def main():  # pragma: no cover - GPU
         print("REUSE_CHECK", json.dumps({k: v for k, v in rc.items() if k != "runs"}, ensure_ascii=False), flush=True)
         a.reuse = a.reuse and rc["same_call"] and rc["same_decision"]
         print("REUSE in session:", a.reuse, flush=True)
+    live = None
+    if a.g0:
+        info["flash_ready"] = proc.wait_ready(timeout=240)
+        info["mem_after_flash_gb"] = round(mem_available_gb(), 1)
+        if info["mem_after_flash_gb"] < 20:
+            print("G0 ABORT: memory", info["mem_after_flash_gb"], flush=True)
+            proc.close()
+            return
+        from e1.live_asr import LiveASR
+        t0 = time.monotonic()
+        live = LiveASR(str(lab / "multilingual"), lang="it", att_right=3, window_s=12.0)
+        info["asr_load_s"] = round(time.monotonic() - t0, 1)
+        info["mem_after_asr_gb"] = round(mem_available_gb(), 1)
+        (out / "freeze.json").write_text(json.dumps(info, indent=1, default=str))
+        print("G0 LOADS", json.dumps({k: info[k] for k in info if k.startswith(("flash", "asr", "mem"))}, default=str),
+              flush=True)
     if a.call_ab:
         ab = call_ab(tok, m, spec, POLICY["it"], tool_schemas, Path(a.call_ab))
         (out / "call_ab.json").write_text(json.dumps(ab, indent=1, ensure_ascii=False))
         print("CALL_AB", json.dumps(ab["summary"], ensure_ascii=False), flush=True)
+    if a.g0:
+        from e1 import g0_session
+        try:
+            res = g0_session.run(out, "g0_it", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), a.cut_s,
+                                 lab / "agentbench", tool_schemas, live, proc, timer=timer, prebuffer_s=a.prebuffer,
+                                 listen_dir=Path(a.listen_dir) if a.listen_dir else None)
+        finally:
+            proc.close()
+        g = res["g0"]
+        print("G0", json.dumps({k: g[k] for k in ("frames", "loop_s", "playback", "first_audio_after_user_end",
+                                                  "barge_in")}, default=str)[:3000], flush=True)
+        print("G0 TALKER", json.dumps(g["talker"], default=str)[:1500], flush=True)
+        print("G0 ASR", json.dumps(g["asr"], ensure_ascii=False, default=str)[:2000], flush=True)
+        return
     if a.ctl:
         from e1 import ctl_session
         res = ctl_session.run(out, "ctl_bf16", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), a.cut_s,

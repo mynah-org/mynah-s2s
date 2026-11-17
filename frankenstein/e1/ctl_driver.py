@@ -31,7 +31,7 @@ TAG = ("<", ">")
 
 class CtlDriver:
     def __init__(self, wrapper, worker, tok, asr: dict, adapter, ftr, frames, brain_log, controller: Controller,
-                 sotc_turn: bool = True, lang: str = "it"):
+                 sotc_turn: bool = True, lang: str = "it", live=None, wav=None):
         self.w, self.worker, self.tok, self.adapter, self.ftr = wrapper, worker, tok, adapter, ftr
         self.frames, self.blog, self.ctl, self.sotc_turn = frames, brain_log, controller, sotc_turn
         self.pieces = {int(k): [p for p in v if not (p.strip().startswith(TAG[0]) and p.strip().endswith(TAG[1]))]
@@ -60,8 +60,14 @@ class CtlDriver:
         self.stale = 0
         self.fc_suppressed: list = []
         self.pump = None
+        self.pump_every = 5
+        self.audible = None              # G0: callable -> is agent audio still playing (default: adapter.busy)
         self._orig = {}
         self.lang = lang
+        self.live, self.wav = live, wav  # G0: live streaming ASR (e1/live_asr.py) instead of the frozen track
+        self.lex_live: set = set()
+        self.nonblank = set(self.nonblank)
+        self.eou = set(self.eou)
         self.holding: list = []          # one record per holding phrase said
         self.reply_bos_needed = False    # a holding phrase closed the turn: the reply opens a new one
 
@@ -95,6 +101,8 @@ class CtlDriver:
     def _rnnt_hook(self, t, gen_text, *rest, **kw):
         self.n_hook += 1
         t = int(t)
+        if self.live is not None:
+            self._ingest_live(t, self.live.step(t, self.wav))
         predicted = int(gen_text[0, t])
         out = self._orig["rnnt"](t, gen_text, *rest, **kw)
         emitted = int(gen_text[0, t])
@@ -122,9 +130,23 @@ class CtlDriver:
         if self.last_t >= 0 and t != self.last_t + 1:
             self.gaps.append({"k": t, "gap_from": self.last_t})
         self.last_t = t
-        if self.pump is not None and t % 5 == 0:
+        if self.pump is not None and t % self.pump_every == 0:
             self.pump()
         return out
+
+    def _ingest_live(self, t, ev):
+        """Live ASR events of frame t -> the same per-frame tables the frozen track fills (lexical activity smoothed
+        over 3 frames, closed words, EOU)."""
+        if ev["pieces"]:
+            self.pieces[t] = list(ev["pieces"])
+            if any(ch.isalnum() for p in ev["pieces"] for ch in p):
+                self.lex_live.add(t)
+        if any(j in self.lex_live for j in (t, t - 1, t - 2)):
+            self.nonblank.add(t)
+        for w in ev["words"]:
+            self.words_at.setdefault(t, []).append(w)
+        if ev["eou"]:
+            self.eou.add(t)
 
     def _poll_worker(self, t):
         for ev in self.worker.poll():
@@ -197,7 +219,7 @@ class CtlDriver:
         elif a.kind == "SPEAK":
             if self.reply_bos_needed:
                 self.reply_bos_needed = False
-                if self.adapter.busy:                # the phrase is still audible: cut it (new epoch)
+                if self.audible() if self.audible is not None else self.adapter.busy:   # phrase still audible: cut
                     self.adapter.cancel(t, "holding_cut")
                     if self.holding:
                         self.holding[-1]["cut_k"] = t
