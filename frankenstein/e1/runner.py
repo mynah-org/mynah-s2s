@@ -98,6 +98,9 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--langs", default="it,fr,en")
     ap.add_argument("--arms", default="m1f,m0,cas")
     ap.add_argument("--budget-s", type=float, default=720.0, help="do not START a session past this (job wall)")
+    ap.add_argument("--decode-audio", action="store_true",
+                    help="keep NVIDIA's EarTTS stage running (its audio is discarded). Needed on the streaming pipeline: "
+                         "with decode_audio=False its log_output() fails on audio_wave=None (E1 job 3)")
     ap.add_argument("--smoke-s", type=float, default=20.0,
                     help="first run M1-force on the first N s of the first language and stop the job if the "
                          "TECHNICAL invariants fail (0 = no smoke)")
@@ -130,8 +133,8 @@ def main():  # pragma: no cover - GPU
         raise SystemExit(f"not enough free memory to load: {freeze['mem_available_gb_before_load']} GB")
 
     # ------------------------------------------------------------------------------------------- load
-    eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo"), overrides={"s2s.decode_audio": False}),
-                          llm_cache=True)
+    ov = {} if a.decode_audio else {"s2s.decode_audio": False}
+    eng = ReferenceEngine(build_cfg(output_dir=str(out / "_nemo"), overrides=ov), llm_cache=True)
     w = eng.wrapper
     tok = AutoTokenizer.from_pretrained(a.tokenizer)
     freeze.update({"engine_load_s": round(eng.load_s, 1), "decode_audio": bool(w.decode_audio),
@@ -142,8 +145,6 @@ def main():  # pragma: no cover - GPU
     (out / "freeze.json").write_text(json.dumps(freeze, indent=1, default=str))
     print("LOADED", json.dumps({k: freeze[k] for k in ("engine_load_s", "decode_audio", "rnnt_loaded",
                                                          "mem_available_gb_after_load")}), flush=True)
-    if w.decode_audio:
-        raise SystemExit("decode_audio is still on")
     brain = TextBrain(eng, tok, "")
     durations = []
 
