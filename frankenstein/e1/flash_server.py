@@ -98,6 +98,64 @@ def fast_generate(cp, torch, stats=None, profile=False):
     return gen
 
 
+def graph_generate(cp, torch, stats, profile=False):
+    """G5: the plain code-predictor loop (prefill of 2 positions + 14 one-token steps + sampling) captured as ONE CUDA
+    graph and replayed per codec frame. The loop has the same shapes every frame (positions 2..16, DynamicCache
+    growing by cat inside the graph's private pool), so no static-cache rewrite of the attention math is needed and
+    the numerics are the eager loop's. Sampling (torch.multinomial) is captured with the graph-safe CUDA RNG: a replay
+    reads the generator's current seed / offset, so the per-frame torch.manual_seed of the talker step still applies.
+    The CUDA RNG state is restored after warm-up + capture, so the first frame draws exactly what the eager loop
+    would. Any capture error -> the eager loop for the rest of the process (recorded in stats)."""
+    from types import SimpleNamespace
+    eager = fast_generate(cp, torch)
+    st = {"g": None, "key": None, "inp": None, "out": None, "failed": None}
+    info = {"captured": False, "failed": None, "replays": 0, "eager_calls": 0}
+    stats["cp_graph"] = info                     # JSON-safe view (the graph and its buffers stay in `st`)
+
+    def gen(inputs_embeds=None, max_new_tokens=15, do_sample=True, top_p=1.0, top_k=50, temperature=1.0, **kw):
+        args = dict(max_new_tokens=max_new_tokens, do_sample=do_sample, top_p=top_p, top_k=top_k,
+                    temperature=temperature)
+        key = (tuple(inputs_embeds.shape), inputs_embeds.dtype, max_new_tokens, do_sample, top_k, temperature)
+        if st["failed"] or (st["g"] is not None and st["key"] != key):
+            info["eager_calls"] += 1
+            return eager(inputs_embeds=inputs_embeds, **args)
+        if profile:
+            torch.cuda.synchronize()
+            c0 = time.perf_counter()
+        if st["g"] is None:
+            rng = torch.cuda.get_rng_state()
+            try:
+                inp = inputs_embeds.clone()
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        eager(inputs_embeds=inp, **args)
+                torch.cuda.current_stream().wait_stream(side)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    out = eager(inputs_embeds=inp, **args).sequences
+                st.update(g=g, key=key, inp=inp, out=out)
+                info["captured"] = True
+            except Exception as e:  # noqa: BLE001
+                st["failed"] = info["failed"] = repr(e)[:400]
+                info["eager_calls"] += 1
+                torch.cuda.synchronize()
+                torch.cuda.set_rng_state(rng)
+                return eager(inputs_embeds=inputs_embeds, **args)
+            torch.cuda.synchronize()
+            torch.cuda.set_rng_state(rng)
+        st["inp"].copy_(inputs_embeds)
+        st["g"].replay()
+        info["replays"] += 1
+        res = SimpleNamespace(sequences=st["out"].clone())
+        if profile:
+            torch.cuda.synchronize()
+            stats["cp_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+        return res
+    return gen
+
+
 def timed_generate(orig, torch, stats):
     def gen(*a, **kw):
         torch.cuda.synchronize()
@@ -119,6 +177,7 @@ def main():  # pragma: no cover - GPU, talker env
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--fast-cp", action="store_true", help="plain loop instead of HF generate for the code predictor")
     ap.add_argument("--profile", action="store_true", help="time the code predictor separately (extra syncs)")
+    ap.add_argument("--cp-graph", action="store_true", help="G5: the code-predictor loop as one CUDA graph")
     ap.add_argument("--prio", default="", choices=["", "high"],
                     help="G4: run all talker GPU work on a highest-priority CUDA stream of this process. CUDA stream "
                          "priorities act inside one context; across processes (the engine is another process) they "
@@ -152,9 +211,11 @@ def main():  # pragma: no cover - GPU, talker env
     by_key: dict = {}
     dead_epochs: set = set()
     stats = {"step_ms": [], "prefill_ms": [], "decode_ms": [], "cp_ms": [], "segments": [], "cancels": 0,
-             "fast_cp": a.fast_cp, "profile": a.profile}
+             "fast_cp": a.fast_cp, "profile": a.profile, "cp_graph_on": a.cp_graph}
     cp = ft.tk.code_predictor
-    if a.fast_cp:
+    if a.cp_graph:
+        cp.generate = graph_generate(cp, torch, stats, a.profile)
+    elif a.fast_cp:
         cp.generate = fast_generate(cp, torch, stats, a.profile)
     elif a.profile:
         cp.generate = timed_generate(cp.generate, torch, stats)
