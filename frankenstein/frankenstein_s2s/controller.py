@@ -27,6 +27,7 @@ class St(Enum):
     PENDING = "pending"          # turn opened, reply requested, nothing spoken yet
     SPEAKING = "speaking"        # reply tokens are flowing to the talker
     TOOL_WAIT = "tool_wait"      # a tool call is out; the turn stays open
+    DRAINING = "draining"        # G3 (audio_aware): the reply text is complete, its audio is still playing
 
 
 # intent kinds -> priority (lower = first)
@@ -91,6 +92,9 @@ class ControllerConfig:
                                    # are merged into a NEW request that supersedes the pending one
     barge_guard: int = 0           # user speech counts for barge-in only from this many frames after the turn opened
                                    # (the ASR tail of the words just spoken is not a barge-in)
+    audio_aware: bool = False      # G3: the turn closes at the END OF ITS AUDIO (AUDIO_ENDED), not at the end of the
+                                   # text; user speech during the remaining audio is a barge-in; a take-turn waits
+    audio_timeout: int = 600       # DRAINING without AUDIO_ENDED: close anyway (48 s)
     holding_phrase: bool = False   # E1l: speak a short per-language holding phrase once per turn when the text LLM
                                    # decides to call a tool (before the call is generated)
     barge_after_open: bool = False # E1k: only a speech run that STARTS after the turn opened can be a barge-in (a run
@@ -121,6 +125,8 @@ class Controller:
         self.tool_since_k = None
         self.open_word = False
         self.spoken_in_turn = False
+        self.drain_since_k = None
+        self.audio_end_k = None          # frame of the last agent audio end (G3)
         self.holding_done = False        # a holding phrase was already spoken in this turn (never repeated)
         self.held: list = []             # current-request reply intents that arrived during TOOL_WAIT (E1k)
 
@@ -219,7 +225,7 @@ class Controller:
         self.last_speech_k = it.k
         started_after = (not self.cfg.barge_after_open or self.opened_k is None or
                          (self.run_start_k is not None and self.run_start_k > self.opened_k))
-        if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT) and started_after and \
+        if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT, St.DRAINING) and started_after and \
                 (self.opened_k is None or it.k - self.opened_k >= self.cfg.barge_guard):
             if self.speech_run >= self.cfg.barge_in_frames:
                 self._cancel(k, "barge_in")
@@ -246,6 +252,10 @@ class Controller:
             self._cancel(k, f"app:{it.payload or 'cancel'}")
 
     def _on_take_turn(self, it, k):
+        if self.state is St.DRAINING:                    # our audio is still playing: retry when it has ended
+            self.deferred = it
+            self._act("DEFER", k, "agent_audio_playing", signal=it.payload or "bos")
+            return
         if self.state is not St.LISTENING:
             return                                       # already in a turn: idempotent
         why = self._may_open(k)
@@ -298,6 +308,11 @@ class Controller:
         why = self._is_stale(it)
         if why or self.state not in (St.PENDING, St.SPEAKING):
             return self._stale(it, k, why or f"state_{self.state.value}")
+        if self.cfg.audio_aware and self.spoken_in_turn:
+            self._act("END_TEXT", k, "reply_done")       # the text is final (EOS to the talker); the turn stays open
+            self.state = St.DRAINING
+            self.drain_since_k = k
+            return
         self._close(k, "reply_done")
 
     def _on_tool_decided(self, it, k):
@@ -343,13 +358,23 @@ class Controller:
             self._stale(it, k, "old_epoch_audio")
 
     def _on_audio_ended(self, it, k):
-        pass
+        if it.epoch is not None and it.epoch != self.epoch:
+            return self._stale(it, k, "old_epoch_audio")
+        self.audio_end_k = k
+        if self.state is St.DRAINING:
+            self._close(k, "audio_end")
+            if self.deferred is not None:                # a take-turn that waited for our audio: its window starts now
+                import dataclasses
+                self.deferred = dataclasses.replace(self.deferred, k=k)
 
     def _on_underrun(self, it, k):
         pass
 
     # ------------------------------------------------------------------ timers
     def _timers(self, k: int) -> None:
+        if self.state is St.DRAINING and self.drain_since_k is not None and \
+                k - self.drain_since_k > self.cfg.audio_timeout:
+            self._close(k, "audio_timeout")
         if self.deferred is not None and self.state is St.LISTENING:
             if k - self.deferred.k > self.cfg.take_turn_window:
                 self._act("HOLD", k, "deferred_take_turn_expired")

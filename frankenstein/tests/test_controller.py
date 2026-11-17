@@ -227,3 +227,41 @@ def test_held_reply_is_discarded_by_a_barge_in():
     c.post(I("TOOL_RESULT", "tool", 7, call_id="r1-0", epoch=0))
     acts = c.tick(7)
     assert not any(a.kind == "SPEAK" for a in acts) and c.held == []
+
+
+def _drain_ctl(**kw):
+    c = Controller(ControllerConfig(audio_aware=True, **kw))
+    run(c, {1: [I("WORDS", "asr", 1)], 4: [I("TAKE_TURN", "thinker", 4)]}, 4)
+    c.post(I("REPLY_TOKENS", "nano", 5, payload=[1001], request_id=1, epoch=0))
+    c.post(I("REPLY_DONE", "nano", 6, request_id=1, epoch=0))
+    c.tick(5)
+    c.tick(6)
+    return c
+
+
+def test_audio_aware_turn_closes_at_audio_end_not_text_end():
+    c = _drain_ctl()
+    assert c.state is St.DRAINING and c.actions[-1].kind == "END_TEXT"
+    out = run(c, {20: [I("AUDIO_ENDED", "talker", 20, epoch=0)]}, 20)
+    assert (20, "CLOSE_TURN", "audio_end") in out and c.state is St.LISTENING and c.audio_end_k == 20
+
+
+def test_user_speech_during_the_audio_tail_is_a_barge_in():
+    c = _drain_ctl(barge_in_frames=3)
+    out = run(c, {**{k: [I("USER_SPEECH", "asr", k)] for k in (10, 11, 12)}}, 12)
+    assert (12, "CANCEL", "barge_in") in out and c.state is St.LISTENING
+
+
+def test_take_turn_waits_for_the_audio_end_then_opens():
+    c = _drain_ctl()
+    run(c, {8: [I("WORDS", "asr", 8)], 10: [I("TAKE_TURN", "thinker", 10)]}, 10)
+    assert c.actions[-1].kind == "DEFER" and c.actions[-1].reason == "agent_audio_playing"
+    out = run(c, {30: [I("AUDIO_ENDED", "talker", 30, epoch=0)]}, 33)
+    opened = [o for o in out if o[1] == "OPEN_TURN"]
+    assert opened and opened[0][0] >= 30
+
+
+def test_audio_timeout_closes_a_turn_without_audio_end():
+    c = _drain_ctl(audio_timeout=10)
+    out = run(c, {}, 20)
+    assert any(o[1:] == ("CLOSE_TURN", "audio_timeout") for o in out)

@@ -123,6 +123,7 @@ class CtlDriver:
         if t in self.eou:
             self.ctl.post(Intent("EOU", "asr", t))
         self._poll_worker(t)
+        self._audio_end_check(t)
         for a in self.ctl.tick(t):
             self._do(a, t)
         to_adapter = self._adapter_id()
@@ -136,6 +137,16 @@ class CtlDriver:
         if self.pump is not None and t % self.pump_every == 0:
             self.pump()
         return out
+
+    def _audio_end_check(self, t):
+        """G3: while the controller drains (text final, audio playing), report the end of our audio once every queued
+        id was handed over, the talker is idle and nothing is audible."""
+        if self.ctl.state.value != "draining" or self.queue or self.close_pending or self.pending_bos:
+            return
+        audible = self.audible() if self.audible is not None else bool(self.adapter.busy)
+        if not audible and not self.adapter.busy:
+            self.ctl.post(Intent("AUDIO_ENDED", "talker", t, epoch=self.ctl.epoch))
+            self.blog.write({"ev": "audio.ended", "k": t})
 
     def _ingest_live(self, t, ev):
         """Live ASR events of frame t -> the same per-frame tables the frozen track fills (lexical activity smoothed
@@ -229,15 +240,26 @@ class CtlDriver:
                         self.holding[-1]["cut_k"] = t
                 self.pending_bos = True
             self.queue += list(a.data.get("ids", []))
-        elif a.kind == "CLOSE_TURN":
+        elif a.kind == "END_TEXT":                    # G3: text final, the turn stays open until its audio ends
             self.close_pending = True
-            self._history(t, a.reason)
+            self.text_closed = True
+            self._history(t, "reply_done")
+        elif a.kind == "CLOSE_TURN":
+            if getattr(self, "text_closed", False):     # after END_TEXT: EOS and history are already done
+                self.text_closed = False
+            else:
+                self.close_pending = True
+                self._history(t, a.reason)
         elif a.kind == "CANCEL":
             self.reply_bos_needed = False
             self.adapter.cancel(t, a.reason)
             self.worker.cancel(self.active_rid)
             self.queue, self.close_pending, self.pending_bos = [], False, False
-            self._history(t, a.reason)
+            if getattr(self, "text_closed", False):     # barge-in on the audio tail: the text is already in history
+                self.text_closed = False
+                self.blog.write({"ev": "history.agent", "k": t, "why": a.reason, "spoken": "", "audio_cut": True})
+            else:
+                self._history(t, a.reason)
         elif a.kind == "DROP_STALE" and a.data.get("intent") == "REPLY_TOKENS":
             self.stale += 1
 

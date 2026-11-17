@@ -291,3 +291,33 @@ def test_holding_phrase_never_cut_reply_queues_behind_it():
     assert starts[0][3] == "Un momento, controllo." and starts[1][2] != starts[0][2] and starts[1][1] == 0
     assert "".join(x[3] for x in seg if x[0] in ("StartSegment", "AppendText"))[len("Un momento, controllo."):] \
         == "Il suo ordine arriva domani."
+
+
+def test_driver_closes_at_audio_end_and_finalizes_text_first():
+    cfg = ControllerConfig(reply_timeout=100, audio_aware=True)
+    asr = {"words": [{"k": 4, "word": "ciao"}], "pieces": {"3": ["▁ciao"]}, "nonblank": [], "eou": [8]}
+    model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * 60
+    v = FakeVocab()
+    w, tr = FakeWrapper(), Tracer()
+    ad = TalkerAdapter([FakeTalkerDriver(), PlaybackGate()], decode=v.decode,
+                       config=AdapterConfig(barge_in="thinker"), tracer=tr)
+    wk = FakeWorker({1: [v.id(p) for p in [" Ciao", "."]]}, delay=2)
+    ctl = Controller(cfg, tracer=tr)
+    d = CtlDriver(w, wk, Tok(v), asr, ad, tr, Log(), Log(), ctl, lang="it")
+    clock = {"k": 0}
+    d.audible = lambda: clock["k"] < 50                 # our audio plays until frame 50
+    ad.busy.clear()
+    un = d.install()
+    g = G(len(model))
+    for t, p in enumerate(model):
+        clock["k"] = t
+        ad.busy.clear()                                  # the fake talker is instantly done generating
+        g[0, t] = p
+        w._apply_rnnt_turn_taking(t, g, None, None)
+    un()
+    kinds = [(a.k, a.kind, a.reason) for a in ctl.actions]
+    end_text = [x for x in kinds if x[1] == "END_TEXT"]
+    close = [x for x in kinds if x[1] == "CLOSE_TURN"]
+    assert end_text and close and close[0][2] == "audio_end" and close[0][0] >= 50 > end_text[0][0]
+    assert any(type(c).__name__ == "FinalizeSegment" and c.k <= end_text[0][0] + 3 for c in ad.commands)
+    assert sum(1 for m in d.messages if m["role"] == "assistant") == 1
