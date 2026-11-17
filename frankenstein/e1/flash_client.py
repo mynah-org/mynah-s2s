@@ -160,6 +160,9 @@ class FlashProc:  # pragma: no cover - process plumbing, exercised on the GPU ho
         self.p.stdin.write(json.dumps(obj) + "\n")
         self.p.stdin.flush()
 
+    def submit_raw(self, obj: dict) -> None:
+        self._send(dict(obj))
+
     def submit(self, cmd) -> None:   # TalkerDriver sink
         if isinstance(cmd, StartSegment):
             self._send({"op": "start", "epoch": cmd.epoch, "turn": cmd.turn, "seg": cmd.segment, "text": cmd.text})

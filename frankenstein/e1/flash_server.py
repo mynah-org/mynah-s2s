@@ -19,6 +19,12 @@ on the wall clock:
   stdout  {"ev": "ready", ...} | {"ev": "audio", "epoch", "turn", "seg", "a", "b", "t_ns", "sr", "pcm16": b64}
           | {"ev": "done", ..., "frames", "ended"} | {"ev": "cancelled", ...} | {"ev": "stats", ...}
 
+G1 options: ``--fast-cp`` replaces the code predictor's HF ``generate`` (called once per codec frame for the 15
+residual codebooks) by a plain loop over the same forward with the same sampling (float32 logits, temperature, top-k,
+softmax, multinomial: the HF warper order) -- instance-level, the package is not edited; codes must stay identical
+(checked by e1/g1_talker.py). ``--profile`` times the code predictor separately (extra syncs). ``done`` events
+carry the segment's codes so two runs can be compared.
+
 Segments of one epoch are generated in order, one at a time. Delivery: chunk ramp 2, 4, 8, 12, 16, 25 frames with
 25 frames of codec left context (flash_rt RAMP / LEFT_CTX). ``t_ns`` is CLOCK_MONOTONIC (shared with the engine
 process on Linux).
@@ -57,6 +63,50 @@ class Gen:
         self.started = False
 
 
+def fast_generate(cp, torch, stats=None, profile=False):
+    """Drop-in for ``code_predictor.generate`` as called by the talker forward (inputs_embeds of 2 positions,
+    max_new_tokens = 15, sampling with top_p = 1.0)."""
+    from types import SimpleNamespace
+    from transformers.cache_utils import DynamicCache
+
+    def gen(inputs_embeds=None, max_new_tokens=15, do_sample=True, top_p=1.0, top_k=50, temperature=1.0, **kw):
+        if profile:
+            torch.cuda.synchronize()
+            c0 = time.perf_counter()
+        cache = DynamicCache()
+        out = cp(inputs_embeds=inputs_embeds, past_key_values=cache, use_cache=True)
+        gs, seq = out.generation_steps, []
+        for i in range(max_new_tokens):
+            x = out.logits[:, -1, :].to(dtype=torch.float32)
+            if do_sample:
+                x = x / temperature
+                x = x.masked_fill(x < torch.topk(x, top_k)[0][..., -1, None], -float("inf"))
+                nxt = torch.multinomial(torch.softmax(x, -1), num_samples=1)
+            else:
+                nxt = x.argmax(-1, keepdim=True)
+            seq.append(nxt)
+            if i + 1 == max_new_tokens:
+                break
+            out = cp(input_ids=nxt, past_key_values=cache, use_cache=True, generation_steps=gs)
+            gs = out.generation_steps
+        if profile:
+            torch.cuda.synchronize()
+            stats["cp_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+        return SimpleNamespace(sequences=torch.cat(seq, 1))
+    return gen
+
+
+def timed_generate(orig, torch, stats):
+    def gen(*a, **kw):
+        torch.cuda.synchronize()
+        c0 = time.perf_counter()
+        r = orig(*a, **kw)
+        torch.cuda.synchronize()
+        stats["cp_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+        return r
+    return gen
+
+
 def main():  # pragma: no cover - GPU, talker env
     global OUT
     ap = argparse.ArgumentParser()
@@ -65,6 +115,8 @@ def main():  # pragma: no cover - GPU, talker env
     ap.add_argument("--voice", required=True, help="reference wav (zero-shot clone) or a built-in voice name")
     ap.add_argument("--lang", default="it")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--fast-cp", action="store_true", help="plain loop instead of HF generate for the code predictor")
+    ap.add_argument("--profile", action="store_true", help="time the code predictor separately (extra syncs)")
     a = ap.parse_args()
     OUT = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
     sys.stdout = sys.stderr                                 # library prints never corrupt the protocol stream
@@ -93,7 +145,13 @@ def main():  # pragma: no cover - GPU, talker env
     pending: deque = deque()          # Gen objects not finished, in order
     by_key: dict = {}
     dead_epochs: set = set()
-    stats = {"step_ms": [], "prefill_ms": [], "decode_ms": [], "segments": [], "cancels": 0}
+    stats = {"step_ms": [], "prefill_ms": [], "decode_ms": [], "cp_ms": [], "segments": [], "cancels": 0,
+             "fast_cp": a.fast_cp, "profile": a.profile}
+    cp = ft.tk.code_predictor
+    if a.fast_cp:
+        cp.generate = fast_generate(cp, torch, stats, a.profile)
+    elif a.profile:
+        cp.generate = timed_generate(cp.generate, torch, stats)
     sync = torch.cuda.synchronize
     V = ft.tc.codec_eos_token_id
 
@@ -126,7 +184,7 @@ def main():  # pragma: no cover - GPU, talker env
                "text_ids": len(g.ids), "first_audio_ms": round((g.first_audio_ns - g.t_start_ns) / 1e6, 1)
                if g.first_audio_ns else None}
         stats["segments"].append(rec)
-        emit({"ev": "done", **rec, "t_ns": time.monotonic_ns()})
+        emit({"ev": "done", **rec, "t_ns": time.monotonic_ns(), "codes": g.codes})
         pending.remove(g)
         by_key.pop((g.epoch, g.turn, g.seg), None)
 
