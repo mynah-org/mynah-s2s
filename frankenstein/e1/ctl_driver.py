@@ -259,7 +259,7 @@ class CtlDriver:
                 self._history(t, a.reason)
         elif a.kind == "CANCEL":
             self.reply_bos_needed = False
-            self.adapter.cancel(t, a.reason)
+            self.adapter.cancel(t, a.reason, audible=bool(self.audible()) if self.audible is not None else False)
             self.worker.cancel(self.active_rid)
             self.queue, self.close_pending, self.pending_bos = [], False, False
             if getattr(self, "text_closed", False):     # barge-in on the audio tail: the text is already in history

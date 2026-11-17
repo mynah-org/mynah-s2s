@@ -265,3 +265,13 @@ def test_decode_required_for_token_input():
     a.feed(Frame(0, 1))
     with pytest.raises(RuntimeError):
         a.feed(Frame(1, 1234))
+
+
+def test_cancel_while_only_audible_still_flushes_playback():
+    from frankenstein_s2s.adapter import TalkerAdapter
+    from frankenstein_s2s.driver import FakeTalkerDriver, PlaybackGate
+    drv, gate = FakeTalkerDriver(), PlaybackGate()
+    ad = TalkerAdapter([drv, gate], decode=lambda ids: "")
+    assert ad.cancel(5, "barge_in") is False                       # idle and silent: nothing to do
+    assert ad.cancel(6, "barge_in", audible=True) is True           # generation over, audio still playing
+    assert gate.epoch == 1 and any(type(c).__name__ == "Cancel" for c in ad.commands)

@@ -250,7 +250,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     for a in d.ctl.actions:
         if a.kind == "CANCEL" and a.reason == "barge_in":
             onset = max((u for u in tl if u["start_k"] <= a.k), key=lambda u: u["start_k"], default=None)
-            cut = next((c for c in player.cuts if c["t"] >= frame_k_t.get(a.k, 0) - 0.5), None)
+            # the playback cut of THIS cancel (same frame); none if no Cancel reached the player (G5 U2)
+            cut = next((c for c in player.cuts if abs(c["t"] - frame_k_t.get(a.k, -1e9)) < 1.0), None)
             t_proc_onset = frame_k_t.get(onset["start_k"]) if onset else None
             barge.append({"k": a.k, "utt": onset["label"] if onset else None,
                           "onset_to_cancel_frames": a.k - onset["start_k"] if onset else None,
