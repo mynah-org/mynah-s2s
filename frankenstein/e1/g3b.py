@@ -110,13 +110,9 @@ def main():  # pragma: no cover - GPU
     timer._wrap(w.model.stt_model, "forward", "thinker_b1")
     timer._wrap(w, "_rnnt_step", "rnnt")
     listen = Path(a.listen_dir)
-    arms = [("B", True)]
     res["arms"] = {}
-    for arm, reactive in (("B", True), ("A", False)):
-        if arm == "A" and left() < a.arm_a_min_left_s:
-            res["arms"]["A"] = {"status": "INCOMPLETE", "why": f"time left {left():.0f} s < {a.arm_a_min_left_s}"}
-            print("ARM A SKIPPED", res["arms"]["A"], flush=True)
-            break
+
+    def run_arm(arm, reactive):
         live.reset(window_s=12.0, every=8)
         t0 = time.monotonic()
         r = g0_session.run(out, f"g3b_{arm}", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), 52.0,
@@ -132,42 +128,52 @@ def main():  # pragma: no cover - GPU
         print(f"ARM {arm} PLAYBACK", json.dumps({k: v for k, v in g["playback"].items() if k != "gap_list"},
                                                 default=str)[:1200], flush=True)
         print(f"ARM {arm} TALKER", json.dumps({k: g["talker"][k] for k in ("step_ms", "decode_ms")}), flush=True)
-        arms.append(arm)
-    proc.close()
-    # ---------------------------------------------------------------- content: offline evaluation ASR
-    items = out / "asr_items"
-    refs = {}
-    for name, run in (("G0", Path(a.g0_it)), ("G3", Path(a.g3_it)), ("G3bB", out / "g3b_B"), ("G3bA", out / "g3b_A")):
-        if (run / "summary.json").exists() and (run / "talker.jsonl").exists():
-            refs.update(build_items(run, items, name))
-    (out / "asr_refs.json").write_text(json.dumps(refs, indent=1, ensure_ascii=False))
-    if left() < a.omni_min_left_s:
-        res["content"] = {"status": "INCOMPLETE", "why": f"time left {left():.0f} s"}
+
+    def content(tag):
+        items = out / f"asr_items_{tag}"
+        refs = {}
+        for name, run in (("G0", Path(a.g0_it)), ("G3", Path(a.g3_it)), ("G3bB", out / "g3b_B"),
+                          ("G3bA", out / "g3b_A")):
+            if (run / "summary.json").exists() and (run / "talker.jsonl").exists() and \
+                    not any(k.startswith(name + "_t") for k in res.get("content_done", [])):
+                refs.update(build_items(run, items, name))
+        if not refs:
+            return
+        (out / f"asr_refs_{tag}.json").write_text(json.dumps(refs, indent=1, ensure_ascii=False))
+        if left() < a.omni_min_left_s:
+            res[f"content_{tag}"] = {"status": "INCOMPLETE", "why": f"time left {left():.0f} s"}
+            save()
+            print("CONTENT SKIPPED", tag, res[f"content_{tag}"], flush=True)
+            return
+        oenv = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        oenv["FAIRSEQ2_CACHE_DIR"] = a.omni_cache
+        try:
+            p = subprocess.run([a.omni_python, a.omni_script, str(items)], env=oenv, capture_output=True, text=True,
+                               timeout=max(30, left() - 10))
+            (out / f"asr_eval_{tag}.log").write_text(p.stdout[-20000:] + "\n" + p.stderr[-20000:])
+            ok = p.returncode == 0
+        except subprocess.TimeoutExpired:
+            ok = False
+        if not ok:
+            res[f"content_{tag}"] = {"status": "INCOMPLETE", "why": "evaluation ASR failed or timed out"}
+        else:
+            sc = score_items(items, refs)
+            (out / f"content_score_{tag}.json").write_text(json.dumps(sc, indent=1, ensure_ascii=False))
+            res[f"content_{tag}"] = {"status": "DONE", **{k: v for k, v in sc.items() if k != "items"}}
+            res.setdefault("content_done", []).extend(refs)
         save()
-        print("CONTENT SKIPPED", res["content"], flush=True)
-        return
-    del eng, m                                              # the evaluation ASR runs in its own process
-    import gc
-    import torch
-    gc.collect()
-    torch.cuda.empty_cache()
-    oenv = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    oenv["FAIRSEQ2_CACHE_DIR"] = a.omni_cache
-    try:
-        p = subprocess.run([a.omni_python, a.omni_script, str(items)], env=oenv, capture_output=True, text=True,
-                           timeout=max(30, left() - 15))
-        (out / "asr_eval.log").write_text(p.stdout[-20000:] + "\n" + p.stderr[-20000:])
-        ok = p.returncode == 0
-    except subprocess.TimeoutExpired:
-        ok = False
-    if not ok:
-        res["content"] = {"status": "INCOMPLETE", "why": "evaluation ASR failed or timed out (asr_eval.log)"}
+        print("CONTENT", tag, json.dumps(res[f"content_{tag}"])[:1500], flush=True)
+
+    run_arm("B", True)                                   # owner: B first
+    content("1")                                         # then the content check (G0, G3, G3b-B)
+    if left() >= a.arm_a_min_left_s:
+        run_arm("A", False)
+        content("2")                                     # A's turns, if time is left
     else:
-        sc = score_items(items, refs)
-        (out / "content_score.json").write_text(json.dumps(sc, indent=1, ensure_ascii=False))
-        res["content"] = {"status": "DONE", **{k: v for k, v in sc.items() if k != "items"}}
-    save()
-    print("CONTENT", json.dumps(res["content"])[:1500], flush=True)
+        res["arms"]["A"] = {"status": "INCOMPLETE", "why": f"time left {left():.0f} s < {a.arm_a_min_left_s}"}
+        save()
+        print("ARM A SKIPPED", res["arms"]["A"], flush=True)
+    proc.close()
 
 
 if __name__ == "__main__":
