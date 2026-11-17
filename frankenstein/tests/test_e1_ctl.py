@@ -92,7 +92,8 @@ def test_fragment_merged_into_a_new_request_and_old_tokens_stale():
     asr = {"words": [{"k": 10, "word": "vorrei"}, {"k": 30, "word": "sapere"}],
            "pieces": {"8": ["▁vorrei"], "29": ["▁sapere"]}, "nonblank": [8, 9, 29], "eou": []}
     model = [T.PAD_ID] * 20 + [T.BOS_ID] + [T.PAD_ID] * 40
-    d, wk, ad, tr, ids, g = rig(asr, model, {1: [" Uno", " due", " tre", "."], 2: [" Si", "."]}, delay=12)
+    d, wk, ad, tr, ids, g = rig(asr, model, {1: [" Uno", " due", " tre", "."], 2: [" Si", "."]}, delay=12,
+                                cfg=ControllerConfig(reply_timeout=100, barge_in_frames=4))
     reqs = [a for a in d.ctl.actions if a.kind == "REQUEST_REPLY"]
     assert [a.data.get("supersedes") for a in reqs] == [None, 1] and 1 in wk.cancelled
     assert wk.submitted[1][1] == "vorrei sapere"
@@ -104,8 +105,8 @@ def test_fragment_merged_into_a_new_request_and_old_tokens_stale():
 
 def test_controller_cancel_reaches_adapter_and_worker():
     asr = {"words": [{"k": 4, "word": "ciao"}, {"k": 40, "word": "aspetta"}],
-           "pieces": {"3": ["▁ciao"], "37": ["▁asp"], "40": ["▁etta"]},
-           "nonblank": [3, 4, 18, 19, 20, 21, 22], "eou": [14]}
+           "pieces": {"3": ["▁ciao"], "18": ["▁asp"], "19": ["et"], "20": ["ta"]},
+           "nonblank": [], "eou": [14]}
     model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * 40
     d, wk, ad, tr, ids, g = rig(asr, model, {1: [" a", " b", " c", " d", " e", " f", " g", " h", " i", " l", "."]},
                                 cfg=ControllerConfig(reply_timeout=100, barge_guard=6))
@@ -149,3 +150,31 @@ def test_open_word_alone_defers_the_take_turn():
     d, *_ = rig(asr, model, {1: [" Si", "."]})
     acts = [(a.k, a.kind, a.reason) for a in d.ctl.actions]
     assert (15, "DEFER", "asr_word_open") in acts and any(a[1] == "OPEN_TURN" and a[0] >= 20 for a in acts)
+
+
+# e1j U4 (frames as recorded): caller words until 602, the reply opened at 607 (Thinker BOS), then a late
+# punctuation + language-tag emission at 611 made a 3-frame "speech" run and a FALSE barge-in at 613.
+U4 = {"words": [{"k": 597, "word": "numero"}, {"k": 605, "word": "d'ordine"}],
+      "pieces": {"594": ["▁nu"], "595": ["me", "ro"], "597": ["▁", "d", "'"], "599": ["ord"], "601": ["in"],
+                 "602": ["e"], "611": [".", "▁", "<it-IT>"]},
+      "nonblank": [594, 595, 596, 597, 598, 599, 600, 601, 602, 603, 604, 611, 612, 613], "eou": [623]}
+
+
+def test_e1j_u4_late_punctuation_is_not_a_barge_in():
+    model = [T.PAD_ID] * 607 + [T.BOS_ID] + [T.PAD_ID] * 30
+    reply = [" Mi", " serve", " il", " nome", " e", " il", " CAP", ".", " Grazie", "."]
+    d, wk, ad, tr, ids, g = rig(U4, model, {1: reply},
+                                cfg=ControllerConfig(reply_timeout=100, barge_after_open=True, eou_fallback=False))
+    assert "CANCEL" not in [a.kind for a in d.ctl.actions]
+    assert "".join(c.text for c in ad.commands if hasattr(c, "text")) == "Mi serve il nome e il CAP. Grazie."
+
+
+def test_true_barge_in_after_open_still_cancels():
+    asr = {"words": [{"k": 4, "word": "ciao"}, {"k": 22, "word": "aspetta"}],
+           "pieces": {"3": ["▁ciao"], "18": ["▁asp"], "19": ["et"], "20": ["ta"]},
+           "nonblank": [], "eou": [14]}
+    model = [T.PAD_ID] * 10 + [T.BOS_ID] + [T.PAD_ID] * 30
+    d, wk, ad, tr, ids, g = rig(asr, model, {1: [" a", " b", " c", " d", " e", " f", " g", " h", " i", " l", "."]},
+                                cfg=ControllerConfig(reply_timeout=100, barge_after_open=True))
+    c = [a for a in d.ctl.actions if a.kind == "CANCEL"]
+    assert c and c[0].k == 20 and c[0].reason == "barge_in"          # 18, 19, 20: three lexical frames

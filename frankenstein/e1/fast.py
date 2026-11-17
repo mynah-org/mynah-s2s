@@ -44,6 +44,10 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--int4-thinker", action="store_true")
     ap.add_argument("--int4-nano", action="store_true")
     ap.add_argument("--ctl", action="store_true", help="E1j: controller-driven session(s) instead of the hook")
+    ap.add_argument("--reuse", action="store_true", help="E1k: Nano KV/SSM reuse across decision -> call -> reply")
+    ap.add_argument("--microbench-int4", action="store_true", help="E1k: INT4 linear micro-bench (M=800, M=1)")
+    ap.add_argument("--reuse-check", action="store_true", help="E1k: reuse vs no-reuse on one tool prompt first")
+    ap.add_argument("--int4-dispatch", action="store_true", help="E1k: the INT4 Nano variant uses Int4Dispatch")
     ap.add_argument("--int4-nano-variant-after-s", type=float, default=0.0,
                     help="E1j: after the bf16 session, quantize Nano INT4 and rerun if the job is younger than this")
     ap.add_argument("--debug-first", action="store_true", help="E1h: check the worker decode against no-cache greedy "
@@ -123,20 +127,35 @@ def main():  # pragma: no cover - GPU
     timer._wrap(w.model.stt_model, "forward", "thinker_b1")
     timer._wrap(w, "_rnnt_step", "rnnt")
 
+    if a.microbench_int4:
+        mb = int4_microbench(m)
+        (out / "int4_microbench.json").write_text(json.dumps(mb, indent=1))
+        print("MICROBENCH", json.dumps(mb), flush=True)
+    if a.reuse_check:
+        rc = reuse_check(tok, m, spec, POLICY["it"], lab, tool_schemas)
+        (out / "reuse_check.json").write_text(json.dumps(rc, indent=1, ensure_ascii=False))
+        print("REUSE_CHECK", json.dumps({k: v for k, v in rc.items() if k != "runs"}, ensure_ascii=False), flush=True)
+        a.reuse = a.reuse and rc["same_call"] and rc["same_decision"]
+        print("REUSE in session:", a.reuse, flush=True)
     if a.ctl:
         from e1 import ctl_session
         res = ctl_session.run(out, "ctl_bf16", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), a.cut_s,
-                              lab / "agentbench", tool_schemas, timer=timer)
+                              lab / "agentbench", tool_schemas, timer=timer, reuse=a.reuse)
         print("SPEED ctl_bf16", json.dumps(res["speed"], default=str)[:1500], flush=True)
         el = time.monotonic() - T_START
         if a.int4_nano_variant_after_s and el < a.int4_nano_variant_after_s:
-            from mynah_v2.model.quant import quantize_thinker_int4
-            shim = SimpleNamespace(wrapper=SimpleNamespace(model=SimpleNamespace(stt_model=SimpleNamespace(llm=m.backbone))))
             t0 = time.monotonic()
-            qi = quantize_thinker_int4(shim)
+            if a.int4_dispatch:
+                from e1.int4_dispatch import quantize_int4_dispatch
+                qi = quantize_int4_dispatch(m.backbone)
+            else:
+                from mynah_v2.model.quant import quantize_thinker_int4
+                shim = SimpleNamespace(wrapper=SimpleNamespace(model=SimpleNamespace(stt_model=SimpleNamespace(llm=m.backbone))))
+                qi = quantize_thinker_int4(shim)
+            qi["mem_after_gb"] = round(mem_available_gb(), 1)
             print("INT4 nano", json.dumps(qi), round(time.monotonic() - t0, 1), "s", flush=True)
             res2 = ctl_session.run(out, "ctl_int4nano", eng, tok, m, spec, POLICY["it"], Path(a.asr_dir), a.cut_s,
-                                   lab / "agentbench", tool_schemas, timer=timer)
+                                   lab / "agentbench", tool_schemas, timer=timer, reuse=a.reuse)
             print("SPEED ctl_int4nano", json.dumps(res2["speed"], default=str)[:1500], flush=True)
         else:
             print("SKIP int4 nano variant, elapsed", round(el), flush=True)
@@ -157,6 +176,92 @@ def main():  # pragma: no cover - GPU
             "async": rec["async"], "loads": {k: v for k, v in info.items() if k.endswith(("_s", "_gb"))}}
     (out / "speed.json").write_text(json.dumps(summ, indent=1, default=str))
     print("SPEED", json.dumps(summ, default=str)[:3000], flush=True)
+
+
+def int4_microbench(m) -> dict:  # pragma: no cover - GPU
+    """One large Nano linear: bf16 vs V2 Int4Linear vs Int4Dispatch, M=800 (prefill) and M=1 (decode)."""
+    import torch
+    import torch.nn.functional as F
+    from mynah_v2.model.quant import Int4Linear
+    from e1.int4_dispatch import Int4Dispatch, _nibbles
+    lin = None
+    for layer in m.backbone.layers:
+        for name in ("up_proj", "in_proj"):
+            mod = getattr(getattr(layer, "mixer", None), name, None)
+            if isinstance(mod, torch.nn.Linear) and (lin is None or mod.weight.numel() > lin.weight.numel()):
+                lin = mod
+    q4 = Int4Linear(lin, max_group=128, clip=False)
+    d = Int4Dispatch(q4, _nibbles(lin.weight.data.to(torch.bfloat16), q4.group), {})
+    deq = d.dequant().float().clone()
+
+    def bench(fn, x, n=20):
+        for _ in range(3):
+            fn(x)
+        torch.cuda.synchronize()
+        ts = []
+        for _ in range(n):
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            fn(x)
+            e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1))
+        return round(sorted(ts)[len(ts) // 2], 3)
+    res = {"shape": list(lin.weight.shape), "group": q4.group}
+    with torch.inference_mode():
+        for M in (800, 1):
+            x = torch.randn(1, M, lin.in_features, device="cuda", dtype=torch.bfloat16)
+            ref = x.float() @ deq.t()
+            y_b = F.linear(x, lin.weight)
+            y_o = q4(x)
+            y_d = d(x)
+            res[f"M{M}"] = {"bf16_ms": bench(lambda z: F.linear(z, lin.weight), x), "int4_old_ms": bench(q4, x),
+                            "int4_dispatch_ms": bench(d, x),
+                            "maxdiff_old_vs_ref": round(float((y_o.float() - ref).abs().max()), 4),
+                            "maxdiff_dispatch_vs_ref": round(float((y_d.float() - ref).abs().max()), 4),
+                            "maxdiff_bf16_vs_ref": round(float((y_b.float() - ref).abs().max()), 4),
+                            "ref_absmax": round(float(ref.abs().max()), 3),
+                            "dispatch_equals_old": bool(torch.equal(y_d, y_o))}
+    del q4, d
+    torch.cuda.empty_cache()
+    return res
+
+
+def reuse_check(tok, m, spec, policy_it, lab, tool_schemas) -> dict:  # pragma: no cover - GPU
+    """One tool turn served with and without the KV/SSM reuse (sequential, default stream): same decision / call?"""
+    import llm_text_bench as B2
+    from mynah_v2.agent.tools import ToolRegistry
+    from tenant_backend import TenantBackend
+    from e1.nano_worker import NanoWorker
+    msgs = [{"role": "assistant", "content": "Ciao! Come posso aiutarti oggi?"},
+            {"role": "user", "content": "Buongiorno, vorrei sapere quando arriva il mio ordine. Mi chiamo Mario Rossi e "
+                                        "il mio CAP è 10121"}]
+    runs = {}
+    for reuse in (False, True):
+        said = []
+        be = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
+        be._said = said
+        reg = ToolRegistry()
+        for t in spec["tools"]:
+            reg.register(t["name"], be.handlers()[t["name"]], t["description"], t["parameters"])
+        bound = reg.bind(__import__("mynah_v2.agent.tools", fromlist=["ToolLedger"]).ToolLedger("rc", None),
+                         lambda: 0, lambda: None, timeout_s=None)
+        wk = NanoWorker(tok, m, spec["system_prompt"] + "\n" + policy_it + " /no_think", tool_schemas(reg), bound, be,
+                        B2.parse_toolcall, max_new=60, tool_step=True, reuse=reuse)
+        t0 = time.monotonic()
+        wk._serve_job(1, [dict(x) for x in msgs], time.monotonic_ns())
+        ev = wk.poll()
+        done = [e for e in ev if e[0] == "done"][0]
+        first = next((e[3] for e in ev if e[0] == "tok"), None)
+        runs[str(reuse)] = {"text": done[2], "calls": [e[2]["name"] + json.dumps(e[2]["args"]) for e in ev if e[0] == "tool"],
+                            "info": done[4], "wall_ms": round((time.monotonic() - t0) * 1e3, 1),
+                            "first_tok_ms": round((first - done[4]["t_start_ns"]) / 1e6, 1) if first else None}
+    a_, b_ = runs["False"], runs["True"]
+    dec = lambda r: [s.get("out") for s in r["info"]["steps"] if s["step"] == "decide"]   # noqa: E731
+    return {"same_decision": dec(a_) == dec(b_), "same_call": a_["calls"] == b_["calls"],
+            "same_reply": a_["text"] == b_["text"], "first_tok_ms": {"no_reuse": a_["first_tok_ms"],
+                                                                     "reuse": b_["first_tok_ms"]},
+            "wall_ms": {"no_reuse": a_["wall_ms"], "reuse": b_["wall_ms"]}, "runs": runs}
 
 
 if __name__ == "__main__":

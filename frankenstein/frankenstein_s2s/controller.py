@@ -91,6 +91,8 @@ class ControllerConfig:
                                    # are merged into a NEW request that supersedes the pending one
     barge_guard: int = 0           # user speech counts for barge-in only from this many frames after the turn opened
                                    # (the ASR tail of the words just spoken is not a barge-in)
+    barge_after_open: bool = False # E1k: only a speech run that STARTS after the turn opened can be a barge-in (a run
+                                   # that began before the open is the tail of the caller's own turn)
 
 
 class Controller:
@@ -107,6 +109,7 @@ class Controller:
         self.actions: list = []
         self.calls: dict = {}            # call_id -> status
         self.speech_run = 0
+        self.run_start_k = None
         self.last_speech_k = -10 ** 9
         self.heard_since_turn = False
         self.deferred: Optional[Intent] = None
@@ -204,8 +207,12 @@ class Controller:
 
     def _on_user_speech(self, it, k):
         self.speech_run += 1
+        if self.speech_run == 1:
+            self.run_start_k = it.k
         self.last_speech_k = it.k
-        if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT) and \
+        started_after = (not self.cfg.barge_after_open or self.opened_k is None or
+                         (self.run_start_k is not None and self.run_start_k > self.opened_k))
+        if self.state in (St.PENDING, St.SPEAKING, St.TOOL_WAIT) and started_after and \
                 (self.opened_k is None or it.k - self.opened_k >= self.cfg.barge_guard):
             if self.speech_run >= self.cfg.barge_in_frames:
                 self._cancel(k, "barge_in")

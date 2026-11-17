@@ -8,8 +8,23 @@ import time
 from pathlib import Path
 
 
+def _spoken_turns(ad, tok) -> list:
+    """The text the talker adapter received, per agent turn (to compare with the text LLM's output)."""
+    turns, cur = [], None
+    for c in ad.commands:
+        n = type(c).__name__
+        if n == "StartSegment":
+            if cur is None or c.turn != cur["turn"]:
+                cur = {"turn": c.turn, "text": ""}
+                turns.append(cur)
+            cur["text"] += (" " if cur["text"] else "") + c.text
+        elif n == "AppendText" and cur is not None:
+            cur["text"] += c.text
+    return turns
+
+
 def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir: Path, cut_s: float,
-        lab_agentbench: Path, tool_schemas, timer=None) -> dict:  # pragma: no cover - GPU
+        lab_agentbench: Path, tool_schemas, timer=None, reuse: bool = False) -> dict:  # pragma: no cover - GPU
     import sys
     sys.path.insert(0, str(lab_agentbench))
     from m0_runner import load_16k, render_prompt, set_model_cfg
@@ -43,7 +58,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=None)
     duplex_prompt = render_prompt(reg.schemas, with_language(spec["system_prompt"], L))
     system = spec["system_prompt"] + "\n" + policy_it + " /no_think"
-    worker = NanoWorker(tok, model, system, tool_schemas(reg), bound, backend, None, max_new=80, tool_step=True)
+    worker = NanoWorker(tok, model, system, tool_schemas(reg), bound, backend, None, max_new=80, tool_step=True,
+                        reuse=reuse)
     import llm_text_bench as B2
     worker.parse = B2.parse_toolcall
     worker.start()
@@ -52,7 +68,7 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     ad = TalkerAdapter([drv, gate], decode=lambda ids: tok.decode(ids),
                        config=AdapterConfig(talker_lang=L.talker_lang, barge_in="thinker"), tracer=ftr)
     ctl = Controller(ControllerConfig(min_blank=2, debounce=8, reply_timeout=100, tool_timeout=150, merge_frames=12,
-                                      barge_guard=6, barge_in_frames=3), tracer=ftr)
+                                      barge_guard=6, barge_in_frames=3, barge_after_open=True), tracer=ftr)
     frames, blog = FrameLog(od / "frames.jsonl"), FrameLog(od / "brain.jsonl")
     seed_all()
     d = CtlDriver(w, worker, tok, asr, ad, ftr, frames, blog, ctl)
@@ -79,7 +95,8 @@ def run(out: Path, od_name: str, eng, tok, model, spec, policy_it: str, asr_dir:
     rec = dict(d.summary(), arm=od_name, lang="it", cut_s=cut_s, calls=worker.calls, backend_audit=backend.audit,
                ledger=[{"name": c.name, "status": c.status.value} for c in led.calls.values()],
                adapter=adapter_summary(ad, gate), wall_s=round(time.monotonic() - t0, 1),
-               comp_timer=timer.report() if timer is not None else None, worker_alive_after_close=worker.is_alive())
+               comp_timer=timer.report() if timer is not None else None, worker_alive_after_close=worker.is_alive(),
+               spoken_turns=_spoken_turns(ad, tok), reuse=reuse)
     ftr.close()
     (od / "summary.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False, default=str))
     fr = [json.loads(x) for x in open(od / "frames.jsonl")]

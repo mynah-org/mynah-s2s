@@ -36,7 +36,12 @@ class CtlDriver:
         self.words_at: dict = {}
         for wd in asr["words"]:
             self.words_at.setdefault(int(wd["k"]), []).append(wd["word"])
-        self.nonblank = set(asr["nonblank"])
+        # speech evidence = LEXICAL ASR activity (E1k): a piece with a letter or digit in the last 3 frames.
+        # Punctuation / space / language-tag emissions come late after the caller stopped (e1j: '.' '<it-IT>' at
+        # frame 611, 13 frames after the end of U4) and are not speech.
+        lex = sorted(k for k, v in self.pieces.items() if any(ch.isalnum() for p in v for ch in p))
+        lexset = set(lex)
+        self.nonblank = {k for k in range(0, (max(lex) + 3) if lex else 0) if any(j in lexset for j in (k, k - 1, k - 2))}
         self.eou = set(asr["eou"])
         self.messages: list = []
         self.base_k = -1                 # caller text of the current turn = pieces in (base_k, k]
