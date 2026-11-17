@@ -5,6 +5,8 @@ Interface used by the per-frame hook (non-blocking):
   submit(rid, messages)   queue a request (a copy of the history is taken)
   cancel(rid)             stop decoding that request as soon as possible (epoch: its tokens become stale)
   poll() -> [events]      ("tok", rid, id, t_ns) | ("tool", rid, call dict) | ("done", rid, text, new_messages, info)
+The worker runs on the DEFAULT CUDA stream (see the note in __init__): kernels of the Thinker and of Nano
+interleave on one stream, each thread's own ops stay in order.
 Per request: an explicit tool step (call-or-reply question on a copy, 3 tokens), on "call" the call text with the
 <TOOLCALL>[ prefix forced, the call executed through the real handlers (V2 ToolRegistry / ToolLedger), then the reply.
 Cache: the V2 hybrid-cache fix (mynah_v2.model.llm_cache) applied to the Nano backbone instance; each generation
@@ -48,7 +50,11 @@ class NanoWorker(threading.Thread):
         self.q_out: queue.Queue = queue.Queue()
         self.cancelled: set = set()
         self.calls: list = []
-        self.stream = torch.cuda.Stream()
+        # NO private CUDA stream (E1h): the NemotronH remote code runs every block inside
+        # torch.cuda.stream(torch.cuda.default_stream(...)) (modeling_nemotron_h.py:767), so on a side stream the
+        # block kernels and our embedding / attention-cache / lm_head ops ran on two streams without ordering; the
+        # decode diverged from token 1. On the default stream the cached decode equals the no-cache greedy ids.
+        self.stream = None
         self.stop_flag = False
 
     # ------------------------------------------------------------------ API (frame-loop thread)
@@ -80,7 +86,7 @@ class NanoWorker(threading.Thread):
                 break
             rid, msgs, t_req = job
             try:
-                with torch.cuda.stream(self.stream), torch.inference_mode():
+                with torch.inference_mode():
                     self._serve(rid, msgs, t_req)
             except Exception as e:  # noqa: BLE001 - a failed request must not kill the worker
                 self.q_out.put(("done", rid, "", [], {"error": repr(e)}))

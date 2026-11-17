@@ -53,8 +53,7 @@ def run_debug(tok, m, eng, system, tools, n: int = 20) -> dict:  # pragma: no co
     box = {}
 
     def th():
-        with torch.cuda.stream(wk.stream), torch.inference_mode():
-            box["r"] = inc()
+        box["r"] = _in_stream(wk, inc)
     t = threading.Thread(target=th)
     t.start()
     t.join()
@@ -89,6 +88,8 @@ def run_debug(tok, m, eng, system, tools, n: int = 20) -> dict:  # pragma: no co
 
 
 def _in_stream(wk, fn):
+    import contextlib
     import torch
-    with torch.cuda.stream(wk.stream), torch.inference_mode():
+    ctx = torch.cuda.stream(wk.stream) if wk.stream is not None else contextlib.nullcontext()
+    with ctx, torch.inference_mode():
         return fn()
