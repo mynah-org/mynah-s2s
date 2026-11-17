@@ -33,12 +33,13 @@ def is_tag(p: str) -> bool:
 class ASRPost:
     """Pieces at frame k -> closed words, ASR activity, EOU (asr_track.py rules, incremental)."""
 
-    def __init__(self, close_after: int = 3, eou_frames: int = 10, bou_frames: int = 3):
+    def __init__(self, close_after: int = 3, eou_frames: int = 10, bou_frames: int = 3, smooth: int = 3):
         self.words: list = []
         self.sched = UserTextScheduler(lambda w: [1000], close_after=close_after,
                                        on_close=lambda k, w, ids: self.words.append({"k": k, "word": w}))
         self.tt = TurnTaker(eou_frames=eou_frames, bou_frames=bou_frames)
         self.raw: set = set()
+        self.smooth = smooth            # activity = a piece in the last `smooth` frames (>= the ASR stride, G3)
 
     def step(self, k: int, pieces: list) -> dict:
         n0 = len(self.words)
@@ -47,7 +48,7 @@ class ASRPost:
             self.raw.add(k)
         self.sched.on_asr(k, pieces)
         self.sched.step(k)
-        nb = any(j in self.raw for j in (k, k - 1, k - 2))
+        nb = any(j in self.raw for j in range(k - self.smooth + 1, k + 1))
         eou = False
         for ev in self.tt.step(k, nb):
             if ev == "eou":
@@ -92,7 +93,9 @@ class LiveASR:  # pragma: no cover - GPU
         self._fresh()
         # pieces arrive in 4-frame batches: a word may only close after a gap longer than one chunk (G0: with
         # close_after 3 words were split at chunk boundaries, "diva no", "ave te")
-        self.post = ASRPost(close_after=self.every + 1)
+        # G3: with a stride of 8 frames the 3-frame activity window had 5-frame holes inside speech: a false end of
+        # utterance opened a turn mid-sentence (frame 139 of U1) and the caller's next words cancelled it
+        self.post = ASRPost(close_after=self.every + 1, smooth=max(3, self.every))
         self.stats = {"calls": 0, "ms": [], "frames": 0, "resets": 0}
         self.per_frame: dict = {}                  # model frame k -> pieces (incl. tags), for the record
 
@@ -151,7 +154,7 @@ class LiveASR:  # pragma: no cover - GPU
             self.every = max(self.chunk, every // self.chunk * self.chunk)
         self.done_frames = 0
         self._fresh()
-        self.post = ASRPost(close_after=self.every + 1)
+        self.post = ASRPost(close_after=self.every + 1, smooth=max(3, self.every))
         self.stats = {"calls": 0, "ms": [], "frames": 0, "resets": 0}
         self.per_frame = {}
 

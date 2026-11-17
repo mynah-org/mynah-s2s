@@ -155,7 +155,8 @@ class CtlDriver:
             self.pieces[t] = list(ev["pieces"])
             if any(ch.isalnum() for p in ev["pieces"] for ch in p):
                 self.lex_live.add(t)
-        if any(j in self.lex_live for j in (t, t - 1, t - 2)):
+        n = max(3, getattr(self.live, "every", 3))      # smoothing >= the ASR stride (G3)
+        if any(j in self.lex_live for j in range(t - n + 1, t + 1)):
             self.nonblank.add(t)
         for w in ev["words"]:
             self.words_at.setdefault(t, []).append(w)

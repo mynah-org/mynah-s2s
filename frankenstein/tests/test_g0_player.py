@@ -52,3 +52,11 @@ def test_asr_post_words_activity_and_eou():
     assert words and words[0][1] == "ciao"
     assert evs[0]["active"] and evs[2]["active"] and not evs[4]["active"]
     assert any(e["eou"] for e in evs)
+
+
+def test_asr_post_stride_8_has_no_activity_holes_and_no_false_eou():
+    post = ASRPost(close_after=9, eou_frames=10, bou_frames=3, smooth=8)
+    pieces = {k: ["▁pa", "ro", "la"] for k in range(8, 80, 8)}          # speech, one batch every 8 frames
+    evs = [post.step(k, pieces.get(k, [])) for k in range(0, 100)]
+    assert all(e["active"] for e in evs[8:80]) and not any(e["eou"] for e in evs[:80])
+    assert any(e["eou"] for e in evs[80:])
