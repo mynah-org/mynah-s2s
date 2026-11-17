@@ -95,6 +95,7 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--clone", action="append", default=[], help="NAME=reference.wav (selectable voice)")
     ap.add_argument("--max-session-s", type=float, default=1200.0)
     ap.add_argument("--idle-timeout", type=float, default=60.0)
+    ap.add_argument("--no-gpu-gate", action="store_true", help="do not time-slice frames and text-LLM work (G7)")
     a = ap.parse_args()
     lab = Path(a.lab_scripts)
     sys.path.insert(0, str(lab / "multilingual"))
@@ -143,8 +144,12 @@ def main():  # pragma: no cover - GPU
     loads["mem_after_all_gb"] = round(mem_available_gb(), 1)
     spec = json.load(open(lab / "agentbench" / "tenant_furniture.json"))
     brief = {"it": BRIEF_IT, "en": "Answer as on a phone call: at most two short sentences, no lists, no markdown."}
+    gate = None
+    if not a.no_gpu_gate:
+        from e1.gpu_gate import GpuGate
+        gate = GpuGate(sync=torch.cuda.synchronize)
     eng = FrankensteinEngine(ref, tok, nano, spec, live, proc, lab / "agentbench", POLICY, brief,
-                             max_session_s=a.max_session_s)
+                             max_session_s=a.max_session_s, gate=gate)
     cfg = ServerConfig(host=a.host, port=a.port, trace_dir=str(td), idle_timeout_s=a.idle_timeout)
     cfg.backend_profile = "frankenstein-int4"
     srv = make_server(eng, cfg)

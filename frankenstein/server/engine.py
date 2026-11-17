@@ -115,12 +115,14 @@ class _NullLog:
 
 class FrankensteinEngine:  # pragma: no cover - GPU (the model-free parts are tested separately)
     def __init__(self, ref, tok, nano, spec, live, proc, lab_agentbench, policy: dict, brief: dict,
-                 nano_graph=None, max_session_s: float = 1200.0, ids_per_frame: int = 8, holding: bool = True):
+                 nano_graph=None, max_session_s: float = 1200.0, ids_per_frame: int = 8, holding: bool = True,
+                 gate=None):
         import torch
         self.torch = torch
         self.ref, self.tok, self.nano, self.spec, self.live, self.proc = ref, tok, nano, spec, live, proc
         self.lab_agentbench, self.policy, self.brief = lab_agentbench, policy, brief
         self.nano_graph, self.ids_per_frame, self.holding = nano_graph, ids_per_frame, holding
+        self.gate = gate                       # G7 GpuGate: frames and text-LLM units alternate on the GPU
         self.chunk_samples = ref.chunk_samples
         self.max_samples = int(max_session_s * 16000)
         self.buf = torch.zeros(self.max_samples)
@@ -184,7 +186,7 @@ class FrankensteinEngine:  # pragma: no cover - GPU (the model-free parts are te
         system = with_language(base, L) + "\n" + policy + "\n" + self.brief.get(L.code, self.brief["en"]) + " /no_think"
         worker = NanoWorker(self.tok, self.nano, system, tool_schemas(reg), bound, backend, B2.parse_toolcall,
                             max_new=60, tool_step=True, constrained=True)
-        worker.reply_soft_cap, worker.graph = 24, self.nano_graph
+        worker.reply_soft_cap, worker.graph, worker.gate = 24, self.nano_graph, self.gate
         worker.start()
         out = _Out()
         player = Player(sr=TALKER_SR, prebuffer_s=0.0)
@@ -256,7 +258,11 @@ class FrankensteinEngine:  # pragma: no cover - GPU (the model-free parts are te
         s["pos"] += pcm16k.numel()
         n_words = sum(len(v) for v in s["d"].words_at.values())
         n_spoken = len(s["d"].handed)
-        r = self.ref.step(pcm16k, is_last=is_last)
+        if self.gate is not None:
+            with self.gate.frame():
+                r = self.ref.step(pcm16k, is_last=is_last)
+        else:
+            r = self.ref.step(pcm16k, is_last=is_last)
         d = s["d"]
         new_ids = d.handed[n_spoken:]
         text_delta = self.tok.decode(new_ids) if new_ids else ""
