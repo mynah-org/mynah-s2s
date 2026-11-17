@@ -99,7 +99,8 @@ class M1Force:
         self.n_hook = 0
         self.cache_checks: list = []
         self.fc_suppressed: list = []
-        self.mismatch: list = []
+        self.mismatch: list = []       # frames where the ORIGINAL wrapper logic changed the id we wrote
+        self.gaps: list = []           # hook calls that were not consecutive frames
         self.last_t = -1
         self.pump = None               # optional callable: deliver fake-talker audio through the PlaybackGate
         self._orig = {}
@@ -143,6 +144,8 @@ class M1Force:
         if u["eou"]:
             self.forcer.on_eou(t)
             self.ftr.emit("turn.eou", t, source="asr")
+        elif u["speech"] and self.forcer.eou_k is not None:
+            self.forcer.eou_k = None            # the caller resumed: no BOS fallback on a mid-utterance pause
         s = None
         written = None
         state_before = None
@@ -183,7 +186,7 @@ class M1Force:
                "t_ns": time.monotonic_ns()}
         self.frames.write(row)
         if self.last_t >= 0 and t != self.last_t + 1:
-            self.mismatch.append({"k": t, "gap_from": self.last_t})
+            self.gaps.append({"k": t, "gap_from": self.last_t})
         self.last_t = t
         if self.pump is not None and t % 5 == 0:
             self.pump()

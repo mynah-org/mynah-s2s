@@ -46,6 +46,14 @@ def main():  # pragma: no cover - CPU model run on the GPU host
     ap.add_argument("--close-after", type=int, default=3)
     ap.add_argument("--eou-frames", type=int, default=10)
     ap.add_argument("--bou-frames", type=int, default=3)
+    ap.add_argument("--att-right", type=int, default=3, help="right context frames: 0, 1, 3, 6, 13")
+    ap.add_argument("--noise-rms", type=float, default=3e-4,
+                    help="seeded white-noise floor added to the whole track (about -70 dBFS): with exact digital "
+                         "silence the zero-lookahead encoder dropped whole utterances (CPU probe, E1 prep)")
+    ap.add_argument("--lang-mode", default="session", choices=["session", "auto"])
+    ap.add_argument("--reset", default="tag", choices=["none", "tag", "eou"],
+                    help="reset the RNNT predictor state after a language tag (tag) or after a tag or an end of "
+                         "utterance (eou): one decoder state over a whole session drops words after the first tag")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -69,23 +77,39 @@ def main():  # pragma: no cover - CPU model run on the GPU host
     dec.eval(), jnt.eval(), pk.eval()
     vocab = list(jnt.vocabulary)
     blank = len(vocab)
-    enc = SpeechEncoder("ml", att=[56, 0], device="cpu")
+    enc = SpeechEncoder("ml", att=[56, a.att_right], device="cpu")
 
     @torch.no_grad()
-    def greedy(e: torch.Tensor, lang_idx: int) -> dict:
+    def greedy(e: torch.Tensor, lang_idx: int) -> tuple:
         oh = torch.zeros(e.shape[0], 128)
         oh[:, lang_idx] = 1
         f = pk(torch.cat([e, oh], -1))
-        g, st = dec.predict(torch.tensor([[blank]]), None, add_sos=False, batch_size=1)
-        per = {}
+
+        def fresh():
+            return dec.predict(torch.tensor([[blank]]), None, add_sos=False, batch_size=1)
+        g, st = fresh()
+        per, resets, blank_run, spoke = {}, [], 0, False
         for t in range(f.shape[0]):
+            emitted = False
             for _ in range(10):
                 k = int(jnt.joint(f[t:t + 1][None], g)[0, 0, 0].argmax())
                 if k == blank:
                     break
+                emitted = True
                 per.setdefault(t, []).append(vocab[k])
                 g, st = dec.predict(torch.tensor([[k]]), st, add_sos=False, batch_size=1)
-        return per
+                if a.reset in ("tag", "eou") and vocab[k].strip().startswith("<") and vocab[k].strip().endswith(">"):
+                    g, st = fresh()
+                    resets.append([t, "tag"])
+                    spoke = False
+                    break
+            blank_run = 0 if emitted else blank_run + 1
+            spoke = spoke or emitted
+            if a.reset == "eou" and spoke and blank_run >= a.eou_frames:
+                g, st = fresh()
+                resets.append([t, "eou"])
+                spoke = False
+        return per, resets
 
     def load_16k(p):
         w, sr = sf.read(p, dtype="float32", always_2d=True)
@@ -107,21 +131,30 @@ def main():  # pragma: no cover - CPU model run on the GPU host
         for (_, iid, gap, _) in TURNS:
             parts += [clips[iid], torch.zeros(int(gap * 16000))]
         wav = torch.cat(parts)
+        if a.noise_rms > 0:
+            gen = torch.Generator().manual_seed(0)
+            wav = wav + torch.randn(wav.numel(), generator=gen) * a.noise_rms
         sf.write(out / f"track_{lang}.wav", wav.numpy(), 16000)
         e = enc(wav)["out"]
-        per = greedy(e, LANG_IDX[lang])
+        per0, resets = greedy(e, LANG_IDX["auto" if a.lang_mode == "auto" else lang])
+        # causality: a piece decoded at encoder frame t used audio up to frame t + right context
+        per = {t + a.att_right: v for t, v in per0.items()}
         words, sched_words = [], []
         sched = UserTextScheduler(lambda w: [1000], close_after=a.close_after,
                                   on_close=lambda k, w, ids: sched_words.append({"k": k, "word": w}))
         tt = TurnTaker(eou_frames=a.eou_frames, bou_frames=a.bou_frames)
-        nonblank, eou, bou = [], [], []
-        F = int(e.shape[0])
+        nonblank, eou, bou, raw_nonblank = [], [], [], []
+        raw_set = {k for k, v in per.items() if any(not (p.startswith(TAG_PREFIX) and p.endswith(">")) for p in v)}
+        F = int(e.shape[0]) + a.att_right
         for k in range(F):
             pieces = per.get(k, [])
             real = [p for p in pieces if not (p.startswith(TAG_PREFIX) and p.endswith(">"))]
             sched.on_asr(k, pieces)
             sched.step(k)
-            nb = bool(real)
+            if real:
+                raw_nonblank.append(k)
+            # activity = a piece in the last 3 frames (the RNNT emits sparsely: 1 piece every 1-3 frames in speech)
+            nb = any(j in raw_set for j in (k, k - 1, k - 2)) if real or raw_nonblank else False
             if nb:
                 nonblank.append(k)
             for ev in tt.step(k, nb):
@@ -136,9 +169,12 @@ def main():  # pragma: no cover - CPU model run on the GPU host
             nxt = [x["start_k"] for x in tl if x["start_k"] > lo]
             hi = min(nxt) if nxt else F + 1
             by_turn[turn["label"]] = " ".join(w["word"] for w in words if lo <= w["k"] < hi)
-        res = {"lang": lang, "lang_idx": LANG_IDX[lang], "att": [56, 0], "frames": F, "frame_s": 0.08,
+        res = {"lang": lang, "lang_idx": LANG_IDX["auto" if a.lang_mode == "auto" else lang],
+               "att": [56, a.att_right], "reset": a.reset, "resets": resets, "noise_rms": a.noise_rms,
+               "emission_offset_frames": a.att_right, "frames": F, "frame_s": 0.08,
                "close_after": a.close_after, "eou_frames": a.eou_frames, "bou_frames": a.bou_frames,
-               "pieces": {str(k): v for k, v in per.items()}, "words": words, "nonblank": nonblank, "eou": eou,
+               "pieces": {str(k): v for k, v in per.items()}, "words": words, "nonblank": nonblank,
+               "raw_nonblank": raw_nonblank, "eou": eou,
                "bou": bou, "timeline": tl, "transcript_by_turn": by_turn,
                "track_sha256": hashlib.sha256(np.ascontiguousarray(wav.numpy()).tobytes()).hexdigest()}
         (out / f"asr_{lang}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1))

@@ -98,7 +98,9 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--langs", default="it,fr,en")
     ap.add_argument("--arms", default="m1f,m0,cas")
     ap.add_argument("--budget-s", type=float, default=720.0, help="do not START a session past this (job wall)")
-    ap.add_argument("--smoke-s", type=float, default=0.0, help=">0: only the first N seconds of the first lang, m1f")
+    ap.add_argument("--smoke-s", type=float, default=20.0,
+                    help="first run M1-force on the first N s of the first language and stop the job if the "
+                         "TECHNICAL invariants fail (0 = no smoke)")
     a = ap.parse_args()
     T0 = time.monotonic()
     out = Path(a.out)
@@ -150,22 +152,22 @@ def main():  # pragma: no cover - GPU
 
     langs = a.langs.split(",")
     arms = a.arms.split(",")
-    if a.smoke_s:
-        langs, arms = langs[:1], ["m1f"]
+    plan = [(langs[0], "m1f", a.smoke_s, "smoke")] if a.smoke_s else []
+    plan += [(lang, arm, 0.0, "") for lang in langs for arm in arms]
     status = {"done": [], "skipped": []}
-    for lang in langs:
+    for lang, arm, cut_s, tag in plan:
         L = session_language(lang)
         asr = json.load(open(asr_dir / f"asr_{lang}.json"))
         wav = load_16k(asr_dir / f"track_{lang}.wav")
-        if a.smoke_s:
-            wav = wav[: int(a.smoke_s * 16000)]
-        for arm in arms:
+        if cut_s:
+            wav = wav[: int(cut_s * 16000)]
+        if True:
             est = (max(durations) * 1.1) if durations else (wav.numel() / 16000 + 30)
-            if not budget_ok(est):
+            if not tag and not budget_ok(est):
                 status["skipped"].append([lang, arm])
                 print("BUDGET: skip", lang, arm, flush=True)
                 continue
-            sid = f"{arm}_{lang}"
+            sid = f"{tag}_{arm}_{lang}" if tag else f"{arm}_{lang}"
             od = out / sid
             od.mkdir()
             backend = TenantBackend(spec, user_activity=lambda: 0, user_transcript=lambda: [])
@@ -211,6 +213,7 @@ def main():  # pragma: no cover - GPU
                 v2_text = "".join(sess.text)
                 rec = {"arm": arm, "lang": lang, "agent_text_v2": v2_text, "hook_calls": hook.n_hook,
                        "frames_last": hook.last_t, "mismatch": hook.mismatch[:50], "n_mismatch": len(hook.mismatch),
+                       "gaps": hook.gaps[:50], "n_gaps": len(hook.gaps),
                        "fc_suppressed": hook.fc_suppressed, "cache_checks": hook.cache_checks,
                        "forcer": {"overrides": hook.forcer.overrides, "agreements": hook.forcer.agreements,
                                   "log": [list(map(str, x)) for x in hook.forcer.log]},
@@ -227,6 +230,17 @@ def main():  # pragma: no cover - GPU
             rec["wall_s"] = round(time.monotonic() - t_s, 1)
             ftr.close()
             (od / "summary.json").write_text(json.dumps(rec, indent=1, ensure_ascii=False, default=str))
+            if tag == "smoke":
+                ok = (rec.get("hook_calls", 0) > 0 and rec.get("n_gaps", 1) == 0
+                      and all(c["same"] for c in rec.get("cache_checks", [])))
+                status["smoke"] = {"ok": ok, "hook_calls": rec.get("hook_calls"), "n_gaps": rec.get("n_gaps"),
+                                   "mismatch": rec.get("mismatch"),
+                                   "cache_checks": rec.get("cache_checks"), "wall_s": rec["wall_s"]}
+                print("SMOKE", json.dumps(status["smoke"], default=str), flush=True)
+                if not ok:
+                    (out / "status.json").write_text(json.dumps(status, indent=1, default=str))
+                    raise SystemExit("smoke failed: TECHNICAL invariants")
+                continue
             durations.append(rec["wall_s"])
             status["done"].append([lang, arm, rec["wall_s"]])
             print("DONE", sid, rec["wall_s"], "s |", json.dumps(rec.get("messages", [])[-6:], ensure_ascii=False)[:1500],
