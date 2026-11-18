@@ -14,13 +14,16 @@ from pathlib import Path
 import torch
 
 PREFIXES = ("model.language_model.", "model.")
-EXPERT = re.compile(r"^(layers\.\d+\.mlp\.experts)\.(\d+)\.(\w+)\.(weight|qweight|qzeros|scales)$")
+EXPERT = re.compile(r"^((?:mtp\.)?layers\.\d+\.mlp\.experts)\.(\d+)\.(\w+)\.(weight|qweight|qzeros|scales|weight_scale|weight_scale_2|input_scale)$")
 
 
 def _short(name: str) -> str | None:
-    if name.startswith(("model.visual.", "visual.", "mtp.")):
+    """Short tensor name (text model prefix stripped), or None to skip it."""
+    if name.startswith(("model.visual.", "visual.")):
         return None
-    if name == "lm_head.weight":
+    if name.startswith("mtp."):
+        return name if _short.load_mtp else None
+    if name.startswith("lm_head."):
         return name
     for p in PREFIXES:
         if name.startswith(p):
@@ -28,9 +31,10 @@ def _short(name: str) -> str | None:
     return None
 
 
-def load_weights(path, device, allow_bf16_experts=False) -> tuple[dict, dict]:
+def load_weights(path, device, allow_bf16_experts=False, mtp=False) -> tuple[dict, dict]:
     """-> (W, info). W: short name -> tensor on `device`; info: quantisation facts from config.json."""
     from safetensors import safe_open
+    _short.load_mtp = mtp
     path = Path(path)
     cfg = json.loads((path / "config.json").read_text())
     q = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
@@ -48,10 +52,12 @@ def load_weights(path, device, allow_bf16_experts=False) -> tuple[dict, dict]:
                 m = EXPERT.match(s)
                 if m:
                     base, e, proj, kind = m.groups()
-                    if kind == "weight" and not allow_bf16_experts:
-                        raise ValueError("bf16 MoE experts are not allowed (compressed only): use an AWQ checkpoint")
-                    key = f"{base}.{proj}" + ("" if kind == "weight" else f".{kind}")
-                    experts[key][int(e)] = fh.get_tensor(name)
+                    t = fh.get_tensor(name)
+                    if kind == "weight" and t.dtype in (torch.bfloat16, torch.float16, torch.float32) \
+                            and not allow_bf16_experts and not base.startswith("mtp."):
+                        raise ValueError("bf16 MoE experts are not allowed (compressed only): AWQ or NVFP4 checkpoints")
+                    key = f"{base}.{proj}" + ("" if kind == "weight" and t.dtype not in (torch.uint8,) else f".{kind}")
+                    experts[key][int(e)] = t
                     if len(experts[key]) == n_exp:                       # this layer's projection is complete
                         d = experts.pop(key)
                         W[key] = torch.stack([d.pop(i) for i in range(n_exp)])
@@ -60,6 +66,12 @@ def load_weights(path, device, allow_bf16_experts=False) -> tuple[dict, dict]:
                     W[s] = t.to(torch.bfloat16) if t.dtype == torch.float16 else t    # fp16 checkpoints (AWQ): bf16
     if experts:
         raise ValueError(f"incomplete expert sets: {sorted(experts)[:4]}")
+    hq = path / "hf_quant_config.json"
+    if hq.exists() and not q:
+        q = {"quant_method": "modelopt:" + json.loads(hq.read_text())["quantization"].get("quant_algo", "?")}
     info = {"quant_method": q.get("quant_method"), "bits": q.get("bits"), "group_size": q.get("group_size"),
             "zero_point": q.get("zero_point"), "version": q.get("version")}
     return W, info
+
+
+_short.load_mtp = False

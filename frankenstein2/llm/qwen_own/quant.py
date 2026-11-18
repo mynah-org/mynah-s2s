@@ -36,6 +36,15 @@ class QLinear:
             self.qweight, self.qzeros, self.scales = awq["qweight"], awq["qzeros"], awq["scales"]
             self.out_features = self.scales.shape[-1]
             return
+        if mode == "nvfp4":                       # ModelOpt W4A16 NVFP4: uint8 [out, in/2], e4m3 [out, in/16], fp32
+            self.q, self.s, self.s2 = awq["q"], awq["s"], awq["s2"].float().reshape(1)
+            self.out_features = self.q.shape[0]
+            return
+        if mode == "fp8":                         # e4m3 [out, in] with a per-tensor scale (weight-only use here)
+            self.q = awq["q"]
+            self.s = awq["s"].float().reshape(1, 1).expand(self.q.shape[0], 1).contiguous()
+            self.out_features = self.q.shape[0]
+            return
         w = w.to(torch.bfloat16)
         self.out_features = w.shape[0]
         if mode == "bf16":
@@ -68,17 +77,49 @@ class QLinear:
             o, i = q.shape
             w = (q.reshape(o, i // self.group, self.group).to(torch.bfloat16) - self.z) * self.s
             return w.reshape(o, i)
+        if self.mode == "nvfp4":
+            from .kernels import nvfp4_dequant
+            return nvfp4_dequant(self.q, self.s, self.s2[0])
+        if self.mode == "fp8":
+            return (self.q.float() * self.s).to(torch.bfloat16)
         return awq_dequant(self.qweight, self.qzeros, self.scales, self.group)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if self.mode == "int8" and x.is_cuda and x.numel() // x.shape[-1] <= 16:
-            from .kernels import w8_gemv                                   # decode: fused int8 GEMV (Triton)
+        rows = x.numel() // x.shape[-1]
+        if self.mode in ("int8", "fp8", "nvfp4") and x.is_cuda and rows <= 16:   # decode: fused GEMV (Triton)
+            from .kernels import int8_gemv, nvfp4_expert_gemv
             shp = x.shape
-            return w8_gemv(x.reshape(-1, shp[-1]), self.q, self.s).reshape(*shp[:-1], self.out_features)
+            x2 = x.reshape(-1, shp[-1])
+            if self.mode == "nvfp4":
+                z = torch.zeros(x2.shape[0], dtype=torch.long, device=x.device)
+                y = nvfp4_expert_gemv(x2, self.q[None], self.s[None], self.s2, z)
+            else:
+                y = int8_gemv(x2, self.q, self.s)
+            return y.reshape(*shp[:-1], self.out_features)
         return F.linear(x, self.dequant())
 
     def nbytes(self) -> int:
         ts = {"bf16": [getattr(self, "w", None)], "int8": [getattr(self, "q", None), getattr(self, "s", None)],
               "int4": [getattr(self, "q", None), getattr(self, "s", None), getattr(self, "z", None)],
-              "awq": [getattr(self, "qweight", None), getattr(self, "qzeros", None), getattr(self, "scales", None)]}
+              "awq": [getattr(self, "qweight", None), getattr(self, "qzeros", None), getattr(self, "scales", None)],
+              "nvfp4": [getattr(self, "q", None), getattr(self, "s", None)], "fp8": [getattr(self, "q", None)]}
         return sum(t.numel() * t.element_size() for t in ts[self.mode] if t is not None)
+
+
+def nvfp4_quantize(w: torch.Tensor):
+    """Round-to-nearest NVFP4 (as ModelOpt's layout): w [..., N, K] float -> (uint8 [..., N, K/2], e4m3 [..., N, K/16],
+    fp32 global scale [...] ). Used for checkpoints that ship bf16 experts (e.g. an MTP head) under the
+    compressed-only rule. Works chunk by chunk over the leading axis to bound memory."""
+    from .kernels import E2M1
+    if w.dim() == 3:
+        parts = [nvfp4_quantize(w[i]) for i in range(w.shape[0])]
+        return tuple(torch.stack([p[j] for p in parts]) for j in range(3))
+    o, i = w.shape
+    g = w.float().reshape(o, i // 16, 16)
+    s2 = (g.abs().amax() / (6 * 448)).clamp(min=1e-12)
+    sc = (g.abs().amax(-1) / 6 / s2).clamp(min=2 ** -9).to(torch.float8_e4m3fn)
+    x = g / (sc.float()[..., None] * s2)
+    grid = torch.tensor(E2M1, device=w.device)
+    mag = (x.abs()[..., None] - grid).abs().argmin(-1)
+    nib = (mag + (x < 0).long() * 8).reshape(o, i).to(torch.uint8)
+    return (nib[:, 0::2] | (nib[:, 1::2] << 4)).contiguous(), sc, s2.reshape(())

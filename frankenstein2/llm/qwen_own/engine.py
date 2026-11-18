@@ -28,13 +28,13 @@ class QwenOwn:
     GRAPH_B = (1, 2, 4, 8, 16)
     GRAPH_L = (512, 1024, 2048, 4096, 8192, 16384, 32768)
 
-    def __init__(self, path, device="cuda", mode="bf16", slots=4, max_len=8192, group=128, graphs=True):
+    def __init__(self, path, device="cuda", mode="bf16", slots=4, max_len=8192, group=128, graphs=True, mtp=False):
         from transformers import AutoTokenizer
         t0 = time.monotonic()
         self.path, self.device = str(path), torch.device(device)
         self.cfg = load_cfg(path)
         self.tok = AutoTokenizer.from_pretrained(self.path)
-        W, info = load_weights(path, self.device)
+        W, info = load_weights(path, self.device, mtp=mtp)
         self.quant = info
         awq_group = info.get("group_size") if info.get("quant_method") == "awq" else None
         self.model = Model(self.cfg, W, self.device, mode=mode, group=group, awq_group=awq_group)
@@ -47,6 +47,8 @@ class QwenOwn:
         self.graphs: dict = {}
         self.use_graphs = graphs and self.device.type == "cuda"
         self.prefill_chunk = 1024
+        self.use_mtp = mtp
+        self.mtp_stats = {"steps": 0, "accepted": 0}
         self.sess: dict = {}
         self.mode = mode
         im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
@@ -99,15 +101,31 @@ class QwenOwn:
         if len(ids) > self.max_len:
             raise ValueError("prompt longer than max_len")
         slots = torch.tensor([s], device=self.device)
+        mtp = self.model.mtp is not None and self.use_mtp
+        hid_prev = None
         for a in range(start, len(ids), self.prefill_chunk):           # bounded activations / expert buffers
             b = min(len(ids), a + self.prefill_chunk)
             new = torch.tensor([ids[a:b]], device=self.device)
             pos = torch.arange(a, b, device=self.device)[None]
-            logits = self.model.forward(new, self.state, slots, pos, torch.tensor([b], device=self.device),
-                                        prefill=True)
+            out = self.model.forward(new, self.state, slots, pos, torch.tensor([b], device=self.device),
+                                     prefill=True, hidden=mtp)
+            logits, hid = out if mtp else (out, None)
+            if mtp and b < len(ids):                                    # MTP over this chunk: (token i+1, hidden i)
+                self._mtp_fill(s, ids[a + 1:b + 1], hid, a + 1)
+            hid_prev = (a, hid)
         se["ids"] = list(ids)
         self._snapshot(s, len(ids))
+        if mtp:
+            se["mtp_tail"] = hid_prev                                   # last chunk: filled once the next token is known
         return logits[0]
+
+    def _mtp_fill(self, s, toks, hid, p0):
+        """Run the MTP head over tokens `toks` paired with main hidden states `hid` [1, T, H], positions p0.. ."""
+        T = len(toks)
+        ids = torch.tensor([toks], device=self.device)
+        pos = torch.arange(p0, p0 + T, device=self.device)[None]
+        return self.model.mtp_forward(ids, hid[:, :T], self.state, torch.tensor([s], device=self.device), pos,
+                                      torch.tensor([p0 + T], device=self.device), prefill=True)[0]
 
     def decode_batch(self, sessions: list, tokens: list) -> torch.Tensor:
         """One token for each session (in order). Returns logits [B, V]. With CUDA graphs: the batch is padded to a
@@ -155,6 +173,138 @@ class QwenOwn:
         g["graph"] = graph
         self.graphs[(B, L)] = g
         return g
+
+    # ---- speculative decoding with the MTP head (greedy, lossless) ----
+    def _verify(self, s, t, d, p, L):
+        """Main model on [t, d] at positions p, p+1 -> (logits [2, V], hidden [1, 2, H], rollback states)."""
+        dev = self.device
+        key = ("verify", L)
+        if self.use_graphs:
+            g = self.graphs.get(key) or self._capture_spec(key, L)
+            g["ids"][0, 0], g["ids"][0, 1] = t, d
+            g["pos"][0, 0], g["pos"][0, 1] = p, p + 1
+            g["lens"][0] = p + 2
+            g["slots"][0] = s
+            g["graph"].replay()
+            return g["out"][0][0], g["out"][1], g["rb"]
+        out = self.model.forward(torch.tensor([[t, d]], device=dev), self.state, torch.tensor([s], device=dev),
+                                 torch.tensor([[p, p + 1]], device=dev), torch.tensor([p + 2], device=dev),
+                                 prefill=False, kv_len=L, all_logits=True, hidden=True)
+        return out[0][0], out[1], self.state["rollback"]
+
+    def _draft(self, s, toks, hid, p, L):
+        """MTP head on 1 or 2 tokens at positions p.. -> draft logits [V]."""
+        dev = self.device
+        T = len(toks)
+        key = ("mtp", T, L)
+        if self.use_graphs:
+            g = self.graphs.get(key) or self._capture_spec(key, L)
+            g["ids"][0, :T] = torch.tensor(toks, device=dev)
+            g["pos"][0, :T] = torch.arange(p, p + T, device=dev)
+            g["lens"][0] = p + T
+            g["slots"][0] = s
+            g["hid"].copy_(hid[:, :T])
+            g["graph"].replay()
+            return g["out"][0]
+        return self.model.mtp_forward(torch.tensor([toks], device=dev), hid[:, :T], self.state,
+                                      torch.tensor([s], device=dev), torch.arange(p, p + T, device=dev)[None],
+                                      torch.tensor([p + T], device=dev), prefill=False, kv_len=L)[0]
+
+    def _capture_spec(self, key, L):
+        dev, H = self.device, self.cfg.hidden
+        T = 2 if key[0] == "verify" else key[1]
+        g = {"ids": torch.zeros(1, T, dtype=torch.long, device=dev),
+             "pos": torch.arange(T, device=dev)[None].clone(), "lens": torch.full((1,), T, dtype=torch.long, device=dev),
+             "slots": torch.full((1,), self.scratch, dtype=torch.long, device=dev),
+             "hid": torch.zeros(1, T, H, dtype=torch.bfloat16, device=dev)}
+        if key[0] == "verify":
+            run = lambda: self.model.forward(g["ids"], self.state, g["slots"], g["pos"], g["lens"], prefill=False,  # noqa
+                                             kv_len=L, all_logits=True, hidden=True)
+        else:
+            run = lambda: self.model.mtp_forward(g["ids"], g["hid"], self.state, g["slots"], g["pos"], g["lens"],  # noqa
+                                                 prefill=False, kv_len=L)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                run()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.graphs.get("pool")):
+            g["out"] = run()
+        self.graphs.setdefault("pool", graph.pool())
+        g["graph"] = graph
+        if key[0] == "verify":
+            g["rb"] = dict(self.state["rollback"])                   # static tensors written by every replay
+        self.graphs[key] = g
+        return g
+
+    def _rollback(self, s, rb):
+        """Keep the main model's DeltaNet state after the first verified token only (draft rejected)."""
+        for i, keep in rb.items():
+            rec, conv = keep[0]
+            self.state["rec"][i][s].copy_(rec[0])
+            self.state["conv"][i][s].copy_(conv[0])
+
+    @torch.no_grad()
+    def generate_mtp(self, s, ids, max_new=192, stop=("</tool_call>",), stop_flag=None):
+        """Greedy speculative decoding: the MTP head drafts one token, the main model verifies [token, draft] in one
+        forward; the draft is kept only if it equals the main model's own greedy token, so the output is the plain
+        greedy output (up to bf16 numerics of a 2-token vs 1-token forward)."""
+        t0 = time.perf_counter()
+        logits = self.prefill(s, ids)
+        se = self.sess[s]
+        eos = set(self.eos_ids)
+        out, text, sent, reason, t_first = [], "", 0, "max", None
+        n = len(ids)
+        t = int(torch.argmax(logits))
+        a, hid = se["mtp_tail"]
+        L = lambda p: min(next((x for x in self.GRAPH_L if x >= p + 3), self.max_len), self.max_len)  # noqa: E731
+        dl = self._mtp_fill(s, ids[a + 1:] + [t], hid, a + 1)            # last prompt chunk + the first token
+        steps = acc = 0
+
+        def emit(tok):
+            nonlocal text, sent, t_first
+            out.append(tok)
+            text = self.tok.decode(out, skip_special_tokens=False)
+            t_first = t_first if t_first is not None else time.perf_counter() - t0
+        p = n
+        while len(out) < max_new:
+            if t in eos:
+                reason = "eos"; break
+            emit(t)
+            if not text.endswith("\ufffd") and len(text) > sent:
+                yield {"text": text[sent:]}; sent = len(text)
+            if any(x in text for x in stop):
+                reason = "stop"; break
+            if stop_flag is not None and stop_flag():
+                reason = "cancel"; break
+            d = int(torch.argmax(dl))
+            lg, hid2, rb = self._verify(s, t, d, p, L(p))
+            steps += 1
+            y0 = int(torch.argmax(lg[0]))
+            if y0 == d and d not in eos:
+                acc += 1
+                emit(d)
+                if not text.endswith("\ufffd") and len(text) > sent:
+                    yield {"text": text[sent:]}; sent = len(text)
+                if any(x in text for x in stop) or len(out) >= max_new:
+                    se["ids"] += [t, d]
+                    reason = "stop" if any(x in text for x in stop) else "max"; break
+                y1 = int(torch.argmax(lg[1]))
+                dl = self._draft(s, [d, y1], hid2, p + 1, L(p))
+                se["ids"] += [t, d]
+                t, p = y1, p + 2
+            else:
+                self._rollback(s, rb)
+                dl = self._draft(s, [y0], hid2, p + 1, L(p))
+                se["ids"] += [t]
+                t, p = y0, p + 1
+        self.mtp_stats["steps"] += steps
+        self.mtp_stats["accepted"] += acc
+        yield {"done": True, "ids": out, "text": text, "reason": reason, "first_token_s": t_first,
+               "total_s": time.perf_counter() - t0, "n": len(out), "prompt_n": len(ids), "mtp_steps": steps,
+               "mtp_accepted": acc}
 
     # ---- generation ----
     @torch.no_grad()

@@ -22,7 +22,21 @@ def tiny_cfg(moe=False):
                    eos_ids=[0])
 
 
-def tiny_weights(c: QwenCfg, awq=False):
+def nvfp4_pack(w: torch.Tensor):
+    """Test helper: [out, in] float -> (uint8 [out, in/2], e4m3 [out, in/16], fp32 global scale)."""
+    from frankenstein2.llm.qwen_own.kernels import E2M1
+    o, i = w.shape
+    g = w.float().reshape(o, i // 16, 16)
+    s2 = g.abs().amax() / (6 * 448)
+    sc = (g.abs().amax(-1) / 6 / s2).clamp(min=1e-3).to(torch.float8_e4m3fn)
+    x = g / (sc.float()[..., None] * s2)
+    grid = torch.tensor(E2M1)
+    mag = (x.abs()[..., None] - grid).abs().argmin(-1)
+    nib = (mag + (x < 0).long() * 8).reshape(o, i).to(torch.uint8)
+    return (nib[:, 0::2] | (nib[:, 1::2] << 4)).contiguous(), sc, s2.reshape(())
+
+
+def tiny_weights(c: QwenCfg, awq=False, nvfp4=False):
     r = lambda *s: (torch.randn(*s) * 0.05).to(torch.bfloat16)          # noqa: E731
     W = {"embed_tokens.weight": r(c.vocab, c.hidden), "norm.weight": r(c.hidden)}
     if not c.tie_embeddings:
@@ -60,7 +74,11 @@ def tiny_weights(c: QwenCfg, awq=False):
                 W[m + f"shared_expert.{n}.weight"] = r(*s)
             for n, (o, i_) in (("gate_proj", (c.moe_intermediate, c.hidden)), ("up_proj", (c.moe_intermediate, c.hidden)),
                                ("down_proj", (c.hidden, c.moe_intermediate))):
-                if awq:
+                if nvfp4:
+                    qs = [nvfp4_pack(r(o, i_).float() * 4) for _ in range(c.num_experts)]
+                    for j, part in enumerate(("weight", "weight_scale", "weight_scale_2")):
+                        W[m + f"experts.{n}.{part}"] = torch.stack([q[j] for q in qs])
+                elif awq:
                     qs = [awq_pack(r(o, i_).float() * 4, 16) for _ in range(c.num_experts)]
                     for j, part in enumerate(("qweight", "qzeros", "scales")):
                         W[m + f"experts.{n}.{part}"] = torch.stack([q[j] for q in qs])
@@ -119,10 +137,11 @@ def test_chunk_equals_recurrent():
     assert torch.allclose(s_c, s, atol=2e-4)
 
 
-@pytest.mark.parametrize("moe,awq", [(False, False), (True, False), (True, True)])
-def test_prefill_decode_consistency(moe, awq):
+@pytest.mark.parametrize("moe,awq,nv", [(False, False, False), (True, False, False), (True, True, False),
+                                        (True, False, True)])
+def test_prefill_decode_consistency(moe, awq, nv):
     c = tiny_cfg(moe)
-    m = Model(c, tiny_weights(c, awq), torch.device("cpu"), awq_group=16 if awq else None)
+    m = Model(c, tiny_weights(c, awq, nv), torch.device("cpu"), awq_group=16 if awq else None)
     ids = torch.randint(1, c.vocab, (1, 20))
     st = m.new_state(2, 64)
     slot = torch.tensor([0])
@@ -171,12 +190,82 @@ def test_weight_only_quant(mode, tol):
     assert ((got - ref).norm() / ref.norm()) < tol
 
 
-@pytest.mark.parametrize("awq", [False, True])
-def test_moe_prefill_path_equals_decode_path(awq):
+@pytest.mark.parametrize("awq,nv", [(False, False), (True, False), (False, True)])
+def test_moe_prefill_path_equals_decode_path(awq, nv):
     c = tiny_cfg(moe=True)
-    m = Model(c, tiny_weights(c, awq), torch.device("cpu"), awq_group=16 if awq else None)
+    m = Model(c, tiny_weights(c, awq, nv), torch.device("cpu"), awq_group=16 if awq else None)
     d = m.layers[0]
     h = (torch.randn(1, 200, c.hidden) * 0.5).to(torch.bfloat16)        # 200 * top_k > 256: the grouped prefill path
     big = m._mlp(d, h).float()
     small = torch.cat([m._mlp(d, h[:, i:i + 1]) for i in range(200)], dim=1).float()   # decode path per token
     assert ((big - small).norm() / small.norm()) < 0.02
+
+
+
+def test_nvfp4_roundtrip():
+    from frankenstein2.llm.qwen_own.kernels import nvfp4_dequant
+    w = torch.randn(64, 128)
+    q, sc, s2 = nvfp4_pack(w)
+    d = nvfp4_dequant(q, sc, s2).float()
+    assert ((d - w).norm() / w.norm()) < 0.15
+
+
+def add_mtp(W, c: QwenCfg, moe=False):
+    r = lambda *s: (torch.randn(*s) * 0.05).to(torch.bfloat16)          # noqa: E731
+    W["mtp.fc.weight"] = r(c.hidden, 2 * c.hidden)
+    for n in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm"):
+        W[f"mtp.{n}.weight"] = r(c.hidden)
+    p = "mtp.layers.0."
+    W[p + "input_layernorm.weight"] = r(c.hidden)
+    W[p + "post_attention_layernorm.weight"] = r(c.hidden)
+    a = p + "self_attn."
+    W[a + "q_proj.weight"] = r(c.heads * c.head_dim * 2, c.hidden)
+    W[a + "k_proj.weight"] = r(c.kv_heads * c.head_dim, c.hidden)
+    W[a + "v_proj.weight"] = r(c.kv_heads * c.head_dim, c.hidden)
+    W[a + "o_proj.weight"] = r(c.hidden, c.heads * c.head_dim)
+    W[a + "q_norm.weight"] = r(c.head_dim)
+    W[a + "k_norm.weight"] = r(c.head_dim)
+    m = p + "mlp."
+    if moe:
+        W[m + "gate.weight"] = r(c.num_experts, c.hidden)
+        W[m + "shared_expert_gate.weight"] = r(1, c.hidden)
+        for n, s in (("gate_proj", (c.shared_intermediate, c.hidden)), ("up_proj", (c.shared_intermediate, c.hidden)),
+                     ("down_proj", (c.hidden, c.shared_intermediate))):
+            W[m + f"shared_expert.{n}.weight"] = r(*s)
+        W[m + "experts.gate_up_proj"] = r(c.num_experts, 2 * c.moe_intermediate, c.hidden)   # bf16 fused (quantised at load)
+        W[m + "experts.down_proj"] = r(c.num_experts, c.hidden, c.moe_intermediate)
+    else:
+        W[m + "gate_proj.weight"] = r(c.intermediate, c.hidden)
+        W[m + "up_proj.weight"] = r(c.intermediate, c.hidden)
+        W[m + "down_proj.weight"] = r(c.hidden, c.intermediate)
+    return W
+
+
+class _Tok:
+    def decode(self, ids, skip_special_tokens=False):
+        return " ".join(map(str, ids))
+
+
+def tiny_engine(moe, nv):
+    from frankenstein2.llm.qwen_own.engine import QwenOwn
+    c = tiny_cfg(moe)
+    e = QwenOwn.__new__(QwenOwn)
+    e.device, e.cfg, e.tok = torch.device("cpu"), c, _Tok()
+    e.model = Model(c, add_mtp(tiny_weights(c, nvfp4=nv), c, moe), e.device)
+    e.state = e.model.new_state(3, 256)
+    e.scratch, e.max_len, e.free, e.sess, e.graphs, e.use_graphs = 2, 256, [0, 1], {}, {}, False
+    e.prefill_chunk, e.use_mtp, e.mtp_stats, e.eos_ids = 1024, True, {"steps": 0, "accepted": 0}, [0]
+    return e
+
+
+@pytest.mark.parametrize("moe,nv", [(False, False), (True, True)])
+def test_mtp_speculative_is_lossless(moe, nv):
+    e = tiny_engine(moe, nv)
+    ids = torch.randint(1, 97, (40,)).tolist()
+    s = e.open()
+    ref = [ev for ev in e.generate(s, ids, max_new=30, stop=("never",))][-1]["ids"]
+    e.close(s)
+    s = e.open()
+    got = [ev for ev in e.generate_mtp(s, ids, max_new=30, stop=("never",))][-1]
+    assert got["ids"] == ref, (got["ids"], ref)
+    assert got["mtp_steps"] > 0

@@ -13,8 +13,8 @@ import torch
 import torch.nn.functional as F
 
 from .config import QwenCfg
-from .kernels import awq_expert_gemv, awq_grouped_gemm
-from .quant import QLinear, awq_dequant
+from .kernels import awq_expert_gemv, moe_align, moe_gemm, nvfp4_dequant, nvfp4_expert_gemv, BM as MOE_BM
+from .quant import QLinear, awq_dequant, nvfp4_quantize
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -121,37 +121,56 @@ class Model:
         self.cfg, self.device = cfg, device
         self.use_kernels = device.type == "cuda"
         self.rope = Rope(cfg, device)
-        L = lambda n: QLinear(W.pop(n), mode=mode, group=group)          # noqa: E731
+        L = lambda n: make_linear(W, n, mode, group)                     # noqa: E731
         self.embed = W.pop("embed_tokens.weight").to(torch.bfloat16)
         self.norm = W.pop("norm.weight")
-        self.lm_head = QLinear(self.embed if cfg.tie_embeddings or "lm_head.weight" not in W else W.pop("lm_head.weight"),
-                               mode="bf16")
-        self.layers = []
-        for i, kind in enumerate(cfg.layer_types):
-            p = f"layers.{i}."
-            d = {"kind": kind, "ln1": W.pop(p + "input_layernorm.weight"), "ln2": W.pop(p + "post_attention_layernorm.weight")}
-            if kind == "linear_attention":
-                a = p + "linear_attn."
-                d.update(qkv=L(a + "in_proj_qkv.weight"), z=L(a + "in_proj_z.weight"),
-                         b=QLinear(W.pop(a + "in_proj_b.weight")), a=QLinear(W.pop(a + "in_proj_a.weight")),
-                         conv=W.pop(a + "conv1d.weight"), A_log=W.pop(a + "A_log"), dt_bias=W.pop(a + "dt_bias"),
-                         gnorm=W.pop(a + "norm.weight"), out=L(a + "out_proj.weight"))
-            else:
-                a = p + "self_attn."
-                d.update(q=L(a + "q_proj.weight"), k=L(a + "k_proj.weight"), v=L(a + "v_proj.weight"),
-                         o=L(a + "o_proj.weight"), qn=W.pop(a + "q_norm.weight"), kn=W.pop(a + "k_norm.weight"))
-            m = p + "mlp."
-            if cfg.moe:
-                d.update(router=W.pop(m + "gate.weight"), sh_gate=W.pop(m + "shared_expert_gate.weight"),
-                         sh_g=L(m + "shared_expert.gate_proj.weight"), sh_u=L(m + "shared_expert.up_proj.weight"),
-                         sh_d=L(m + "shared_expert.down_proj.weight"))
-                d["experts"] = {k: W.pop(m + "experts." + k) for k in list(_expert_keys(W, m))}
-                d["awq_group"] = awq_group
-            else:
-                d.update(g=L(m + "gate_proj.weight"), u=L(m + "up_proj.weight"), dn=L(m + "down_proj.weight"))
-            self.layers.append(d)
+        self.lm_head = QLinear(self.embed, mode="bf16") if cfg.tie_embeddings or "lm_head.weight" not in W \
+            else make_linear(W, "lm_head.weight", "bf16", group)
+        self.layers = [self._build_layer(W, f"layers.{i}.", kind, L, awq_group, group)
+                       for i, kind in enumerate(cfg.layer_types)]
+        self.mtp = None
+        if "mtp.fc.weight" in W:                                               # multi-token prediction head
+            ex = {}
+            pre = "mtp.layers.0.mlp.experts."
+            if pre + "gate_up_proj" in W:                                      # bf16 fused experts: never kept in bf16
+                gu, dn = W.pop(pre + "gate_up_proj"), W.pop(pre + "down_proj")
+                I_ = gu.shape[1] // 2
+                for nm, t in (("gate_proj", gu[:, :I_]), ("up_proj", gu[:, I_:]), ("down_proj", dn)):
+                    q_, s_, s2_ = nvfp4_quantize(t)
+                    W[pre + nm + ".weight"], W[pre + nm + ".weight_scale"], W[pre + nm + ".weight_scale_2"] = q_, s_, s2_
+                del gu, dn
+            d = self._build_layer(W, "mtp.layers.0.", "full_attention", L, awq_group, group)
+            d["i"] = "mtp"
+            self.mtp = {"layer": d, "fc": make_linear(W, "mtp.fc.weight", "bf16", group),
+                        "n_emb": W.pop("mtp.pre_fc_norm_embedding.weight"), "n_hid": W.pop("mtp.pre_fc_norm_hidden.weight"),
+                        "norm": W.pop("mtp.norm.weight")}
         self.lin_idx = [i for i, k in enumerate(cfg.layer_types) if k == "linear_attention"]
         self.att_idx = [i for i, k in enumerate(cfg.layer_types) if k != "linear_attention"]
+
+    def _build_layer(self, W, p, kind, L, awq_group, group):
+        cfg = self.cfg
+        d = {"kind": kind, "ln1": W.pop(p + "input_layernorm.weight"), "ln2": W.pop(p + "post_attention_layernorm.weight")}
+        if kind == "linear_attention":
+            a = p + "linear_attn."
+            d.update(qkv=L(a + "in_proj_qkv.weight"), z=L(a + "in_proj_z.weight"),
+                     b=make_linear(W, a + "in_proj_b.weight", "bf16", group),
+                     a=make_linear(W, a + "in_proj_a.weight", "bf16", group),
+                     conv=W.pop(a + "conv1d.weight"), A_log=W.pop(a + "A_log"), dt_bias=W.pop(a + "dt_bias"),
+                     gnorm=W.pop(a + "norm.weight"), out=L(a + "out_proj.weight"))
+        else:
+            a = p + "self_attn."
+            d.update(q=L(a + "q_proj.weight"), k=L(a + "k_proj.weight"), v=L(a + "v_proj.weight"),
+                     o=L(a + "o_proj.weight"), qn=W.pop(a + "q_norm.weight"), kn=W.pop(a + "k_norm.weight"))
+        m = p + "mlp."
+        if cfg.moe:
+            d.update(router=W.pop(m + "gate.weight"), sh_gate=W.pop(m + "shared_expert_gate.weight"),
+                     sh_g=L(m + "shared_expert.gate_proj.weight"), sh_u=L(m + "shared_expert.up_proj.weight"),
+                     sh_d=L(m + "shared_expert.down_proj.weight"))
+            d["experts"] = {k: W.pop(m + "experts." + k) for k in list(_expert_keys(W, m))}
+            d["awq_group"] = awq_group
+        else:
+            d.update(g=L(m + "gate_proj.weight"), u=L(m + "up_proj.weight"), dn=L(m + "down_proj.weight"))
+        return d
 
     # ---- state ----
     def new_state(self, slots: int, max_len: int):
@@ -165,7 +184,9 @@ class Model:
             "k": {i: torch.zeros(slots, c.kv_heads, max_len, c.head_dim, dtype=torch.bfloat16, device=dev) for i in self.att_idx},
             "v": {i: torch.zeros(slots, c.kv_heads, max_len, c.head_dim, dtype=torch.bfloat16, device=dev) for i in self.att_idx},
             "max_len": max_len,
-        }
+        } | ({"k_mtp": torch.zeros(slots, c.kv_heads, max_len, c.head_dim, dtype=torch.bfloat16, device=dev),
+              "v_mtp": torch.zeros(slots, c.kv_heads, max_len, c.head_dim, dtype=torch.bfloat16, device=dev)}
+             if self.mtp is not None else {})
 
     # ---- blocks ----
     def _deltanet(self, d, x, st, slots, prefill):
@@ -194,9 +215,17 @@ class Model:
         state = st["rec"][d["i"]][slots]
         if prefill:
             out, s = chunk_delta_rule(q, k, v, g, beta, state)
-        else:
+        elif T == 1:
             o, s = step_delta_rule(q[:, 0], k[:, 0], v[:, 0], g[:, 0], beta[:, 0], state)
             out = o[:, None]
+        else:                                  # verify (speculative): token by token, keep each step's state
+            outs, s, keep = [], state, []
+            for t in range(T):
+                o, s = step_delta_rule(q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t], s)
+                outs.append(o)
+                keep.append((s, full[:, :, t + 1:t + c.conv_k]))      # rec state, conv window after token t
+            out = torch.stack(outs, 1)
+            st.setdefault("rollback", {})[d["i"]] = keep
         st["rec"][d["i"]][slots] = s
         out = out.to(x.dtype).reshape(-1, c.lin_v_dim)
         out = gated_rms_norm(out, z.reshape(-1, c.lin_v_dim), d["gnorm"], c.eps).reshape(B, T, -1)
@@ -214,7 +243,7 @@ class Model:
         v = d["v"](x).view(B, T, c.kv_heads, c.head_dim).transpose(1, 2)
         cos, sin = self.rope.cos_sin(pos, x.dtype)
         q, k = self.rope.apply(q, cos, sin), self.rope.apply(k, cos, sin)
-        K, V = st["k"][d["i"]], st["v"][d["i"]]
+        K, V = (st["k_mtp"], st["v_mtp"]) if d["i"] == "mtp" else (st["k"][d["i"]], st["v"][d["i"]])
         if prefill:                                                            # one slot, positions p0..p0+T-1
             s, p0 = int(slots[0]), int(pos[0, 0])
             K[s, :, p0:p0 + T] = k[0]
@@ -225,13 +254,14 @@ class Model:
             else:
                 m = torch.arange(p0 + T, device=x.device)[None, :] <= (p0 + torch.arange(T, device=x.device))[:, None]
                 o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=m[None, None], enable_gqa=True)
-        else:                                                                  # one token per slot
-            K[slots, :, pos[:, 0]] = k[:, :, 0]
-            V[slots, :, pos[:, 0]] = v[:, :, 0]
+        else:                                                                  # T tokens per slot (decode / verify)
+            for t in range(T):
+                K[slots, :, pos[:, t]] = k[:, :, t]
+                V[slots, :, pos[:, t]] = v[:, :, t]
             L = kv_len or K.shape[2]                                             # a static bucket >= every length
             kk, vv = K[slots, :, :L], V[slots, :, :L]
-            m = torch.arange(L, device=x.device)[None, :] < lens[:, None]
-            o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=m[:, None, None, :], enable_gqa=True)
+            m = torch.arange(L, device=x.device)[None, None, :] <= pos[:, :, None]          # [B, T, L]
+            o = F.scaled_dot_product_attention(q, kk, vv, attn_mask=m[:, None], enable_gqa=True)
         o = o.transpose(1, 2).reshape(B, T, -1)
         o = o * torch.sigmoid(gate)
         return d["o"](o)
@@ -253,10 +283,14 @@ class Model:
         if h.shape[0] * c.top_k <= 256:                                       # decode (graph-safe: no host sync)
             # few tokens (decode): gather the selected experts' weights and run them as a batched matmul
             idx = topi.reshape(-1)                                             # [N*k]
-            if "gate_proj.qweight" in ex and self.use_kernels:                 # AWQ: fused dequant GEMV (Triton)
-                hh = h.repeat_interleave(c.top_k, dim=0)
-                gv = lambda nm, xx: awq_expert_gemv(xx, ex[nm + ".qweight"], ex[nm + ".qzeros"],   # noqa: E731
-                                                    ex[nm + ".scales"], idx, grp)
+            if self.use_kernels and ("gate_proj.qweight" in ex or "gate_proj.weight_scale" in ex):
+                hh = h.repeat_interleave(c.top_k, dim=0)                       # fused dequant GEMV (Triton)
+                if "gate_proj.qweight" in ex:
+                    gv = lambda nm, xx: awq_expert_gemv(xx, ex[nm + ".qweight"], ex[nm + ".qzeros"],   # noqa: E731
+                                                        ex[nm + ".scales"], idx, grp)
+                else:
+                    gv = lambda nm, xx: nvfp4_expert_gemv(xx, ex[nm + ".weight"], ex[nm + ".weight_scale"],  # noqa: E731
+                                                          ex[nm + ".weight_scale_2"], idx)
                 a = F.silu(gv("gate_proj", hh)) * gv("up_proj", hh)
                 y = gv("down_proj", a) * topv.reshape(-1, 1)
                 return (y.reshape(-1, c.top_k, H).sum(1) + sh).reshape(B, T, H)
@@ -271,6 +305,16 @@ class Model:
             # many tokens (prefill): sort the (token, expert) pairs by expert, pad each hit expert's rows to the
             # longest, dequantise the hit experts once and run three batched matmuls (no per-expert Python loop)
             flat, wts = topi.reshape(-1), topv.reshape(-1)
+            if self.use_kernels and ("gate_proj.qweight" in ex or "gate_proj.weight_scale" in ex):
+                # block-aligned grouped GEMM: each expert's rows padded to MOE_BM, one program per row block
+                order, pos, total, bexp = moe_align(flat, c.num_experts, MOE_BM)
+                tok = order // c.top_k
+                X = torch.zeros(total, H, dtype=h.dtype, device=h.device)
+                X[pos] = h[tok]
+                a = F.silu(moe_gemm(X, ex, "gate_proj", bexp, grp)) * moe_gemm(X, ex, "up_proj", bexp, grp)
+                Y = moe_gemm(a, ex, "down_proj", bexp, grp)
+                out.index_add_(0, tok, Y[pos] * wts[order][:, None])
+                return (out + sh).reshape(B, T, H)
             order = torch.argsort(flat, stable=True)
             e_sorted, tok = flat[order], order // c.top_k
             counts = torch.bincount(flat, minlength=c.num_experts)
@@ -300,9 +344,10 @@ class Model:
 
     # ---- forward ----
     @torch.no_grad()
-    def forward(self, ids, st, slots, pos, lens, prefill, kv_len=None):
+    def forward(self, ids, st, slots, pos, lens, prefill, kv_len=None, all_logits=False, hidden=False):
         """ids [B, T]; slots [B] long; pos [B, T]; lens [B] (cache length after this call). Returns logits of the last
-        position [B, V] (fp32)."""
+        position [B, V] (fp32), or of every position [B, T, V] with all_logits; with hidden also the pre-norm hidden
+        states [B, T, H] (the MTP head's input)."""
         x = F.embedding(ids, self.embed)
         for i, d in enumerate(self.layers):
             d["i"] = i
@@ -313,8 +358,22 @@ class Model:
                 h = self._attention(d, h, st, slots, pos, lens, prefill, kv_len)
             x = x + h
             x = x + self._mlp(d, rms_norm(x, d["ln2"], self.cfg.eps))
-        x = rms_norm(x[:, -1], self.norm, self.cfg.eps)
-        return self.lm_head(x).float()
+        hid = x
+        x = rms_norm(x if all_logits else x[:, -1], self.norm, self.cfg.eps)
+        logits = self.lm_head(x).float()
+        return (logits, hid) if hidden else logits
+
+    @torch.no_grad()
+    def mtp_forward(self, ids, hid, st, slots, pos, lens, prefill, kv_len=None):
+        """MTP draft head: tokens ids [B, T] (the token after each hidden state), main hidden states hid [B, T, H] at
+        the previous positions, positions pos [B, T] of the tokens. Returns draft logits of the last position [B, V]."""
+        mt, c = self.mtp, self.cfg
+        e = rms_norm(F.embedding(ids, self.embed), mt["n_emb"], c.eps)
+        x = mt["fc"](torch.cat([e, rms_norm(hid, mt["n_hid"], c.eps)], dim=-1))
+        d = mt["layer"]
+        x = x + self._attention(d, rms_norm(x, d["ln1"], c.eps), st, slots, pos, lens, prefill, kv_len)
+        x = x + self._mlp(d, rms_norm(x, d["ln2"], c.eps))
+        return self.lm_head(rms_norm(x[:, -1], mt["norm"], c.eps)).float()
 
 
 def _expert_keys(W, m):
@@ -323,8 +382,23 @@ def _expert_keys(W, m):
 
 
 def _expert_weight(ex, name, idx, group):
-    """Selected experts' weight [n, out, in] bf16. `ex` holds stacked tensors: either "<name>" bf16 [E, out, in]
-    or AWQ "<name>.qweight/.qzeros/.scales" stacked over E."""
+    """Selected experts' weight [n, out, in] bf16. `ex` holds stacked tensors: "<name>" bf16 [E, out, in], AWQ
+    "<name>.qweight/.qzeros/.scales" or NVFP4 "<name>.weight/.weight_scale/.weight_scale_2", stacked over E."""
     if name in ex:
         return ex[name][idx]
+    if name + ".weight_scale" in ex:
+        return nvfp4_dequant(ex[name + ".weight"][idx], ex[name + ".weight_scale"][idx], ex[name + ".weight_scale_2"][idx])
     return awq_dequant(ex[name + ".qweight"][idx], ex[name + ".qzeros"][idx], ex[name + ".scales"][idx], group)
+
+
+def make_linear(W, name, mode, group):
+    """The linear stored under `name` (".weight") in its checkpoint format: NVFP4 (with .weight_scale/.weight_scale_2),
+    FP8 e4m3 (with a per-tensor .weight_scale), else bf16 weights quantised to `mode` (bf16 / int8 / int4)."""
+    base = name[:-len(".weight")]
+    w = W.pop(name)
+    W.pop(base + ".input_scale", None)                     # static activation scale: unused (weight-only paths)
+    if base + ".weight_scale_2" in W:
+        return QLinear(mode="nvfp4", q=w, s=W.pop(base + ".weight_scale"), s2=W.pop(base + ".weight_scale_2"))
+    if w.dtype == torch.float8_e4m3fn:
+        return QLinear(mode="fp8", q=w, s=W.pop(base + ".weight_scale"))
+    return QLinear(w, mode=mode, group=group)
