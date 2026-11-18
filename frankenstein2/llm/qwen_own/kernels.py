@@ -57,6 +57,31 @@ try:                                                    # pragma: no cover - nee
         sc = tl.load(s_ptr + rows, mask=rmask, other=0.0).to(tl.float32)
         tl.store(y_ptr + p * N + rows, (acc * sc).to(tl.bfloat16), mask=rmask)
 
+    @triton.jit
+    def _awq_grouped_gemm(x_ptr, qw_ptr, qz_ptr, sc_ptr, eid_ptr, y_ptr, M, K, N, G,
+                          sxe, sxm, sqe, sqk, sze, szk, sse, ssk, sye, sym,
+                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        h = tl.program_id(0)
+        mb = tl.program_id(1)
+        nb = tl.program_id(2)
+        e = tl.load(eid_ptr + h).to(tl.int64)
+        rows = mb * BM + tl.arange(0, BM)
+        rmask = rows < M
+        cols = nb * BN + tl.arange(0, BN)
+        pcol = cols // 8
+        shift = ((cols % 2) * 4 + (cols % 8) // 2) * 4
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            ks = k0 + tl.arange(0, BK)
+            a = tl.load(x_ptr + h * sxe + rows[:, None] * sxm + ks[None, :], mask=rmask[:, None], other=0.0)
+            q = tl.load(qw_ptr + e * sqe + ks[:, None] * sqk + pcol[None, :])
+            gi = ks // G
+            z = tl.load(qz_ptr + e * sze + gi[:, None] * szk + pcol[None, :])
+            sc = tl.load(sc_ptr + e * sse + gi[:, None] * ssk + cols[None, :]).to(tl.float32)
+            w = (((q >> shift[None, :]) & 0xF) - ((z >> shift[None, :]) & 0xF)).to(tl.float32) * sc
+            acc += tl.dot(a.to(tl.bfloat16), w.to(tl.bfloat16))
+        tl.store(y_ptr + h * sye + rows[:, None] * sym + cols[None, :], acc.to(tl.bfloat16), mask=rmask[:, None])
+
     HAVE_TRITON = True
 except Exception:                                       # pragma: no cover
     HAVE_TRITON = False
@@ -88,3 +113,27 @@ def w8_gemv(x, q, s, use_triton=True):
         _w8_gemv[grid](x, q, s, y, K, N, x.stride(0), q.stride(0), BLOCK_N=64, BLOCK_K=128)
         return y
     return torch.nn.functional.linear(x, q.to(torch.bfloat16) * s)
+
+
+def awq_grouped_gemm(X, qweight, qzeros, scales, eids, group, use_triton=True):
+    """Prefill: Y[h] = X[h] @ dequant(W[eids[h]]) for each hit expert h, X [n_hit, M, K] bf16 (rows padded per
+    expert). Dequantisation happens inside the tiles (tensor-core dot), the bf16 weights are never materialised."""
+    nh, M, K = X.shape
+    N = scales.shape[-1]
+    ok_shape = K % 64 == 0 and N % 64 == 0 and (64 % group == 0 or group % 64 == 0)
+    if use_triton and HAVE_TRITON and X.is_cuda and ok_shape:
+        X = X.contiguous()
+        Y = torch.empty(nh, M, N, dtype=torch.bfloat16, device=X.device)
+        BM = 16 if M <= 16 else 32
+        grid = (nh, triton.cdiv(M, BM), N // 64)
+        try:                                   # 2 pipeline stages: fits ~100 KB shared memory (sm_89, sm_12x)
+            _awq_grouped_gemm[grid](X, qweight, qzeros, scales, eids, Y, M, K, N, group,
+                                    X.stride(0), X.stride(1), qweight.stride(0), qweight.stride(1), qzeros.stride(0),
+                                    qzeros.stride(1), scales.stride(0), scales.stride(1), Y.stride(0), Y.stride(1),
+                                    BM=BM, BN=64, BK=64, num_stages=2, num_warps=4)
+            return Y
+        except Exception as e:                 # out of shared memory on a smaller part: the torch path below
+            if "out of resource" not in str(e).lower():
+                raise
+    w = awq_dequant(qweight[eids], qzeros[eids], scales[eids], group)       # [n_hit, N, K]
+    return X @ w.transpose(-1, -2)

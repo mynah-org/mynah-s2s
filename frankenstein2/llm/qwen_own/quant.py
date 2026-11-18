@@ -9,31 +9,22 @@ import torch
 import torch.nn.functional as F
 
 AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)        # AutoAWQ packs 8 nibbles per int32 in this interleaved order
-_SHIFTS = None
-
-
-def _shifts(device):
-    global _SHIFTS
-    if _SHIFTS is None or _SHIFTS.device != device:
-        _SHIFTS = torch.arange(0, 32, 4, device=device, dtype=torch.int32)
-    return _SHIFTS
-
-
 def awq_unpack(q: torch.Tensor) -> torch.Tensor:
-    """int32 [..., rows, cols/8] (AWQ order) -> int32 [..., rows, cols] values 0..15 in natural column order."""
-    v = (q.unsqueeze(-1) >> _shifts(q.device)) & 0xF                       # [..., rows, cols/8, 8]
-    v = v[..., list(AWQ_REVERSE_ORDER)]
-    return v.reshape(*q.shape[:-1], q.shape[-1] * 8)
+    """int32 [..., rows, cols/8] (AWQ order) -> int32 [..., rows, cols] values 0..15 in natural column order (one
+    shift per natural column: column 8p+j sits in nibble AWQ_REVERSE_ORDER[j] of packed word p)."""
+    sh = torch.tensor([4 * r for r in AWQ_REVERSE_ORDER], device=q.device, dtype=torch.int32)
+    return ((q.unsqueeze(-1) >> sh) & 0xF).reshape(*q.shape[:-1], q.shape[-1] * 8)
 
 
 def awq_dequant(qweight, qzeros, scales, group: int) -> torch.Tensor:
     """AutoAWQ GEMM tensors -> bf16 weight [..., out, in] for F.linear. qweight [..., in, out/8], qzeros
-    [..., in/group, out/8], scales [..., in/group, out]."""
+    [..., in/group, out/8], scales [..., in/group, out]. Zeros and scales broadcast per group (no repeat copies)."""
     w = awq_unpack(qweight)                                                # [..., in, out]
     z = awq_unpack(qzeros)                                                 # [..., in/g, out]
-    z = z.repeat_interleave(group, dim=-2)
-    s = scales.repeat_interleave(group, dim=-2)
-    return ((w - z).to(s.dtype) * s).transpose(-1, -2).to(torch.bfloat16)
+    *lead, i_, o = w.shape
+    w = w.reshape(*lead, i_ // group, group, o)
+    w = (w - z.unsqueeze(-2)).to(scales.dtype) * scales.unsqueeze(-2)
+    return w.reshape(*lead, i_, o).transpose(-1, -2).to(torch.bfloat16)
 
 
 class QLinear:

@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import QwenCfg
-from .kernels import awq_expert_gemv
+from .kernels import awq_expert_gemv, awq_grouped_gemm
 from .quant import QLinear, awq_dequant
 
 
@@ -283,12 +283,18 @@ class Model:
             maxc = int(counts.max())
             X = torch.zeros(hit.numel(), maxc, H, dtype=h.dtype, device=h.device)
             X[row, rank] = h[tok]
-            wg = _expert_weight(ex, "gate_proj", hit, grp)                     # [n_hit, I, H]
-            wu = _expert_weight(ex, "up_proj", hit, grp)
-            a = F.silu(X @ wg.transpose(-1, -2)) * (X @ wu.transpose(-1, -2))
-            del wg, wu
-            wd = _expert_weight(ex, "down_proj", hit, grp)                     # [n_hit, H, I]
-            Y = a @ wd.transpose(-1, -2)                                       # [n_hit, maxc, H]
+            if "gate_proj.qweight" in ex and self.use_kernels:                 # AWQ: fused dequant grouped GEMM
+                gg = lambda nm, xx: awq_grouped_gemm(xx, ex[nm + ".qweight"], ex[nm + ".qzeros"],    # noqa: E731
+                                                     ex[nm + ".scales"], hit, grp)
+                a = F.silu(gg("gate_proj", X)) * gg("up_proj", X)
+                Y = gg("down_proj", a)
+            else:
+                wg = _expert_weight(ex, "gate_proj", hit, grp)                 # [n_hit, I, H]
+                wu = _expert_weight(ex, "up_proj", hit, grp)
+                a = F.silu(X @ wg.transpose(-1, -2)) * (X @ wu.transpose(-1, -2))
+                del wg, wu
+                wd = _expert_weight(ex, "down_proj", hit, grp)                 # [n_hit, H, I]
+                Y = a @ wd.transpose(-1, -2)                                   # [n_hit, maxc, H]
             out.index_add_(0, tok, Y[row, rank] * wts[order][:, None])
         return (out + sh).reshape(B, T, H)
 
