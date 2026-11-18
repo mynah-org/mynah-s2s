@@ -238,8 +238,8 @@ class EarsSession:
             for t, tok in self.rnnt.decode(self.rnnt.project(last[:1])[0]):
                 p = self.proc.tokenizer.convert_ids_to_tokens(tok)
                 pieces.append({"f": self.frames_in + t, "p": p, "id": tok})
-                if is_tag(p):
-                    self.rnnt.fresh()
+                # A language tag (e.g. <it-IT> after a sentence) is dropped from the text but does NOT reset the
+                # predictor: f2-003 showed a reset there deleting the next words ("Mi [chiamo Mario] Rossi").
             if self.window is None:
                 dbs = []
                 for j in range(T):

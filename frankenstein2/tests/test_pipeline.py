@@ -128,3 +128,13 @@ def test_words_after_an_early_endpoint_cancel_and_merge():
     run(p, 60)
     assert [a["reason"] for a in tr.of("ctl.action") if a["kind"] == "CANCEL"] == ["user_continues"]
     assert llm.submitted[1][1] == [{"role": "user", "content": "cerco un divano a tre posti"}]
+
+
+def test_punctuation_or_tag_after_endpoint_is_not_a_continuation():
+    ears = {"s": {2: {"pieces": pieces(4, "vorrei sapere dov'è il mio ordine"), "events": [ev("ENDPOINT", 10)]},
+                  3: {"pieces": [{"f": 14, "p": ".", "id": 0}, {"f": 14, "p": "▁", "id": 0},
+                                 {"f": 14, "p": "<it-IT>", "id": 0}]}}}
+    p, be, llm, talker, tr = make("s", "it", ears, lambda m: [("wait", 10), ("text", "Certo.")])
+    run(p, 40)
+    assert not [a for a in tr.of("ctl.action") if a["kind"] == "CANCEL"]
+    assert [s["text"] for s in talker.said] == ["Certo."]

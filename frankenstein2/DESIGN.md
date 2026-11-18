@@ -27,7 +27,8 @@ environment. Each session has its own language, encoder caches, GRU state and ru
 - **Transcript.** True cache-aware streaming with lookahead k=3: 320 ms chunks, `chunked_limited` attention, and
   causal conv caches carried across chunks.
   - Mel frames per chunk: 25 for the first chunk, then 32 per chunk.
-  - Only the user row is decoded. The greedy RNN-T keeps its predictor state across hops.
+  - Only the user row is decoded. The greedy RNN-T keeps its predictor state across hops. A language tag such as
+    `<it-IT>` is dropped from the text without resetting the predictor: a reset there deleted the next words.
   - The language prompt is always explicit (`it` / `fr` / `en`). There is no auto-detection by default.
   - Checked against an offline pass over the whole track with the same lookahead: the last layer matches to within
     4e-6 (max abs) and layer 15 has cosine 1.0. The transcripts are equal except for one repeated short word.
@@ -47,7 +48,9 @@ environment. Each session has its own language, encoder caches, GRU state and ru
   - BARGE: `yield ≥ 0.4` for 2 frames, with `onset_s`.
   - BACKCHANNEL: `bc ≥ 0.4` for 2 frames, then a 1.2 s refractory period.
   - 6 warm-up frames after each reset or mode switch.
-  - Thresholds can be set per language (`--ep-thr it=0.85`).
+  - Thresholds can be set per language (`--ep-thr it=0.85`). On the Italian session, 0.85 roughly halves the
+    endpoint latency; the extra early fires fall in inner pauses and are recovered by the continuation guard and
+    the unheard-barge merge.
 - **2nd ear.** The agent channel is the agent audio exactly as the playout released it, delayed by the client delay
   and resampled 24→16 kHz with a zero-latency resampler. Backchannel audio is never in it.
 
@@ -164,6 +167,9 @@ The trace records:
 - what was heard after a barge.
 
 ## 8. Known limits
+- End-to-end runs (Italian session, fixed and reactive user): tools with parameters right for `find_customer`, but
+  the text LLM answers the catalogue question without calling `search_catalog`; barge-in by the yield head is slow
+  (seconds, Tyger's known weakness off English); cache-aware GRU features would need a fine-tune.
 
 - The GRU was trained on English. In synthetic tests, Italian and French endpointing work; barge-in recall is
   weaker off English.

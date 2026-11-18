@@ -41,10 +41,15 @@ def add_args(ap) -> None:
     ap.add_argument("--chunking", default="", help="talker chunking override: sentence | whole | progressive")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--ep-thr", action="append", default=[], help="LANG=threshold for the endpoint head")
+    ap.add_argument("--child-env", action="append", default=[],
+                    help="KEY=VALUE for the ears and talker processes (their own environments' caches / headers)")
 
 
 def child_env(a, extra: dict | None = None) -> dict:
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    """The parent's environment minus PYTHONPATH and HF_HUB_CACHE (a child environment has its own cache, given
+    as HF_HOME through --child-env / --pocket-hf-home), plus --child-env."""
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "HF_HUB_CACHE")}
+    env.update(dict(x.split("=", 1) for x in getattr(a, "child_env", []) or []))
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PYTHONDONTWRITEBYTECODE="1")
     if a.threads:
         env.update(OMP_NUM_THREADS=str(a.threads), MKL_NUM_THREADS=str(a.threads))

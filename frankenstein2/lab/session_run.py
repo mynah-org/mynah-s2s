@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "frankenstein"))
 
 TOOLS_EXPECTED = [{"name": "search_catalog", "args": {"query": "divano"}},
-                  {"name": "find_customer", "args": {"name": "Rossi", "postcode": "10121"}}]
+                  {"name": "find_customer", "args": {"full_name": "Mario Rossi", "postcode": "10121"}}]
 
 
 def mem_available_gb():
@@ -276,6 +276,7 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--llm", default="nano", choices=["nano", "scripted"])
     ap.add_argument("--bf16-arm", action="store_true", help="after the INT4 arms, arm A again with INT4 decode off")
     ap.add_argument("--session-voice", default="")
+    ap.add_argument("--warm-llm", action="store_true", help="one request through the LLM before the arms")
     ap.add_argument("--content", action="store_true")
     ap.add_argument("--budget-s", type=float, default=1e9)
     a = ap.parse_args()
@@ -321,6 +322,16 @@ def main():  # pragma: no cover - model run
         res_mem["after_nano"] = {"mem_available_gb": mem_available_gb(), **cuda_snapshot(torch), "nano": shared.mem,
                                  "engine_rss_gb": rss_gb(), "procs": proc_mem(ears, pocket)}
         make_llm = B.llm_factory(a, shared, spec)
+        if a.warm_llm:                    # f2-003: the first request after load took ~7 s (cold kernels)
+            t = time.monotonic()
+            w = make_llm("warm", "it")
+            w.submit(1, [{"role": "user", "content": "Buongiorno, cerco un divano a tre posti."}])
+            done = False
+            while not done and time.monotonic() - t < 90:
+                done = any(e["ev"] == "done" for e in w.poll())
+                time.sleep(0.05)
+            w.close()
+            info["llm_warm_s"] = round(time.monotonic() - t, 1)
     else:
         make_llm = scripted_llm_factory()
     save()

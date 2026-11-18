@@ -41,6 +41,11 @@ BACKCHANNEL = {"it": "Mh-mh.", "fr": "Mh-mh.", "en": "Mm-hmm.", "de": "Mh-mh.", 
 STEP = 1280
 
 
+def _tag(p: str) -> bool:
+    s = p.strip().replace("\u2581", "")
+    return s.startswith("<") and s.endswith(">")
+
+
 @dataclass
 class PipelineConfig:
     lang: str = "it"
@@ -163,7 +168,8 @@ class Pipeline:
             self.tr.emit("asr.piece", k, pieces=[[p["f"], p["p"]] for p in r["pieces"]])
             c = self.ctl
             if c.state is not St.LISTENING and self.last_ep_frame is not None and not self.continues_posted and \
-                    any(p["f"] > self.last_ep_frame + 1 and p["p"].strip("\u2581 ") for p in r["pieces"]):
+                    any(p["f"] > self.last_ep_frame + 2 and any(ch.isalnum() for ch in p["p"]) and
+                        not _tag(p["p"]) for p in r["pieces"]):
                 self.continues_posted = True
                 self.stats["continues"].append({"step": k})
                 heard = self.playout.turn_first_step(c.epoch, c.turn, holding=False) is not None
