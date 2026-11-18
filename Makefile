@@ -96,7 +96,7 @@ webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ct
 		kill -0 $$gpu_pid 2>/dev/null || { tail -40 $(WEBUI_GPU_LOG); exit 1; }; \
 		sleep 2; \
 	done; \
-	if command -v uv >/dev/null 2>&1; then uv run --project webui --extra gpu python webui/server.py --v2-ws $(WEBUI_V2_WS) --profile $(WEBUI_GPU_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --v2-ws $(WEBUI_V2_WS) --profile $(WEBUI_GPU_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); fi
+	if command -v uv >/dev/null 2>&1; then uv run --project webui --extra gpu python webui/server.py --v2-ws $(WEBUI_V2_WS) --engine $(ENGINE) --profile $(WEBUI_GPU_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --v2-ws $(WEBUI_V2_WS) --engine $(ENGINE) --profile $(WEBUI_GPU_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); fi
 client: ## stream a WAV to the server at real-time pace: make client WAV=path/to.wav
 	$(M) client $(WAV)
 ws-check: ## non-interactive server + client round trip on one corpus item (WS_ITEM=q03 by default); fails on dropped audio / no answer

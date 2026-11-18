@@ -97,6 +97,7 @@ class StaticHandler(SimpleHTTPRequestHandler):
                 "gpu_configured": configured,
                 "v2_reachable": probe_v2(self.server.v2_ws) if configured else False,
                 "profile": self.server.profile,
+                "engine": self.server.engine,
                 "profile_label": profile_label(self.server.profile),
                 "audio_samples": bool(self.server.audio_root and self.server.audio_root.is_dir()),
                 "ws_path": "/ws",
@@ -438,6 +439,8 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="bind address; use 0.0.0.0 for LAN")
     parser.add_argument("--advertise-host", default=None, help="host printed as the LAN URL (e.g. 192.0.2.20)")
     parser.add_argument("--port", type=int, default=8787, help="static UI port")
+    parser.add_argument("--engine", choices=["voicechat", "frankenstein"], default="voicechat",
+                        help="which S2S server the GPU backend talks to: the official English VoiceChat engine or the multilingual Frankenstein engine (language and voice selectors)")
     parser.add_argument("--ws-port", type=int, default=8788, help="browser WebSocket port")
     parser.add_argument("--v2-ws", default=None, help="GPU server URL, e.g. ws://127.0.0.1:8765/v1/session")
     parser.add_argument("--profile", choices=["int4", "q8", "bf16", "demo"], default=None,
@@ -451,6 +454,7 @@ def main():
     audio_root = Path(args.audio_root).expanduser() if args.audio_root else None
     httpd = WebUIHTTPServer((args.host, args.port), lambda *a, **kw: StaticHandler(*a, directory=str(root), **kw),
                             v2_ws=args.v2_ws, profile=args.profile, audio_root=audio_root)
+    httpd.engine = args.engine                   # reported by /api/config: the page shows LANGUAGE/VOICE only for frankenstein
     httpd.ws_port = args.ws_port                 # reported by /api/config: the page connects to it (any UI port)
     http_thread = threading.Thread(target=httpd.serve_forever, name="webui-http", daemon=True)
     http_thread.start()

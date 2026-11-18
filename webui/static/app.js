@@ -7,8 +7,8 @@ async function boot() {
   const select = $("scenarioSelect");
   data.scenarios.forEach((s) => { const option = document.createElement("option"); option.value = s.id; option.textContent = s.name; select.append(option); });
   select.addEventListener("change", () => { if (state.ws && state.ws.readyState < 2) resetSession(); updateScenario(); });
-  $("transportSelect").addEventListener("change", () => { if (state.ws && state.ws.readyState < 2) resetSession(); state.transport = $("transportSelect").value; updateProfile(state.transport === "gpu" ? state.profile : "demo", false); setConnection("idle", state.transport === "gpu" ? "V2 GPU bridge offline" : "Local demo offline"); setAgent("idle", "Voice agent offline"); updateScenario(); updateMicNote(); updateMicButton(); });
-  $("inputSelect").addEventListener("change", () => { if (state.sampleRun) stopSample(); updateScenario(); updateMicNote(); updateMicButton(); });
+  $("transportSelect").addEventListener("change", () => { if (state.ws && state.ws.readyState < 2) resetSession(); state.transport = $("transportSelect").value; updateProfile(state.transport === "gpu" ? state.profile : "demo", false); setConnection("idle", state.transport === "gpu" ? "V2 GPU bridge offline" : "Local demo offline"); setAgent("idle", "Voice agent offline"); updateEngineFields(); updateScenario(); updateMicNote(); updateMicButton(); });
+  $("inputSelect").addEventListener("change", () => { if (state.sampleRun) stopSample(); updateEngineFields(); updateScenario(); updateMicNote(); updateMicButton(); });
   $("connectButton").addEventListener("click", connect);
   $("micButton").addEventListener("click", toggleMic);
   $("trySuggestion").addEventListener("click", trySuggestion);
@@ -22,11 +22,15 @@ async function boot() {
   updateProfile(state.transport === "gpu" ? state.profile : "demo", false);
   state.gpuConfigured = Boolean(config.gpu_configured && config.v2_reachable !== false);
   state.wsPort = config.ws_port ? String(config.ws_port) : null;
+  state.engine = config.engine || "voicechat";
+  updateEngineFields();
   if (!config.gpu_configured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · not configured"; }
   else if (!state.gpuConfigured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · offline"; }
   updateScenario();
 }
 
+// Official VoiceChat is English-only with its own voice: LANGUAGE/VOICE apply to the Frankenstein engine only.
+function updateEngineFields() { const multi = state.engine === "frankenstein" && state.transport === "gpu"; document.querySelectorAll(".lang-field, .voice-field").forEach((el) => { el.hidden = !multi; }); }
 function currentScenario() { return state.scenarios[$("scenarioSelect").value]; }
 function updateScenario() {
   const s = currentScenario(); if (!s) return;
@@ -85,7 +89,7 @@ function connect() {
   if (state.transport === "gpu" && !state.audioIn) { try { state.audioIn = new AudioContext({sampleRate:16000}); } catch (_) { state.audioIn = new AudioContext(); } }
   const ws = new WebSocket(`${protocol}://${location.hostname}:${state.wsPort || (location.port === "8787" ? "8788" : location.port)}/ws`);
   state.ws = ws; state.closing = false; ws.binaryType = "arraybuffer";
-  ws.onopen = () => { setConnection("ok", state.transport === "gpu" ? "V2 bridge connected" : "Demo bridge connected"); $("connectButton").textContent = "Disconnect"; $("micButton").disabled = false; setSession("Opening agent…", true); state.t0 = performance.now(); const rate = state.audioIn?.sampleRate || 16000; ws.send(JSON.stringify({type:"session.start", transport:state.transport, scenario:currentScenario().id, system_prompt:$("promptEditor").value, input_rate:rate, language:$("languageSelect")?.value || undefined, voice:$("voiceSelect")?.value || undefined})); };
+  ws.onopen = () => { setConnection("ok", state.transport === "gpu" ? "V2 bridge connected" : "Demo bridge connected"); $("connectButton").textContent = "Disconnect"; $("micButton").disabled = false; setSession("Opening agent…", true); state.t0 = performance.now(); const rate = state.audioIn?.sampleRate || 16000; ws.send(JSON.stringify({type:"session.start", transport:state.transport, scenario:currentScenario().id, system_prompt:$("promptEditor").value, input_rate:rate, language:state.engine === "frankenstein" ? ($("languageSelect")?.value || undefined) : undefined, voice:state.engine === "frankenstein" ? ($("voiceSelect")?.value || undefined) : undefined})); };
   ws.onmessage = (e) => { if (typeof e.data === "string") { try { handleJson(JSON.parse(e.data)); } catch (_) { setSession("Invalid bridge message"); } } else playPcm(e.data); };
   ws.onerror = () => { if (state.ws !== ws) return; setConnection("error", state.transport === "gpu" ? "V2 bridge unreachable" : "Demo bridge unreachable"); setAgent("error", "Voice agent offline"); setSession("Connection error"); $("micButton").disabled = true; };
   ws.onclose = () => { if (state.ws !== ws) return; state.ws = null; state.connected = false; state.closing = false; $("connectButton").textContent = "Reconnect"; $("micButton").disabled = true; stopMic(); stopSample(); stopAudioOutput(); updateProfile(state.transport === "gpu" ? state.profile : "demo", false); setAgent("idle", "Voice agent offline"); setConnection("idle", state.transport === "gpu" ? "V2 bridge offline" : "Demo bridge offline"); setSession("Disconnected"); updateMicNote(); };

@@ -32,6 +32,32 @@ default (and enables cuDNN benchmarking):
 make webui-gpu
 ```
 
+### Choosing the speech-to-speech engine
+
+One start serves one engine; loading takes minutes, so the choice is made with
+`make`, not in the browser:
+
+| Engine | Start | Languages | Browser |
+|---|---|---|---|
+| Official VoiceChat (default) | `make webui-gpu` | English only | no language or voice selector |
+| Frankenstein (experimental, `frankenstein/`) | `make webui-gpu ENGINE=frankenstein FRANK_SERVE_ARGS="…"` | the text-to-speech languages (Italian, English, French, German, Spanish, Portuguese, Russian, Chinese, Japanese, Korean) | LANGUAGE and VOICE selectors |
+
+The bridge reports the engine in `/api/config`, and the page shows the LANGUAGE
+and VOICE selectors only for Frankenstein. Frankenstein's server needs the
+paths of its components, for example:
+
+```bash
+make webui-gpu ENGINE=frankenstein FRANK_SERVE_ARGS="--trace-dir /tmp/frank-traces \
+  --lab-scripts /path/to/labs-scripts --nano-dir /path/to/nemotron-nano \
+  --flash-python /path/to/tts-env/bin/python --flash-harness /path/to/harness \
+  --flash-root /path/to/tts-weights --flash-voice /path/to/voice.pt \
+  --clone Aria=/path/to/reference.wav"
+```
+
+See `frankenstein/README.md` and `frankenstein/INTEGRATION.md` for what each
+component is and the current limits (one session at a time, slower than real
+time while the agent speaks).
+
 The control strip reports the profile of the server that was started. Keep the
 label aligned with the V2 flags when comparing profiles:
 
