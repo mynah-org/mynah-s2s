@@ -79,9 +79,16 @@ ENGINE ?= voicechat
 FRANK_DIR ?= $(CURDIR)
 FRANK_PORT ?= 8771
 FRANK_SERVE_ARGS ?=
+# ENGINE=frankenstein2: Frankenstein v2 (Nemotron streaming ASR + Tyger turn-taking GRU, text LLM with tools, Pocket
+# talker), from frankenstein2/ (FRANK2_SERVE_ARGS = its model paths, see frankenstein2/server/build.py).
+FRANK2_PORT ?= 8772
+FRANK2_SERVE_ARGS ?=
 ifeq ($(ENGINE),frankenstein)
 WEBUI_SERVE_CMD = cd $(FRANK_DIR) && PYTHONPATH=$(FRANK_DIR)/v2/src $(WEBUI_PYTHON) frankenstein/server/serve.py --port $(FRANK_PORT) $(FRANK_SERVE_ARGS)
 WEBUI_V2_WS = ws://127.0.0.1:$(FRANK_PORT)/v1/session
+else ifeq ($(ENGINE),frankenstein2)
+WEBUI_SERVE_CMD = cd $(FRANK_DIR) && PYTHONPATH=$(FRANK_DIR)/v2/src $(WEBUI_PYTHON) frankenstein2/server/serve.py --port $(FRANK2_PORT) --trace-dir $(FRANK_DIR)/.f2-traces $(FRANK2_SERVE_ARGS)
+WEBUI_V2_WS = ws://127.0.0.1:$(FRANK2_PORT)/v1/session
 else
 WEBUI_SERVE_CMD = ARGS="$(V2_SERVE_ARGS)" $(M) serve
 WEBUI_V2_WS = ws://127.0.0.1:8765/v1/session

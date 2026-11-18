@@ -15,6 +15,10 @@ licenses; you are responsible for complying with them. This file is informationa
   ([nvidia/NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2)); see its model
   card for its license (revision `6533e8d`).
 
+- **Tyger turn-taking bundle** (`nineninesix/tyger` @`cd826db`: the turn-taking GRU and a copy of NVIDIA Nemotron 3.5
+  ASR streaming 0.6B @`ea30d66`), OpenMDW 1.1 per its model card; used at runtime by Frankenstein v2's ears
+  (`frankenstein2/`), not redistributed.
+
 ## Reference inference code (not vendored)
 
 - **NVIDIA NeMo Speech**, branch `nemotron-labs-voicechat` @ `097dfe9`
@@ -35,6 +39,9 @@ SPDX header saying which part is derived and that it was modified.
 | `v2/src/mynah_v2/model/perf.py` | `_make_generate_step` (EarTTS MoG refinement step without host syncs) | NeMo Speech `speechlm2/modules/ear_tts_model.py` @097dfe9, © NVIDIA CORPORATION & AFFILIATES (Apache-2.0) |
 | `v2/src/mynah_v2/model/codec_async.py` | `spec_to_wav` ops in `make_cached_spec_to_wav` | NeMo Speech `speechlm2/modules/ear_tts_vae_codec.py` @097dfe9, © NVIDIA CORPORATION & AFFILIATES (Apache-2.0) |
 | `v2/tests/cpu/test_codec_async.py` | `_upstream_spec_to_wav` (unmodified reference copy for a bit-identity test) | same as above (Apache-2.0) |
+| `frankenstein2/ears/rules.py` | turn rules (endpoint / barge-in / backchannel decisions, state display) | tyger-s2s `app/plugins/ears/tyger/rules.py`, `session.py`, `constants.py` @97d011d, © the tyger-s2s authors (Apache-2.0) |
+| `frankenstein2/ears/turntaker.py` | the turn-taking GRU module definition and bundle loading | tyger-s2s `app/plugins/ears/tyger/controller.py`, `bundle.py` @97d011d, © the tyger-s2s authors (Apache-2.0) |
+| `frankenstein2/ears/window.py` | device log-mel features and the layer-15 window encode | tyger-s2s `app/plugins/ears/tyger/asr.py` @97d011d, © the tyger-s2s authors (Apache-2.0) |
 
 Other files reference upstream line numbers in comments to explain what they interact with; they do not copy it.
 

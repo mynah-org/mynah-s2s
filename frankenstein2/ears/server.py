@@ -1,0 +1,133 @@
+"""The ears as a JSON-lines process (run with the python of an environment that has transformers >= 5.13 for
+Nemotron 3.5 ASR; the engine's own environment may pin another transformers).
+
+  stdin   {"op": "open", "sid", "lang": "it", "thr": {...}}          a new session (fresh caches, GRU, rules)
+          {"op": "hop", "sid", "n", "mode": "listen"|"speaking", "reset": bool, "u": b64 float32[5120], "a": ...}
+          {"op": "transcribe", "id", "lang", "pcm": b64 float32}    offline transcript (content evidence)
+          {"op": "mem"} | {"op": "close", "sid"} | {"op": "quit"}
+  stdout  {"ev": "ready", ...} | {"ev": "opened", ...} | {"ev": "hop", "n", "frames", "events", "pieces", "ms", ...}
+          | {"ev": "transcript", "id", "text", "ms"} | {"ev": "closed", "stats"} | {"ev": "error", "error"}
+
+Several sessions, each with its own language and its own state (``EarsSession``: encoder caches, windows, RNN-T
+predictor, GRU state, rules); every reply carries the session id. Hops are served in arrival order (not batched
+across sessions yet). Prints nothing else on stdout (logs go to stderr).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+PROMPTS = {"auto": 101, "en": 0, "it": 15, "fr": 8, "de": 9, "es": 3}
+
+
+def rss_gb() -> float:
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 2 ** 20, 3)
+    except OSError:
+        pass
+    return -1.0
+
+
+def b64f32(s: str):
+    import numpy as np
+    return np.frombuffer(base64.b64decode(s), dtype="<f4").copy()
+
+
+def main():  # pragma: no cover - model process
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bundle", required=True, help="tyger bundle dir (config.json, model.safetensors, nemotron/)")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--lookahead", type=int, default=3)
+    ap.add_argument("--no-sha", action="store_true")
+    a = ap.parse_args()
+    out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    sys.stdout = sys.stderr
+
+    def emit(o):
+        out.write(json.dumps(o, ensure_ascii=False) + "\n")
+        out.flush()
+    import numpy as np
+    import torch
+    from frankenstein2.ears.rules import Thresholds
+    from frankenstein2.ears.stream import EarsSession, transcribe_offline
+    from frankenstein2.ears.turntaker import load_bundle
+    t0 = time.monotonic()
+    dev = a.device if (a.device == "cpu" or torch.cuda.is_available()) else "cpu"
+    model, proc, tt, cfg = load_bundle(a.bundle, check_sha=not a.no_sha)
+    model.to(dev)
+    tt.to(dev)
+    pdict = dict(getattr(proc, "prompt_dictionary", None) or {}) or PROMPTS
+
+    def mem():
+        if dev == "cpu":
+            return {}
+        return {"cuda_allocated_gb": round(torch.cuda.memory_allocated() / 2 ** 30, 3),
+                "cuda_reserved_gb": round(torch.cuda.memory_reserved() / 2 ** 30, 3),
+                "cuda_peak_gb": round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)}
+    emit({"ev": "ready", "device": dev, "load_s": round(time.monotonic() - t0, 1), "lookahead": a.lookahead,
+          "torch": torch.__version__, "tf32": torch.backends.cuda.matmul.allow_tf32,
+          "capability": list(torch.cuda.get_device_capability()) if dev != "cpu" else None, **mem(),
+          "rss_gb": rss_gb()})
+    sessions, stats = {}, {}
+    for line in sys.stdin:
+        try:
+            c = json.loads(line)
+        except ValueError:
+            continue
+        op = c.get("op")
+        try:
+            if op == "quit":
+                break
+            if op == "open":
+                lang = c.get("lang", "it")
+                thr = Thresholds(**(c.get("thr") or {}))
+                if lang not in PROMPTS and lang not in pdict:
+                    raise ValueError(f"no ASR prompt for language {lang!r}")
+                sid = c["sid"]
+                sessions[sid] = EarsSession(model, proc, tt, dev, int(pdict.get(lang, PROMPTS.get(lang))), thr,
+                                            k=a.lookahead, gru_features=c.get("gru_features", "window"))
+                stats[sid] = {"hops": 0, "ms": [], "enc_ms": [], "win_ms": []}
+                emit({"ev": "opened", "sid": sid, "lang": lang, "prompt_id": sessions[sid].rnnt.prompt_id,
+                      "thr": thr.__dict__, **mem()})
+            elif op == "hop":
+                sid = c["sid"]
+                with torch.inference_mode():
+                    r = sessions[sid].hop(b64f32(c["u"]), b64f32(c["a"]), c["mode"], bool(c.get("reset")))
+                st = stats[sid]
+                st["hops"] += 1
+                for key in ("ms", "enc_ms", "win_ms"):
+                    st[key].append(r[key])
+                emit({"ev": "hop", "sid": sid, "n": c["n"], "t_ns": time.monotonic_ns(), **r})
+            elif op == "transcribe":
+                t1 = time.monotonic()
+                lang = c.get("lang", "it")
+                with torch.inference_mode():
+                    txt = transcribe_offline(model, proc, b64f32(c["pcm"]),
+                                             int(pdict.get(lang, PROMPTS.get(lang, 101))), dev, k=a.lookahead)
+                emit({"ev": "transcript", "id": c.get("id"), "text": txt,
+                      "ms": round((time.monotonic() - t1) * 1e3, 1)})
+            elif op == "mem":
+                emit({"ev": "mem", "id": c.get("id"), **mem(), "rss_gb": rss_gb()})
+            elif op == "close":
+                sid = c["sid"]
+                sessions.pop(sid, None)
+                emit({"ev": "closed", "sid": sid, "stats": stats.pop(sid, {}), **mem()})
+        except Exception as e:  # noqa: BLE001 - report, keep serving
+            import traceback
+            traceback.print_exc()
+            emit({"ev": "error", "op": op, "sid": c.get("sid"), "n": c.get("n"), "error": f"{type(e).__name__}: {str(e)[:300]}"})
+    emit({"ev": "bye", **mem()})
+
+
+if __name__ == "__main__":
+    main()

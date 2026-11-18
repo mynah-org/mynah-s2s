@@ -30,7 +30,7 @@ async function boot() {
 }
 
 // Official VoiceChat is English-only with its own voice: LANGUAGE/VOICE apply to the Frankenstein engine only.
-function updateEngineFields() { const multi = state.engine === "frankenstein" && state.transport === "gpu"; document.querySelectorAll(".lang-field, .voice-field").forEach((el) => { el.hidden = !multi; }); }
+function updateEngineFields() { const multi = (state.engine === "frankenstein" || state.engine === "frankenstein2") && state.transport === "gpu"; document.querySelectorAll(".lang-field, .voice-field").forEach((el) => { el.hidden = !multi; }); }
 function currentScenario() { return state.scenarios[$("scenarioSelect").value]; }
 function updateScenario() {
   const s = currentScenario(); if (!s) return;
@@ -89,7 +89,7 @@ function connect() {
   if (state.transport === "gpu" && !state.audioIn) { try { state.audioIn = new AudioContext({sampleRate:16000}); } catch (_) { state.audioIn = new AudioContext(); } }
   const ws = new WebSocket(`${protocol}://${location.hostname}:${state.wsPort || (location.port === "8787" ? "8788" : location.port)}/ws`);
   state.ws = ws; state.closing = false; ws.binaryType = "arraybuffer";
-  ws.onopen = () => { setConnection("ok", state.transport === "gpu" ? "V2 bridge connected" : "Demo bridge connected"); $("connectButton").textContent = "Disconnect"; $("micButton").disabled = false; setSession("Opening agent…", true); state.t0 = performance.now(); const rate = state.audioIn?.sampleRate || 16000; ws.send(JSON.stringify({type:"session.start", transport:state.transport, scenario:currentScenario().id, system_prompt:$("promptEditor").value, input_rate:rate, language:state.engine === "frankenstein" ? ($("languageSelect")?.value || undefined) : undefined, voice:state.engine === "frankenstein" ? ($("voiceSelect")?.value || undefined) : undefined})); };
+  ws.onopen = () => { setConnection("ok", state.transport === "gpu" ? "V2 bridge connected" : "Demo bridge connected"); $("connectButton").textContent = "Disconnect"; $("micButton").disabled = false; setSession("Opening agent…", true); state.t0 = performance.now(); const rate = state.audioIn?.sampleRate || 16000; ws.send(JSON.stringify({type:"session.start", transport:state.transport, scenario:currentScenario().id, system_prompt:$("promptEditor").value, input_rate:rate, language:state.engine.startsWith("frankenstein") ? ($("languageSelect")?.value || undefined) : undefined, voice:state.engine.startsWith("frankenstein") ? ($("voiceSelect")?.value || undefined) : undefined})); };
   ws.onmessage = (e) => { if (typeof e.data === "string") { try { handleJson(JSON.parse(e.data)); } catch (_) { setSession("Invalid bridge message"); } } else playPcm(e.data); };
   ws.onerror = () => { if (state.ws !== ws) return; setConnection("error", state.transport === "gpu" ? "V2 bridge unreachable" : "Demo bridge unreachable"); setAgent("error", "Voice agent offline"); setSession("Connection error"); $("micButton").disabled = true; };
   ws.onclose = () => { if (state.ws !== ws) return; state.ws = null; state.connected = false; state.closing = false; $("connectButton").textContent = "Reconnect"; $("micButton").disabled = true; stopMic(); stopSample(); stopAudioOutput(); updateProfile(state.transport === "gpu" ? state.profile : "demo", false); setAgent("idle", "Voice agent offline"); setConnection("idle", state.transport === "gpu" ? "V2 bridge offline" : "Demo bridge offline"); setSession("Disconnected"); updateMicNote(); };
