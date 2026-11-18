@@ -2,14 +2,16 @@
 
 Wire format (one connection = one session; ``max_sessions`` concurrent, default 1 because one engine = one GPU):
   client -> server
+    websocket URL ``?probe=1`` (health probe; no session or GPU slot is allocated)
     text   {"type": "session.start", "system_prompt"?: str, "mode"?: "reference"|"enhanced",
             "input_rate"?: int (8000-48000, default 16000)}                                       (optional, first)
     binary PCM16 little-endian mono at input_rate, any length (resampled to 16 kHz with a streaming soxr resampler,
            as in the paper's App. B client contract; chunked server-side into 160 ms engine chunks)
     text   {"type": "session.end"}     graceful end: an in-flight tool call is answered first (drain), then close
     text   {"type": "session.cancel"}  immediate end: open tool calls cancelled, no drain (also: client disconnect)
-  server -> client
-    text   {"type": "session.created", "session_id", "mode", "input_rate": 16000, "output_rate": 22050}
+    server -> client
+    text   {"type": "session.created", "session_id", "mode", "input_rate": 16000, "output_rate": 22050,
+            "backend_profile": "bf16"|"int4"|"q8"}
     binary PCM16 little-endian mono 22.05 kHz agent audio, in generation order
     text   {"type": "event", "ev": <trace event name>, ...trace fields}   (audio.received/thinker.step suppressed
            unless ?verbose=1)
@@ -59,6 +61,7 @@ class ServerConfig:
     close_timeout_s: float = 180.0  # engine close longer than this -> server unhealthy (slot kept, restart needed)
     trace_dir: str | None = None
     default_mode: str = "reference"
+    backend_profile: str = "bf16"
     default_prompt: str | None = None
     # Composition hook, called per session: (session_id, tracer, mode, session_ref) -> conversation controller
     # (application state: tool ledger, facts, grounding). The transport never interprets tools or model behaviour.
@@ -164,6 +167,7 @@ class VoiceServer:
         self.engine = engine
         self.cfg = cfg
         self.active = 0
+        self.slot_lock = threading.Lock()
         self.engine_lock = threading.Lock()
         self.unhealthy: str | None = None
         self.tracer_factory = tracer_factory or self._default_tracer
@@ -178,15 +182,26 @@ class VoiceServer:
         path = getattr(getattr(ws, "request", None), "path", None) or getattr(ws, "path", "/")
         qs = parse_qs(urlparse(path).query)
         verbose = qs.get("verbose", ["0"])[0] == "1"
-        if self.unhealthy is not None:
+        if qs.get("probe", ["0"])[0] == "1":
+            await ws.send(json.dumps({"type": "server.ready", "backend_profile": self.cfg.backend_profile,
+                                      "active": self.active, "max_sessions": self.cfg.max_sessions,
+                                      "unhealthy": self.unhealthy}))
+            await ws.close(code=1000, reason="health probe")
+            return
+        with self.slot_lock:
+            unhealthy = self.unhealthy
+            accepted = (unhealthy is None and self.active < self.cfg.max_sessions
+                        and self.engine_lock.acquire(blocking=False))
+            if accepted:
+                self.active += 1
+        if unhealthy is not None:
             await ws.send(json.dumps({"type": "error", "error": f"unhealthy: {self.unhealthy}"}))
             await ws.close(code=1011, reason="server unhealthy")
             return
-        if self.active >= self.cfg.max_sessions or not self.engine_lock.acquire(blocking=False):
+        if not accepted:
             await ws.send(json.dumps({"type": "error", "error": "busy"}))
             await ws.close(code=1013, reason="busy")
             return
-        self.active += 1
         loop = asyncio.get_running_loop()
         sid = f"ws-{uuid.uuid4().hex[:8]}"
         tracer = self.tracer_factory(sid)
@@ -246,7 +261,8 @@ class VoiceServer:
                            controller=controller)
             # through the ordered outbound queue, so it precedes every event of this session
             send_threadsafe(json.dumps({"type": "session.created", "session_id": sid, "mode": mode,
-                                        "input_rate": in_rate, "output_rate": 22050}))
+                                        "input_rate": in_rate, "output_rate": 22050,
+                                        "backend_profile": self.cfg.backend_profile}))
             await loop.run_in_executor(None, sess.open, prompt)
             worker = SessionWorker(sess, send_threadsafe, int(self.cfg.max_backlog_s * 16000 * 2),
                                    lambda n: send_threadsafe(json.dumps({"type": "audio.dropped", "bytes": n})),
@@ -306,9 +322,10 @@ class VoiceServer:
             except Exception:  # noqa: BLE001 - client may be gone
                 send_task.cancel()
             tracer.close()
-            self.active -= 1
-            if not hung:                     # a stuck engine keeps the slot: no second session on a busy GPU
-                self.engine_lock.release()
+            with self.slot_lock:
+                self.active -= 1
+                if not hung:                 # a stuck engine keeps the slot: no second session on a busy GPU
+                    self.engine_lock.release()
 
     async def serve(self, ready: Callable[[], None] | None = None) -> None:
         import websockets

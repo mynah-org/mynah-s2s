@@ -80,6 +80,24 @@ def test_ws_rejects_second_concurrent_session(tmp_path):
     assert asyncio.run(main())["error"] == "busy"
 
 
+def test_ws_health_probe_does_not_allocate_a_session_or_gpu_slot():
+    eng = FakeEngine()
+    srv = VoiceServer(eng, ServerConfig(host="127.0.0.1", port=0, backend_profile="int4"))
+
+    async def main():
+        import websockets
+        async with websockets.serve(srv.handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with websockets.connect(f"ws://127.0.0.1:{port}/v1/session?probe=1") as ws:
+                ready = json.loads(await ws.recv())
+            return ready, srv.active, srv.engine_lock.locked(), eng.opened
+
+    ready, active, locked, opened = asyncio.run(main())
+    assert ready == {"type": "server.ready", "backend_profile": "int4", "active": 0,
+                     "max_sessions": 1, "unhealthy": None}
+    assert active == 0 and not locked and not opened
+
+
 def test_ws_session_end_during_a_call_drains_it_before_closing(tmp_path):
     """Live regression (GB10 ws demo): the client ended while the tool call was running; the call leaked into the
     next session. The worker must keep the line open until the call is consumed, then close cleanly."""

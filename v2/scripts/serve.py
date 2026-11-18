@@ -22,6 +22,14 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _backend_profile(args) -> str:
+    if args.int4 or args.int4_pack or args.thinker_int4 or args.eartts_int4 or args.int4_extended:
+        return "int4"
+    if args.int8 or args.int8_pack:
+        return "q8"
+    return "bf16"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
@@ -69,6 +77,8 @@ def main():
                     help="EXPERIMENT: also quantize perception Linear, RNNT joint, CAS/fusion/MoG Linear paths")
     ap.add_argument("--int8", action="store_true", default=_env_flag("MYNAH_INT8"),
                     help="opt-in Q8 parity preset: Thinker, EarTTS, perception, RNNT joint, codec 1x1, and specialized Q8 paths")
+    ap.add_argument("--int8-protected", action="store_true", default=_env_flag("MYNAH_INT8_PROTECTED"),
+                    help="EXPERIMENT: W8A16 with Thinker text/function heads left in BF16; dynamic Q8 only")
     ap.add_argument("--int8-pack", default=os.environ.get("MYNAH_INT8_PACK"),
                     help="load one offline .safetensors + sibling .json Q8 bundle; specialized Q8 paths remain runtime opt-ins")
     ap.add_argument("--int8-specialized", action="store_true", default=_env_flag("MYNAH_INT8_SPECIALIZED"),
@@ -94,6 +104,10 @@ def main():
             ap.error("--int8-pack cannot be combined with --int8 or INT4 options")
         a.int8 = True
         a.int8_specialized = True
+    if a.int8_protected and a.int8_pack:
+        ap.error("--int8-protected is currently supported only for the dynamic Q8 path")
+    if a.int8_protected and not a.int8:
+        ap.error("--int8-protected requires --int8")
     if a.int4:
         if a.int8:
             ap.error("--int4 and --int8 are mutually exclusive")
@@ -175,7 +189,7 @@ def main():
         else:
             from mynah_v2.model.quant import quantize_extended_w8, quantize_thinker_w8
             from mynah_v2.model.eartts_q8 import quantize_eartts_w8
-            print("THINKER_Q8", quantize_thinker_w8(eng, include_heads=True), flush=True)
+            print("THINKER_Q8", quantize_thinker_w8(eng, include_heads=not a.int8_protected), flush=True)
             print("EARTTS_Q8", quantize_eartts_w8(eng), flush=True)
             print("EXTENDED_Q8", quantize_extended_w8(eng), flush=True)
     if a.perf_profile or a.exp:
@@ -195,7 +209,7 @@ def main():
             timeout_s=a.tool_timeout if mode == "enhanced" else None)
         eng.bind_session_tools(bound)          # owned by this session; unbound by engine.close()
         return Controller(None, ledger=led, tools=bound)
-    cfg = ServerConfig(host=a.host, port=a.port, trace_dir=str(td), default_mode=a.mode, max_backlog_s=a.max_backlog, idle_timeout_s=a.idle_timeout, close_timeout_s=a.close_timeout,
+    cfg = ServerConfig(host=a.host, port=a.port, trace_dir=str(td), default_mode=a.mode, backend_profile=_backend_profile(a), max_backlog_s=a.max_backlog, idle_timeout_s=a.idle_timeout, close_timeout_s=a.close_timeout,
                        default_prompt=render_prompt(reg.schemas, read_system_message(a.system_message)), controller_factory=controller_factory)
     srv = VoiceServer(eng, cfg)
     asyncio.run(srv.serve(ready=lambda: print(f"READY ws://{a.host}:{a.port} (engine load {eng.load_s:.0f}s)", flush=True)))

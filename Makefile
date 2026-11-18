@@ -66,11 +66,14 @@ w8-pack: ## export offline per-channel Q8 bundle + JSON manifest (W8_ARGS=...)
 WEBUI_ARGS ?=
 WEBUI_GPU_LOG ?= /tmp/mynah-v2-webui-gpu.log
 WEBUI_PYTHON ?= $(if $(wildcard $(HOME)/mynah-s2s/.venv-v2/bin/python),$(HOME)/mynah-s2s/.venv-v2/bin/python,python3)
-# The WebUI path targets the measured GB10 configuration by default. Direct
-# `make serve` remains BF16 unless the caller explicitly passes --int4.
+WEBUI_PROFILE ?= demo
+WEBUI_GPU_PROFILE ?= int4
+WEBUI_AUDIO_ROOT ?= $(HOME)/mynah-s2s/data/agent
+# The WebUI path targets the measured lower-latency INT4 configuration by default.
+# Direct `make serve` remains BF16 unless the caller explicitly passes --int4.
 V2_SERVE_ARGS ?= --int4 --cudnn-benchmark
 webui: ## local HTML5 UI + Python bridge on http://127.0.0.1:8787 (no Node.js)
-	@if command -v uv >/dev/null 2>&1; then uv run --project webui --no-sync python webui/server.py $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py $(WEBUI_ARGS); fi
+	@if command -v uv >/dev/null 2>&1; then uv run --project webui --no-sync python webui/server.py --profile $(WEBUI_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --profile $(WEBUI_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); fi
 webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ctrl-C
 	@set -e; \
 	ARGS="$(V2_SERVE_ARGS)" $(M) serve >$(WEBUI_GPU_LOG) 2>&1 & gpu_pid=$$!; \
@@ -79,7 +82,7 @@ webui-gpu: ## start the V2 GPU server and the web UI together; stop both with Ct
 		kill -0 $$gpu_pid 2>/dev/null || { tail -40 $(WEBUI_GPU_LOG); exit 1; }; \
 		sleep 2; \
 	done; \
-	if command -v uv >/dev/null 2>&1; then uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session $(WEBUI_ARGS); fi
+	if command -v uv >/dev/null 2>&1; then uv run --project webui --extra gpu python webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session --profile $(WEBUI_GPU_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); else $(WEBUI_PYTHON) webui/server.py --v2-ws ws://127.0.0.1:8765/v1/session --profile $(WEBUI_GPU_PROFILE) --audio-root "$(WEBUI_AUDIO_ROOT)" $(WEBUI_ARGS); fi
 client: ## stream a WAV to the server at real-time pace: make client WAV=path/to.wav
 	$(M) client $(WAV)
 ws-check: ## non-interactive server + client round trip on one corpus item (WS_ITEM=q03 by default); fails on dropped audio / no answer
