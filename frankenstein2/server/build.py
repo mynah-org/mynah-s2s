@@ -59,6 +59,13 @@ def add_args(ap) -> None:
     ap.add_argument("--ep-thr", action="append", default=[], help="LANG=threshold for the endpoint head")
     ap.add_argument("--no-tool-rule", dest="tool_rule", action="store_false",
                     help="v2b: without the tool rule in the system prompt and the localized decision question")
+    ap.add_argument("--runtime", default="procs", choices=["procs", "single"],
+                    help="single = ONE process owns the GPU: our own ears, Qwen and Pocket runtimes under one scheduler "
+                         "(frankenstein2/runtime.py); procs = the ears / talker / Qwen processes")
+    ap.add_argument("--pocket-weights", default="", help="single: the Pocket cloning snapshot (languages/<lang>/model.safetensors)")
+    ap.add_argument("--pocket-tokenizers", default="", help="single: where languages/<lang>/tokenizer.json are")
+    ap.add_argument("--pocket-preload", default="it,en,fr", help="single: talker languages loaded at start")
+    ap.add_argument("--talker-budget-ms", type=float, default=40.0)
     ap.add_argument("--child-env", action="append", default=[],
                     help="KEY=VALUE for the ears and talker processes (their own environments' caches / headers)")
 
@@ -75,8 +82,17 @@ def child_env(a, extra: dict | None = None) -> dict:
     return env
 
 
+def _single(a, log_dir):  # pragma: no cover - GPU
+    if getattr(a, "_single", None) is None:
+        from frankenstein2 import runtime
+        a._single = runtime.start(a, log_dir)
+    return a._single
+
+
 def start_ears(a, log_dir: Path):  # pragma: no cover - process
     """One ears process, or a pool of --ears-procs processes (sessions spread across them)."""
+    if a.runtime == "single":
+        return _single(a, log_dir)["ears"]
     from frankenstein2.ears.client import EarsPool, EarsProc
     procs = []
     for i in range(max(1, a.ears_procs)):
@@ -90,6 +106,8 @@ def start_ears(a, log_dir: Path):  # pragma: no cover - process
 
 
 def start_pocket(a, log_dir: Path):  # pragma: no cover - process
+    if a.runtime == "single":
+        return _single(a, log_dir)["talker"]
     from frankenstein2.tts.procs import PocketProc
     extra = {"HF_HOME": a.pocket_hf_home} if a.pocket_hf_home else {}
     thr = ["--threads", str(a.threads)] if a.threads else []
@@ -109,6 +127,8 @@ def start_pocket(a, log_dir: Path):  # pragma: no cover - process
 def start_qwen(a, log_dir: Path):  # pragma: no cover - process
     """The Qwen LLM process: our own inference engine (frankenstein2.llm.qwen_own.server under --qwen-src) or the HF
     generate stand-in (llm/qwen_server.py); both speak the same JSON lines."""
+    if a.runtime == "single":
+        return _single(a, log_dir)["llm"]
     from frankenstein2.tts.procs import PocketProc               # generic JSON-lines process, replies routed by "ss"
     if a.qwen_src:
         argv = [a.qwen_python, "-m", "frankenstein2.llm.qwen_own.server", "--model", a.qwen_model, "--mode",

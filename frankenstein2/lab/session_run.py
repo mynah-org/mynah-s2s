@@ -473,6 +473,11 @@ def main():  # pragma: no cover - model run
         info["ws"] = ws_phases(a, res, out)
         save()
         print("WS", json.dumps(info["ws"], default=str)[:6000], flush=True)
+    if getattr(a, "_single", None) is not None:          # the one-process engine: what its GPU thread did
+        info["scheduler"] = a._single["sched"].summary()
+        info["mem_end"] = {**cuda_snapshot(torch), "engine_rss_peak_gb": rss_gb("VmHWM")}
+        save()
+        print("SCHED", json.dumps(info["scheduler"]), flush=True)
     pocket.close()
     ears.close()
     if qproc is not None:

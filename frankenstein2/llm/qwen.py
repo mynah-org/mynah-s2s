@@ -150,3 +150,5 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
     def close(self):
         for rid in list(self.jobs):
             self.cancel(rid)
+        if getattr(self.p, "releases_slots", False):       # the in-process engine frees the session's slot
+            self.p.send({"op": "close", "ss": self.ss})

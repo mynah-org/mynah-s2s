@@ -79,6 +79,36 @@ def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", syst
     return p
 
 
+def _step_output():
+    """V2's StepOutput; its module pulls VoiceChat's model stack (omegaconf, ...), which the one-process engine's
+    venv does not carry: then a field-identical stand-in."""
+    try:
+        from mynah_v2.model.reference import StepOutput
+        return StepOutput
+    except ImportError:
+        global _StepOutput
+        if _StepOutput is None:
+            from dataclasses import dataclass, field
+
+            @dataclass
+            class StepOutput:  # same fields as mynah_v2.model.reference.StepOutput
+                audio: object
+                text_delta: str
+                asr_delta: str
+                func_delta: str
+                frame_idx: int
+                new_text_ids: list
+                new_func_ids: list
+                fc_active: bool
+                fc_records: list = field(default_factory=list)
+                latency_ms: float = 0.0
+            _StepOutput = StepOutput
+        return _StepOutput
+
+
+_StepOutput = None
+
+
 class Frankenstein2Engine:
     chunk_samples = STEP
 
@@ -141,7 +171,7 @@ class Frankenstein2Engine:
     def step(self, pcm16k, is_last: bool = False):
         import torch
         from mynah_v2.model import tokens as T
-        from mynah_v2.model.reference import StepOutput
+        StepOutput = _step_output()
         t0 = time.monotonic()
         x = pcm16k.detach().float().cpu().numpy() if hasattr(pcm16k, "detach") else np.asarray(pcm16k, np.float32)
         r = self.p.step(x)

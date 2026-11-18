@@ -178,13 +178,40 @@ The interface is `submit(rid, messages)`, `cancel(rid)`, `poll()` and `close()`.
   them. Each session's history, LLM requests, tool calls, talker requests, audio bytes and ears hops come out equal
   to the same session run alone.
 
+## 5b. One process, own runtimes (`runtime.py`, `--runtime single`)
+
+With `--runtime single` one process owns the GPU and runs every model on one scheduler thread. All the models run on
+our own torch code:
+- `ears/nemotron.py` + `ears/own.py`: the Nemotron 3.5 streaming encoder (cache-aware, a K/V pool of 56 frames per
+  session slot), the RNN-T, the 8 s window encoder for the GRU, and the GRU itself. A hop runs for every waiting
+  session in a few batched calls. Checked against the reference implementation: same pieces and events.
+- `tts/pocket_own.py`: the Pocket FlowLM, the flow net, the Mimi encoder/decoder and voice cloning (an MIT port of
+  pocket-tts). With the same seeds its audio is bit-exact to the package. `PocketBatch` keeps one KV slot per row
+  and steps every speaking session of a language in one call.
+- `llm/qwen_own`: chunked prefill (`prefill_step`) and batched decode (`decode_batch`).
+
+The old process plugins keep their interfaces through in-process backends (`InProcEars`, `InProcLLM`, `InProcTalker`),
+so `core.Pipeline` and the controller are unchanged. The scheduler runs in this order:
+1. ears, as a cohort: hops wait up to `gather_ms` (120) for the other sessions, then run as one batch;
+2. talker frames for the rows whose audio is less than 1.2 s ahead of real time;
+3. one LLM call, alternating between a batched decode step and a 256-token prefill chunk of the oldest prompt.
+
+Designs adopted from the owner's MIT engines (mynah-asr, mynah-tts):
+- per-stream K/V rings;
+- cohort batching with a gather window;
+- fixed KV slots per row;
+- one host sync per frame.
+
+The runtime has no CUDA graphs and no bf16 GEMMs yet. Both are listed as next steps.
+
 ## 6. Placement and memory (`server/build.py`)
 
 Every placement choice is an option: ears device, Nano precision, talker device, Pocket languages kept loaded, and
 CPU threads per process. Each process reports its own CUDA allocated / reserved / peak and host RSS. The engine does
 not assume unified memory.
 
-There are no custom kernels in v2 itself. Arch-specific paths are inherited only from v1's optional Nano INT4
+There are no custom kernels in v2 itself. The one-process runtime uses only torch ops (SDPA, conv, linear) and runs
+on any CUDA arch. It assumes nothing about unified memory. Arch-specific paths are inherited only from v1's optional Nano INT4
 (torch tinygemm, sm80+) and decode graph. Measured footprints and which targets fit are in the local performance
 notes, not here.
 
@@ -200,11 +227,13 @@ The trace records:
 - what was heard after a barge.
 
 ## 8. Known limits
-- **Concurrency.** Each session costs the ears one streaming-ASR pass and the GRU window encode per hop. The LLM
-  serves one request at a time, and the talker one segment at a time. On a single GPU shared by those processes,
-  a handful of concurrent sessions keep real time; ten do not yet.
-  - What is needed for ten: batched streaming ASR, batched LLM decode across sessions, batched talker steps, and one
-    GPU scheduler instead of several processes time-slicing the GPU.
+- **Concurrency.** The one-process runtime batches the ears, the LLM decode and the talker across sessions, and four
+  concurrent sessions work. Ten do not yet: the ears keep up, but the GPU thread has too little time left for the
+  LLM.
+  - The fp32 ears cohort (GRU window re-encode plus streaming) takes about half of every 320 ms. Qwen decode at
+    batch 10 takes about 100 ms per token, and queued prompts are prefilled one at a time.
+  - Next steps: bf16 GEMMs and CUDA graphs for the ears; a cheaper GRU feature path; batched prefill; LLM decode
+    steps that run while the ears gather.
 - The GRU features use a second encoder pass because the head was trained on that regime. Fine-tuning the head on
   streaming features would remove it.
 
@@ -212,5 +241,5 @@ The trace records:
   weaker off English.
 - There is no AEC. The 2nd ear assumes the client cancels the echo.
 - Words spoken over the agent without a detected barge are dropped. This is the same as Tyger.
-- Sessions are served one hop or one request at a time. There is no cross-session batching yet, but all state is
-  already per session.
+- With `--runtime procs`, sessions are served one hop or one request at a time. With `--runtime single`, they are
+  batched.

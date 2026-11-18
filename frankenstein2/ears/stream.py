@@ -292,10 +292,11 @@ def gru_batch_frames(sessions: list, hus: list, has: list, dbs: list) -> list:
     return out
 
 
-def hop_batch(items: list) -> list:
-    """items: [(EarsSession, user, agent, mode, reset)] of DIFFERENT sessions -> their hop results. The GRU's window
-    encodes (the dominant cost) and the GRU frames run as one batch across sessions; the streaming ASR stays per
-    session (its caches are per session; each keeps its own language prompt)."""
+def hop_batch(items: list, batched_asr: bool = True) -> list:
+    """items: [(EarsSession, user, agent, mode, reset)] of DIFFERENT sessions -> their hop results, everything batched
+    across sessions: the GRU's window encodes, the GRU frames, the streaming ASR chunks (one encoder forward, per-row
+    language prompt, per-session caches: ears/batched.py) and the greedy RNN-T. Results equal per-session hops."""
+    from .batched import rnnt_batch, stream_chunks
     t0 = time.monotonic()
     for s, u, a, m, r in items:
         s.begin(m, r)
@@ -317,15 +318,40 @@ def hop_batch(items: list) -> list:
                                [feats[id(x[0])][1] for x in ws_], dbs)
         for x, r in zip(ws_, res):
             gru[id(x[0])] = r
+    t_win = time.monotonic() - t0
+    if not batched_asr:
+        out = []
+        for s, u, a, m, r in items:
+            res = s.hop(u, a, m, r, gru_done=gru.get(id(s), ([], [])))
+            res["win_ms"] = round(t_win * 1e3 / max(1, len(items)), 2)
+            res["batch"] = len(items)
+            out.append(res)
+        return out
+    t1 = time.monotonic()
+    pieces = {id(s): [] for s, *_ in items}
+    for s, u, a, m, r in items:
+        s.pair.push(u.astype(np.float32), a)
+    while True:
+        ready = [s for s, *_ in items if s.pair.ready()]
+        if not ready:
+            break
+        lasts = stream_chunks([s.pair for s in ready])
+        toks = rnnt_batch([s.rnnt for s in ready], lasts)
+        for s, last, tk in zip(ready, lasts, toks):
+            for t, tok in tk:
+                pieces[id(s)].append({"f": s.frames_in + t, "p": s.proc.tokenizer.convert_ids_to_tokens(tok),
+                                      "id": tok})
+            s.frames_in += last.shape[1]
     if items[0][0].dev != "cpu":
         torch.cuda.synchronize()
-    t_win = time.monotonic() - t0
+    t_asr = time.monotonic() - t1
     out = []
     for s, u, a, m, r in items:
-        res = s.hop(u, a, m, r, gru_done=gru.get(id(s), ([], [])))
-        res["win_ms"] = round(t_win * 1e3 / max(1, len(items)), 2)
-        res["batch"] = len(items)
-        out.append(res)
+        fr, ev = gru.get(id(s), ([], []))
+        s.hops += 1
+        out.append({"frames": fr, "events": ev, "pieces": pieces[id(s)], "enc_ms": round(t_asr * 1e3 / len(items), 2),
+                    "win_ms": round(t_win * 1e3 / len(items), 2), "ms": round((time.monotonic() - t0) * 1e3, 2),
+                    "frames_total": s.frames_in, "batch": len(items)})
     return out
 
 
