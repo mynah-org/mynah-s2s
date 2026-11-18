@@ -297,7 +297,8 @@ def ws_phases(a, res, out: Path) -> dict:  # pragma: no cover - model run
     if a.ws_n:                                        # one phase of N concurrent sessions, languages in turn
         langs = ["it", "en", "fr"]
         specs = [ClientSpec(f"n{a.ws_n}_{i:02d}_{langs[i % 3]}", via if i == 0 else direct, langs[i % 3],
-                            *tracks[langs[i % 3]], via_bridge=(i == 0), voice=v, start_delay_s=0.7 * i)
+                            *tracks[langs[i % 3]], via_bridge=(i == 0), voice=v, start_delay_s=0.7 * i,
+                            reactive=a.ws_reactive)
                  for i in range(a.ws_n)]
         snap = {}
 
@@ -363,6 +364,7 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--session-voice", default="")
     ap.add_argument("--warm-llm", action="store_true", help="one request through the LLM before the arms")
     ap.add_argument("--ws-phases", action="store_true", help="after the arms: concurrent WebSocket sessions")
+    ap.add_argument("--ws-reactive", action="store_true", help="N-session phase: each client waits for the agent")
     ap.add_argument("--ws-n", type=int, default=0, help="one phase of N concurrent sessions instead of phases 1-2")
     ap.add_argument("--content", action="store_true")
     ap.add_argument("--budget-s", type=float, default=1e9)
