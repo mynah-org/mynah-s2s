@@ -195,8 +195,9 @@ class EarsProc:  # pragma: no cover - process plumbing, exercised on the GPU hos
         return self.ready
 
     def send(self, msg: dict) -> None:
-        self.p.stdin.write(json.dumps(msg) + "\n")
-        self.p.stdin.flush()
+        with self.lock:                                  # several sessions' threads share the process
+            self.p.stdin.write(json.dumps(msg) + "\n")
+            self.p.stdin.flush()
 
     def poll(self, sid, block: bool = False) -> list:
         box, out = self._box(sid), []

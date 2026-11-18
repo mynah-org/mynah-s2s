@@ -138,3 +138,17 @@ def test_punctuation_or_tag_after_endpoint_is_not_a_continuation():
     run(p, 40)
     assert not [a for a in tr.of("ctl.action") if a["kind"] == "CANCEL"]
     assert [s["text"] for s in talker.said] == ["Certo."]
+
+
+def test_barge_assist_stops_audible_audio_on_the_first_user_word():
+    long = "Il suo ordine è stato spedito ieri dal magazzino centrale e arriverà entro tre giorni lavorativi."
+    ears = {"s": {2: {"pieces": pieces(4, "dov'è il mio ordine"), "events": [ev("ENDPOINT", 11)]},
+                  8: {"pieces": pieces(30, "aspetti")}}}             # the word of a cut-in starting at step 28
+    p, be, llm, talker, tr = make("s", "it", ears, lambda m: [("text", long)])
+    loud = np.full(1280, 0.1, np.float32)
+    for k in range(60):
+        p.step(loud if 28 <= k < 45 else Z)
+    b = [e for e in tr.of("ears.event") if e["kind"] == "BARGE"]
+    assert b and b[0]["by"] == "asr_word" and b[0]["onset_frame"] == 28
+    fl = tr.of("audio.flush")
+    assert fl and fl[0]["model_step"] <= 36                      # stop <= 0.64 s after the onset

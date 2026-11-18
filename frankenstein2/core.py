@@ -53,6 +53,7 @@ class PipelineConfig:
     client_delay_steps: int = 1            # transport + client playback buffer, in 80 ms steps
     overlap_grace_frames: int = 6          # speech this close to a turn's end is kept for the next user turn
     trace_frames: bool = True
+    barge_assist: bool = True              # echo-aware energy onset + ASR word confirmation (control/barge.py)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
 
 
@@ -83,6 +84,9 @@ class Pipeline:
         self.stats = {"hops": 0, "ears_ms": [], "endpoints": [], "barges": [], "backchannels": [], "cancels": [],
                       "continues": []}
         self.closed = False
+        from .control.barge import BargeAssist
+        self.barge = BargeAssist()
+        self.barge_cand = None
         self.last_ep_frame = None
         self.continues_posted = False
 
@@ -129,9 +133,25 @@ class Pipeline:
         k = self.k
         user = np.asarray(user, np.float32)
         asr_delta = []
-        self.ears.push(user, self.ear.take(), self.ctl.ears_mode)
+        heard = self.ear.take()
+        self.ears.push(user, heard, self.ctl.ears_mode)
+        if self.cfg.barge_assist:
+            self.barge_cand = self.barge.step(k, user, heard,
+                                              self.ctl.state is St.SPEAKING and self.playout.audible())
         for r in self.ears.poll():
             self._on_hop(r, k, asr_delta)
+        if self.barge_cand is not None:
+            on = self.barge_cand["onset"]
+            to = self.turns.get((self.ctl.epoch, self.ctl.turn))
+            why = self.barge.decide(self.barge_cand, [{"f": f, "p": p} for f, p in self.user.pieces if f >= on - 1],
+                                    agent_text=(to.text if to else "") + " " + HOLDING.get(self.lang, ""))
+            if why:
+                self.stats["barges"].append({"frame": on, "step": k, "by": why})
+                self.tr.emit("ears.event", k, kind="BARGE", by=why, onset_frame=on,
+                             onset_s=round((k - on + 1) * 0.08, 2), **{x: self.barge_cand[x] for x in
+                                                                     ("mic_db", "agent_db", "coupling_db")})
+                self.ctl.post(Intent("BARGE", "ears", k, payload={"onset_s": round((k - on + 1) * 0.08, 2),
+                                                                  "frame": on, "by": why}))
         for e in self.llm.poll():
             self._on_llm(e, k)
         for e in self.talker.poll():
@@ -165,6 +185,8 @@ class Pipeline:
                                                                           "bc_prob", "hazard", "db") if x in f})
         if r.get("pieces"):
             asr_delta.append(self.user.add(r["pieces"]))
+            to = self.turns.get((self.ctl.epoch, self.ctl.turn))
+            self.barge.words(r["pieces"], (to.text if to else "") + " " + HOLDING.get(self.lang, ""))
             self.tr.emit("asr.piece", k, pieces=[[p["f"], p["p"]] for p in r["pieces"]])
             c = self.ctl
             if c.state is not St.LISTENING and self.last_ep_frame is not None and not self.continues_posted and \

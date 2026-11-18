@@ -27,6 +27,9 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--port", type=int, default=8772)
     ap.add_argument("--trace-dir", required=True)
     ap.add_argument("--idle-timeout", type=float, default=60.0)
+    ap.add_argument("--max-sessions", type=int, default=4, help="concurrent sessions (each with its own language)")
+    ap.add_argument("--v2-server", action="store_true",
+                    help="V2's single-session VoiceServer instead of the multi-session server")
     B.add_args(ap)
     a = ap.parse_args()
     td = Path(a.trace_dir)
@@ -34,22 +37,34 @@ def main():  # pragma: no cover - GPU
     t0 = time.monotonic()
     ears = B.start_ears(a, td)
     spec = B.tenant(a)
+    pocket = B.start_pocket(a, td)
     from frankenstein2.llm.nano import NanoShared
     shared = NanoShared(a.nano_dir, str(Path(a.lab_scripts) / "multilingual"), a.nano_precision, a.nano_graph)
-    pocket = B.start_pocket(a, td)
-    from frankenstein2.server.engine import Frankenstein2Engine, Resources
+    from frankenstein2.server.engine import Frankenstein2Engine, Resources, make_pipeline
     res = Resources(ears=ears, make_llm=B.llm_factory(a, shared, spec), make_talker=B.talker_factory(a, pocket),
                     voices=B.voices(a), ears_thr=B.thresholds(a), trace_dir=str(td))
+    loads = {"load_s": round(time.monotonic() - t0, 1), "ears": ears.ready, "talker": pocket.ready,
+             "nano": shared.mem}
+    (td / "server_loads.json").write_text(json.dumps(loads, indent=1, default=str))
+    import asyncio
+    if not a.v2_server:
+        from frankenstein2.server.multi import MultiServer
+        srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
+                          max_sessions=a.max_sessions, idle_timeout_s=a.idle_timeout,
+                          profile=f"frankenstein2-{a.nano_precision}")
+        try:
+            asyncio.run(srv.serve(a.host, a.port, ready=lambda: print(
+                f"READY port={a.port} " + json.dumps(loads, default=str), flush=True)))
+        finally:
+            pocket.close()
+            ears.close()
+        return
     eng = Frankenstein2Engine(res)
     from server.serve import make_server                     # v1's server wrapper (language / voice fields)
     from mynah_v2.transport.ws_server import ServerConfig
     cfg = ServerConfig(host=a.host, port=a.port, trace_dir=str(td), idle_timeout_s=a.idle_timeout)
     cfg.backend_profile = f"frankenstein2-{a.nano_precision}"
     srv = make_server(eng, cfg)
-    loads = {"load_s": round(time.monotonic() - t0, 1), "ears": ears.ready, "talker": pocket.ready,
-             "nano": shared.mem}
-    (td / "server_loads.json").write_text(json.dumps(loads, indent=1, default=str))
-    import asyncio
     try:
         asyncio.run(srv.serve(ready=lambda: print(f"READY port={a.port} " + json.dumps(loads, default=str),
                                                   flush=True)))

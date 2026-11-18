@@ -44,6 +44,41 @@ class Resources:
     trace_dir: str | None = None
 
 
+def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", system_prompt: str | None = None,
+                  sink=None, trace: bool = True):
+    """One session's Pipeline on the shared resources (language and voice fixed for the session)."""
+    from frankenstein2.core import Pipeline, PipelineConfig
+    from frankenstein2.ears.client import EarsLink
+    from frankenstein2.tracing import Tracer
+    if language not in res.languages:
+        raise ValueError(f"language {language!r} not served; available {list(res.languages)}")
+    if voice and res.voices and voice not in res.voices:
+        raise ValueError(f"unknown voice {voice!r}; available {sorted(res.voices)}")
+    tr = Tracer(f"{res.trace_dir}/{sid}.f2.jsonl" if (res.trace_dir and trace) else None, session_id=sid, keep=False,
+                sink=sink)
+    llm = res.make_llm(sid, language, system_prompt)
+    talker = res.make_talker(sid, language, res.voices.get(voice, voice))
+    ears = EarsLink(res.ears, sid, language, thr=res.ears_thr.get(language))
+    p = Pipeline(sid, ears, llm, talker, PipelineConfig(lang=language, client_delay_steps=res.client_delay_steps), tr)
+    p.open()
+    orig = p.close
+
+    def close():
+        try:
+            orig()
+        finally:
+            for x in (llm, talker):
+                try:
+                    x.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            tr.emit("engine.teardown", p.k, steps=p.k, cancels=len(p.stats["cancels"]),
+                    endpoints=len(p.stats["endpoints"]), barges=len(p.stats["barges"]))
+            tr.close()
+    p.close = close
+    return p
+
+
 class Frankenstein2Engine:
     chunk_samples = STEP
 

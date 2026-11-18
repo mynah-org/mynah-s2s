@@ -84,3 +84,19 @@ def test_gru_prev_state_forced_by_mode():
 def test_energy_db():
     assert energy_db([0.0] * 1280) < -100
     assert -21 < energy_db([0.1] * 1280) < -19
+
+
+def test_silence_fallback_ends_a_turn_when_p_end_plateaus():
+    r = RulesState()
+    rows = [(out(), SPEECH)] * 10 + [(out(0.89), SIL)] * 20
+    eps = [e for e in run(r, rows) if e["kind"] == "ENDPOINT"]
+    assert len(eps) == 1 and eps[0]["by"] == "silence" and eps[0]["k"] == 10 + 15 - 1
+    r = RulesState(thr=Thresholds(fallback_sil_frames=0))
+    assert not [e for e in run(r, rows) if e["kind"] == "ENDPOINT"]
+
+
+def test_noise_floor_raises_the_voiced_threshold_on_a_noisy_line():
+    r = RulesState()
+    for _ in range(800):
+        r.on_frame(out(), -40.0)            # a steady -40 dB line noise for 64 s
+    assert r.floor_db > -50 and not r.voiced(-40.0) and r.voiced(-20.0)

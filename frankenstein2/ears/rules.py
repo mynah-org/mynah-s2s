@@ -47,6 +47,11 @@ class Thresholds:
     bc_deb: int = 2
     bc_refractory: int = 15          # 1.2 s
     theta: float = 0.2               # hazard threshold of the display-only state decision
+    fallback_sil_frames: int = 15    # the bundle's own policy (config.json default_policy): after the user spoke,
+                                     # this many unvoiced frames (1.2 s) end the turn even if p_end stays under the
+                                     # threshold (Tyger's live config leaves it off; 0 = off). v2 runs showed p_end
+                                     # plateaus of 0.89-0.90 for 8 s after an Italian turn.
+    floor_margin_db: float = 9.0     # voiced = above max(VAD_DB, tracked noise floor + margin)
 
 
 def energy_db(frame) -> float:
@@ -92,6 +97,8 @@ class RulesState:
     talk_frames: int = 0
     quiet_frames: int = 0
     frame: int = 0                   # frames seen since the session start (never reset)
+    sil_run: int = 0                 # listen mode: unvoiced frames since the user's last voiced frame
+    floor_db: float = -70.0          # tracked noise floor of the mic (slow up, fast down)
 
     def reset(self) -> None:
         """A new turn (Tyger: Conversation resets the session at a turn end and after a barge)."""
@@ -99,6 +106,15 @@ class RulesState:
         self.warm = self.ep_run = self.yield_run = self.bc_run = self.bc_cooldown = 0
         self.voiced_ms, self.in_turn = 0.0, False
         self.talk_frames = self.quiet_frames = 0
+        self.sil_run = 0
+
+    def voiced(self, db: float) -> bool:
+        return db > max(VAD_DB, self.floor_db + self.thr.floor_margin_db)
+
+    def _track_floor(self, db: float) -> None:
+        """Noise floor: follows a quieter frame at once, a louder one by 0.05 dB per frame (~0.6 dB/s), so speech
+        never lifts it but a noisier line does over tens of seconds."""
+        self.floor_db = db if db < self.floor_db else self.floor_db + min(0.05, db - self.floor_db)
 
     def switch_mode(self, mode: str) -> bool:
         """listen <-> speaking: fresh decision runs, previous state seeded from the new mode. True if it changed."""
@@ -133,7 +149,8 @@ class RulesState:
         k = self.frame
         self.frame += 1
         st = state_decision(slog, haz, self.prev_state, self.thr.theta)
-        voiced = act_db > VAD_DB
+        voiced = self.voiced(act_db)
+        self._track_floor(act_db)
         events = []
         frame_ev = dict(kind="FRAME", k=k, mode=self.mode, hazard=round(haz, 4), yield_prob=round(yp, 4),
                         bc_prob=round(bcp, 4), p_end=round(pep, 4), db=round(act_db, 1))
@@ -153,6 +170,9 @@ class RulesState:
         if voiced:
             self.voiced_ms += FRAME_S * 1e3
             self.in_turn = True
+            self.sil_run = 0
+        elif self.in_turn:
+            self.sil_run += 1
         spoke = self.in_turn and self.voiced_ms >= MIN_SPEECH_MS
         if self.bc_cooldown > 0:
             self.bc_cooldown -= 1
@@ -167,9 +187,11 @@ class RulesState:
             self.ep_run = self.ep_run + 1 if pep >= self.thr.ep_thr else 0
         else:
             self.ep_run = 0
-        if spoke and self.ep_run >= self.thr.ep_deb:
-            events.append(dict(kind="ENDPOINT", k=k, p_end=round(pep, 3), voiced_ms=round(self.voiced_ms)))
-            self.voiced_ms, self.in_turn = 0.0, False
+        by_sil = bool(self.thr.fallback_sil_frames) and self.sil_run >= self.thr.fallback_sil_frames
+        if spoke and (self.ep_run >= self.thr.ep_deb or by_sil):
+            events.append(dict(kind="ENDPOINT", k=k, p_end=round(pep, 3), voiced_ms=round(self.voiced_ms),
+                               by="head" if self.ep_run >= self.thr.ep_deb else "silence"))
+            self.voiced_ms, self.in_turn, self.sil_run = 0.0, False, 0
             self.prev_state = LISTEN
             self.warm = self.bc_run = self.bc_cooldown = self.ep_run = 0
             frame_ev["state"] = "idle"

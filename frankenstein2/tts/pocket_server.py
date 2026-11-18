@@ -30,10 +30,11 @@ STOCK = {"it": "giovanni", "fr": "estelle", "en": "alba", "de": "alba", "es": "a
 MODEL_24L = {"it": "italian_24l", "fr": "french_24l", "en": "english_2026-09_24l", "de": "german_24l"}
 
 
-def rss_gb() -> float:
+def rss_gb(key: str = "VmRSS") -> float:
+    """Host RSS (VmRSS) or its peak (VmHWM) in GB."""
     try:
         for line in open("/proc/self/status"):
-            if line.startswith("VmRSS:"):
+            if line.startswith(key + ":"):
                 return round(int(line.split()[1]) / 2 ** 20, 3)
     except OSError:
         pass
@@ -67,7 +68,7 @@ def main():  # pragma: no cover - model process
     voices: dict = {}                                               # (lang, voice) -> state
 
     def mem():
-        d = {"rss_gb": rss_gb()}
+        d = {"rss_gb": rss_gb(), "rss_peak_gb": rss_gb("VmHWM")}
         if dev != "cpu":
             d.update(cuda_allocated_gb=round(torch.cuda.memory_allocated() / 2 ** 30, 3),
                      cuda_reserved_gb=round(torch.cuda.memory_reserved() / 2 ** 30, 3),

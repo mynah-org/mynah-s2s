@@ -29,7 +29,14 @@ def add_args(ap) -> None:
     ap.add_argument("--ears-python", required=True)
     ap.add_argument("--ears-bundle", required=True)
     ap.add_argument("--ears-device", default="cuda")
-    ap.add_argument("--talker", default="pocket", choices=["pocket", "flash"])
+    ap.add_argument("--talker", default="pocket", choices=["pocket", "swap", "flash"],
+                    help="pocket = one Pocket model per language; swap = pocket_swap (shared base + language packages)")
+    ap.add_argument("--swap-root", default=str(ROOT / "pocket_swap"))
+    ap.add_argument("--swap-base", default="", help="pocket_swap base checkpoint (english_2026-09_24l)")
+    ap.add_argument("--swap-packages", default="", help="pocket_swap language packages (any precision)")
+    ap.add_argument("--swap-mode", default="ondemand", choices=["ondemand", "materialise"])
+    ap.add_argument("--swap-preset", default="gb10", help="pocket_swap planner preset (slots, host tiers)")
+    ap.add_argument("--swap-slots", type=int, default=0)
     ap.add_argument("--pocket-python", default="")
     ap.add_argument("--pocket-hf-home", default="")
     ap.add_argument("--talker-device", default="cuda")
@@ -41,6 +48,8 @@ def add_args(ap) -> None:
     ap.add_argument("--chunking", default="", help="talker chunking override: sentence | whole | progressive")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--ep-thr", action="append", default=[], help="LANG=threshold for the endpoint head")
+    ap.add_argument("--no-tool-rule", dest="tool_rule", action="store_false",
+                    help="v2b: without the tool rule in the system prompt and the localized decision question")
     ap.add_argument("--child-env", action="append", default=[],
                     help="KEY=VALUE for the ears and talker processes (their own environments' caches / headers)")
 
@@ -69,10 +78,16 @@ def start_ears(a, log_dir: Path):  # pragma: no cover - process
 def start_pocket(a, log_dir: Path):  # pragma: no cover - process
     from frankenstein2.tts.procs import PocketProc
     extra = {"HF_HOME": a.pocket_hf_home} if a.pocket_hf_home else {}
-    p = PocketProc([a.pocket_python, str(ROOT / "frankenstein2" / "tts" / "pocket_server.py"), "--device",
-                    a.talker_device, "--max-langs", str(a.pocket_max_langs),
-                    *(["--threads", str(a.threads)] if a.threads else [])], child_env(a, extra),
-                   str(log_dir / "pocket_server.log"))
+    thr = ["--threads", str(a.threads)] if a.threads else []
+    if a.talker == "swap":
+        argv = [a.pocket_python, str(ROOT / "frankenstein2" / "tts" / "swap_server.py"), "--swap-root", a.swap_root,
+                "--base", a.swap_base, "--packages", a.swap_packages, "--mode", a.swap_mode, "--preset",
+                a.swap_preset, "--device", a.talker_device, *(["--slots", str(a.swap_slots)] if a.swap_slots else []),
+                *thr]
+    else:
+        argv = [a.pocket_python, str(ROOT / "frankenstein2" / "tts" / "pocket_server.py"), "--device",
+                a.talker_device, "--max-langs", str(a.pocket_max_langs), *thr]
+    p = PocketProc(argv, child_env(a, extra), str(log_dir / f"{a.talker}_server.log"))
     p.start()
     p.wait_ready(600)
     return p
@@ -93,7 +108,7 @@ def llm_factory(a, shared, spec, on_ledger=None):  # pragma: no cover - GPU
     from mynah_v2.agent.tools import ToolLedger, ToolRegistry
     from e1.tools_bench import POLICY as P1, tool_schemas
     from frankenstein_s2s.lang import session_language, with_language
-    from frankenstein2.llm.nano import BRIEF, POLICY, NanoLLM
+    from frankenstein2.llm.nano import BRIEF, POLICY, TOOL_RULE, NanoLLM
     policy = {**P1, **POLICY}
 
     def make(sid, lang, system_prompt=None):
@@ -106,9 +121,11 @@ def llm_factory(a, shared, spec, on_ledger=None):  # pragma: no cover - GPU
             reg.register(t["name"], backend.handlers()[t["name"]], t["description"], t["parameters"])
         led = ToolLedger(sid, None)
         bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=None)
+        rule = ("\n" + TOOL_RULE.get(lang, TOOL_RULE["en"])) if a.tool_rule else ""
         system = (with_language(system_prompt or spec["system_prompt"], L) + "\n" + policy.get(lang, policy["en"])
-                  + "\n" + BRIEF.get(lang, BRIEF["en"]) + " /no_think")
-        llm = NanoLLM(shared, system, tool_schemas(reg), bound, lang, backend=backend)
+                  + "\n" + BRIEF.get(lang, BRIEF["en"]) + rule + " /no_think")
+        llm = NanoLLM(shared, system, tool_schemas(reg), bound, lang, backend=backend,
+                      localized_step=a.tool_rule)
         llm.backend, llm.ledger = backend, led
         if on_ledger:
             on_ledger(sid, led, backend)

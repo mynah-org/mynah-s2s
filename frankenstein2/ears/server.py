@@ -28,10 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 PROMPTS = {"auto": 101, "en": 0, "it": 15, "fr": 8, "de": 9, "es": 3}
 
 
-def rss_gb() -> float:
+def rss_gb(key: str = "VmRSS") -> float:
+    """Host RSS (VmRSS) or its peak (VmHWM) in GB."""
     try:
         for line in open("/proc/self/status"):
-            if line.startswith("VmRSS:"):
+            if line.startswith(key + ":"):
                 return round(int(line.split()[1]) / 2 ** 20, 3)
     except OSError:
         pass
@@ -77,7 +78,7 @@ def main():  # pragma: no cover - model process
     emit({"ev": "ready", "device": dev, "load_s": round(time.monotonic() - t0, 1), "lookahead": a.lookahead,
           "torch": torch.__version__, "tf32": torch.backends.cuda.matmul.allow_tf32,
           "capability": list(torch.cuda.get_device_capability()) if dev != "cpu" else None, **mem(),
-          "rss_gb": rss_gb()})
+          "rss_gb": rss_gb(), "rss_peak_gb": rss_gb("VmHWM")})
     sessions, stats = {}, {}
     for line in sys.stdin:
         try:
@@ -117,7 +118,7 @@ def main():  # pragma: no cover - model process
                 emit({"ev": "transcript", "id": c.get("id"), "text": txt,
                       "ms": round((time.monotonic() - t1) * 1e3, 1)})
             elif op == "mem":
-                emit({"ev": "mem", "id": c.get("id"), **mem(), "rss_gb": rss_gb()})
+                emit({"ev": "mem", "id": c.get("id"), **mem(), "rss_gb": rss_gb(), "rss_peak_gb": rss_gb("VmHWM")})
             elif op == "close":
                 sid = c["sid"]
                 sessions.pop(sid, None)

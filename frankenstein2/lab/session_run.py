@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import json
+
+import numpy as np
 import os
 import sys
 import time
@@ -46,9 +48,9 @@ def cuda_snapshot(torch):
             "peak_gb": round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)}
 
 
-def rss_gb():
+def rss_gb(key="VmRSS"):
     for line in open("/proc/self/status"):
-        if line.startswith("VmRSS:"):
+        if line.startswith(key + ":"):
             return round(int(line.split()[1]) / 2 ** 20, 3)
     return None
 
@@ -260,6 +262,63 @@ def run_arm(name, eng, res, frozen, track, out: Path, a, reactive: bool):  # pra
     return summary
 
 
+def ws_phases(a, res, out: Path) -> dict:  # pragma: no cover - model run
+    """The multi-session WebSocket server in this process + the web UI bridge as a subprocess; concurrent clients in
+    different languages (phase 1: IT through the bridge + EN direct; phase 2: FR + IT direct)."""
+    import asyncio
+    import subprocess
+    import threading
+    from frankenstein2.lab.ws_sessions import ClientSpec, run_clients
+    from frankenstein2.server.engine import make_pipeline
+    from frankenstein2.server.multi import MultiServer
+    port, bport, uport = 8791, 8798, 8797
+    srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
+                      max_sessions=4)
+    ready = threading.Event()
+    th = threading.Thread(target=lambda: asyncio.run(srv.serve("127.0.0.1", port, ready=ready.set)), daemon=True)
+    th.start()
+    ready.wait(30)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    bridge = subprocess.Popen([sys.executable, str(ROOT / "webui" / "server.py"), "--engine", "frankenstein2",
+                               "--v2-ws", f"ws://127.0.0.1:{port}/v1/session", "--port", str(uport), "--ws-port",
+                               str(bport), "--profile", "int4"], env=env, stdout=open(out / "bridge.log", "w"),
+                              stderr=subprocess.STDOUT)
+    time.sleep(3)
+    direct, via = f"ws://127.0.0.1:{port}/v1/session", f"ws://127.0.0.1:{bport}/ws"
+    tracks = {}
+    for lang in ("it", "en", "fr"):
+        fz = json.load(open(Path(a.asr_dir) / f"asr_{lang}.json"))
+        import soundfile as sf
+        x, _ = sf.read(Path(a.asr_dir) / f"track_{lang}.wav", dtype="float32")
+        x = x[: int(a.cut_s * 16000)]
+        tracks[lang] = (x, [u for u in fz["timeline"] if u["end_k"] * 0.08 < a.cut_s])
+    res_ws = {}
+    v = a.session_voice
+    p1 = [ClientSpec("p1_it_bridge", via, "it", *tracks["it"], via_bridge=True, voice=v),
+          ClientSpec("p1_en_direct", direct, "en", *tracks["en"], voice=v, start_delay_s=1.5)]
+    res_ws["phase1"] = run_clients(p1, out / "ws")
+    p2 = [ClientSpec("p2_fr_direct", direct, "fr", *tracks["fr"], voice=v),
+          ClientSpec("p2_it_direct", direct, "it", *tracks["it"], voice=v, start_delay_s=2.0)]
+    res_ws["phase2"] = run_clients(p2, out / "ws")
+    bridge.terminate()
+    if a.content:                                     # content of everything each client received (ears ASR)
+        import soundfile as sf
+        from scipy.signal import resample_poly
+        from frankenstein2.ears.client import f32b64
+        from frankenstein2.lab.metrics import cer
+        for ph in res_ws.values():
+            for name, r in ph.items():
+                if "error" in r:
+                    continue
+                y, sr = sf.read(out / "ws" / name / "agent_client_22k.wav", dtype="float32")
+                y16 = resample_poly(y, 320, 441).astype(np.float32)
+                t = res.ears.request({"op": "transcribe", "id": name, "lang": r["language"], "pcm": f32b64(y16)},
+                                     "transcript", 120)
+                r["asr_all"] = t["text"]
+                r["cer_all_vs_said"] = cer(" ".join(x for x in r["said"] if x), t["text"])
+    return res_ws
+
+
 def main():  # pragma: no cover - model run
     from frankenstein2.server import build as B
     ap = argparse.ArgumentParser()
@@ -277,6 +336,7 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--bf16-arm", action="store_true", help="after the INT4 arms, arm A again with INT4 decode off")
     ap.add_argument("--session-voice", default="")
     ap.add_argument("--warm-llm", action="store_true", help="one request through the LLM before the arms")
+    ap.add_argument("--ws-phases", action="store_true", help="after the arms: concurrent WebSocket sessions")
     ap.add_argument("--content", action="store_true")
     ap.add_argument("--budget-s", type=float, default=1e9)
     a = ap.parse_args()
@@ -304,11 +364,12 @@ def main():  # pragma: no cover - model run
         info["talker_gpu_error"] = repr(e)
         save()
         pocket.close()
-        (out / "pocket_server.log").rename(out / "pocket_server.gpu_failed.log")
+        (out / f"{a.talker}_server.log").rename(out / f"{a.talker}_server.gpu_failed.log")
         a.talker_device = "cpu"
         pocket = B.start_pocket(a, out)
         warm = PocketTalker(pocket, "warm", "it", B.voices(a).get(a.session_voice, a.session_voice))
     info["talker_voice"] = warm.info
+    warm.close()
     info["talker_device"] = a.talker_device
     res_mem["after_pocket"] = {"mem_available_gb": mem_available_gb(), **cuda_snapshot(torch),
                                "procs": proc_mem(ears, pocket)}
@@ -320,7 +381,7 @@ def main():  # pragma: no cover - model run
         shared = NanoShared(a.nano_dir, str(Path(a.lab_scripts) / "multilingual"), a.nano_precision, a.nano_graph)
         info["nano_load_s"] = round(time.monotonic() - t, 1)
         res_mem["after_nano"] = {"mem_available_gb": mem_available_gb(), **cuda_snapshot(torch), "nano": shared.mem,
-                                 "engine_rss_gb": rss_gb(), "procs": proc_mem(ears, pocket)}
+                                 "engine_rss_gb": rss_gb(), "engine_rss_peak_gb": rss_gb("VmHWM"), "procs": proc_mem(ears, pocket)}
         make_llm = B.llm_factory(a, shared, spec)
         if a.warm_llm:                    # f2-003: the first request after load took ~7 s (cold kernels)
             t = time.monotonic()
@@ -361,7 +422,7 @@ def main():  # pragma: no cover - model run
                              "content": [{k: c[k] for k in ("turn", "epoch", "complete", "cer_vs_speech", "played_s")}
                                          for c in s["content"]],
                              "mem_after": {"mem_available_gb": mem_available_gb(), **cuda_snapshot(torch),
-                                           "engine_rss_gb": rss_gb(), "procs": proc_mem(ears, pocket)}}
+                                           "engine_rss_gb": rss_gb(), "engine_rss_peak_gb": rss_gb("VmHWM"), "procs": proc_mem(ears, pocket)}}
         save()
         print("ARM", arm, json.dumps(info["arms"][arm], default=str)[:4000], flush=True)
         if a.listen_dir:
@@ -370,6 +431,10 @@ def main():  # pragma: no cover - model run
             ld.mkdir(parents=True, exist_ok=True)
             for f in ("agent_24k.wav", "mix_stream_24k.wav", "mix_wall_24k.wav"):
                 shutil.copy(out / arm / f, ld / f)
+    if a.ws_phases and time.monotonic() - T0 < a.budget_s + 60:
+        info["ws"] = ws_phases(a, res, out)
+        save()
+        print("WS", json.dumps(info["ws"], default=str)[:6000], flush=True)
     pocket.close()
     ears.close()
     info["total_s"] = round(time.monotonic() - T0, 1)

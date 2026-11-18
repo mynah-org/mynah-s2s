@@ -27,6 +27,7 @@ class PocketProc:  # pragma: no cover - process plumbing
         self.boxes: dict = {}
         self.misc: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
+        self.open_lock = threading.Lock()                # one session open (voice load) at a time
         self.ready = None
 
     def start(self):
@@ -53,8 +54,9 @@ class PocketProc:  # pragma: no cover - process plumbing
         self.misc.put({"ev": "eof"})
 
     def send(self, m):
-        self.p.stdin.write(json.dumps(m) + "\n")
-        self.p.stdin.flush()
+        with self.lock:                                  # several sessions' threads share the process
+            self.p.stdin.write(json.dumps(m) + "\n")
+            self.p.stdin.flush()
 
     def wait(self, ev: str, timeout: float = 300.0, pred=None) -> dict:
         t_end = time.monotonic() + timeout
@@ -101,8 +103,9 @@ class PocketTalker:  # pragma: no cover - needs the process
     def __init__(self, proc: PocketProc, ss: str, lang: str, voice: str = "", chunking: str = "sentence",
                  load_timeout: float = 120.0):
         self.proc, self.ss, self.lang, self.voice, self.chunking = proc, ss, lang, voice, chunking
-        proc.send({"op": "voice", "id": ss, "lang": lang, "voice": voice})
-        self.info = proc.wait("voice", load_timeout, pred=lambda m: m.get("id") == ss)
+        with proc.open_lock:
+            proc.send({"op": "voice", "id": ss, "lang": lang, "voice": voice})
+            self.info = proc.wait("voice", load_timeout, pred=lambda m: m.get("id") == ss)
         self.done_info: list = []
 
     def say(self, sid, text, epoch):
@@ -122,7 +125,10 @@ class PocketTalker:  # pragma: no cover - needs the process
         return out
 
     def close(self):
-        pass
+        try:
+            self.proc.send({"op": "close", "ss": self.ss})       # pocket_swap: release the session's slot binding
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class FlashTalker:  # pragma: no cover - needs the v1 talker process

@@ -35,6 +35,33 @@ POLICY = {
            "manque une information, demande-la. Avant une action qui change quelque chose, demande confirmation."),
 }
 
+# The f2 runs: asked for a product, the model said "I'm searching the catalogue, one moment" and never called the
+# search tool. A tool rule in the system prompt and the decision question in the session language (both tenant-agnostic).
+TOOL_RULE = {
+    "it": ("Quando la risposta richiede dati che non hai (prodotti, disponibilità, prezzi, ordini, clienti), chiama "
+           "prima lo strumento adatto. Non dire mai che stai cercando o controllando senza chiamare uno strumento."),
+    "fr": ("Quand la réponse demande des données que tu n'as pas (produits, disponibilité, prix, commandes, clients), "
+           "appelle d'abord l'outil adapté. Ne dis jamais que tu cherches ou vérifies sans appeler un outil."),
+    "en": ("When the answer needs data you do not have (products, availability, prices, orders, customers), call the "
+           "right tool first. Never say you are searching or checking without calling a tool."),
+}
+STEP_Q = ("[Controllo interno, non dal cliente] Per rispondere all'ultima richiesta del cliente devi prima chiamare "
+          "uno strumento? Rispondi con una sola parola: TOOL oppure REPLY.")     # = v1 e1/tool_step_probe.STEP_Q
+_STEP = {
+    "it": ("[Controllo interno, non dal cliente] Per rispondere all'ultima richiesta del cliente servono dati che "
+           "solo uno strumento può darti (prodotti, ordini, clienti, resi)? Rispondi con una sola parola: TOOL oppure "
+           "REPLY."),
+    "fr": ("[Contrôle interne, pas du client] Pour répondre à la dernière demande du client, faut-il des données que "
+           "seul un outil peut donner (produits, commandes, clients, retours) ? Réponds par un seul mot : TOOL ou "
+           "REPLY."),
+    "en": ("[Internal check, not from the caller] To answer the caller's last request, do you need data that only a "
+           "tool can give (products, orders, customers, returns)? Answer with one word: TOOL or REPLY."),
+}
+
+
+def step_question(lang: str) -> str:
+    return _STEP.get(lang, _STEP["en"])
+
 
 def _v1_path():
     if str(V1) not in sys.path:
@@ -67,7 +94,7 @@ class NanoShared:  # pragma: no cover - GPU
 
 class NanoLLM:  # pragma: no cover - GPU (the event conversion is model-free and tested through ScriptedLLM)
     def __init__(self, shared: NanoShared, system: str, tool_schemas: list, bound: dict, lang: str,
-                 backend=None, max_new: int = 60, soft_cap: int = 24):
+                 backend=None, max_new: int = 60, soft_cap: int = 24, localized_step: bool = True):
         _v1_path()
         from e1.nano_worker import NanoWorker
         self.sh, self.lang = shared, lang
@@ -79,6 +106,14 @@ class NanoLLM:  # pragma: no cover - GPU (the event conversion is model-free and
         w.reply_soft_cap = soft_cap
         w.graph, w.graph_reply_only = shared.graph, shared.graph is not None
         orig = w._serve_job
+        if localized_step:                       # the worker's decision question, in the session language
+            ids0, q = w._ids, step_question(lang)
+
+            def ids(msgs, extra=None):
+                if msgs and msgs[-1].get("content") == STEP_Q:
+                    msgs = msgs[:-1] + [{"role": "user", "content": q}]
+                return ids0(msgs, extra)
+            w._ids = ids
 
         def serialized(rid, msgs, t_req):
             with shared.lock:
