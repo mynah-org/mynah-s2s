@@ -268,25 +268,28 @@ class Model:
             y = (a @ wd.transpose(-1, -2))[:, 0] * topv.reshape(-1, 1)
             out = y.reshape(-1, c.top_k, H).sum(1)
         else:
-            # many tokens (prefill): group the tokens per expert, dequantise each hit expert once
-            flat = topi.reshape(-1)
-            order = torch.argsort(flat)
-            counts = torch.bincount(flat, minlength=c.num_experts).tolist()
-            tok = order // c.top_k
-            start = 0
-            for e, n in enumerate(counts):
-                if n == 0:
-                    continue
-                sel = order[start:start + n]
-                ti = tok[start:start + n]
-                start += n
-                e_t = torch.tensor([e], device=h.device)
-                wg = _expert_weight(ex, "gate_proj", e_t, grp)[0]
-                wu = _expert_weight(ex, "up_proj", e_t, grp)[0]
-                wd = _expert_weight(ex, "down_proj", e_t, grp)[0]
-                xs = h[ti]
-                y = F.linear(F.silu(F.linear(xs, wg)) * F.linear(xs, wu), wd)
-                out.index_add_(0, ti, y * topv.reshape(-1)[sel, None])
+            # many tokens (prefill): sort the (token, expert) pairs by expert, pad each hit expert's rows to the
+            # longest, dequantise the hit experts once and run three batched matmuls (no per-expert Python loop)
+            flat, wts = topi.reshape(-1), topv.reshape(-1)
+            order = torch.argsort(flat, stable=True)
+            e_sorted, tok = flat[order], order // c.top_k
+            counts = torch.bincount(flat, minlength=c.num_experts)
+            hit = torch.nonzero(counts).flatten()                              # host sync: fine in prefill
+            remap = torch.full((c.num_experts,), -1, dtype=torch.long, device=h.device)
+            remap[hit] = torch.arange(hit.numel(), device=h.device)
+            offs = torch.cumsum(counts, 0) - counts
+            rank = torch.arange(flat.numel(), device=h.device) - offs[e_sorted]
+            row = remap[e_sorted]
+            maxc = int(counts.max())
+            X = torch.zeros(hit.numel(), maxc, H, dtype=h.dtype, device=h.device)
+            X[row, rank] = h[tok]
+            wg = _expert_weight(ex, "gate_proj", hit, grp)                     # [n_hit, I, H]
+            wu = _expert_weight(ex, "up_proj", hit, grp)
+            a = F.silu(X @ wg.transpose(-1, -2)) * (X @ wu.transpose(-1, -2))
+            del wg, wu
+            wd = _expert_weight(ex, "down_proj", hit, grp)                     # [n_hit, H, I]
+            Y = a @ wd.transpose(-1, -2)                                       # [n_hit, maxc, H]
+            out.index_add_(0, tok, Y[row, rank] * wts[order][:, None])
         return (out + sh).reshape(B, T, H)
 
     # ---- forward ----

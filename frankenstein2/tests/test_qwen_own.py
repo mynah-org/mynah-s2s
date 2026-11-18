@@ -169,3 +169,14 @@ def test_weight_only_quant(mode, tol):
     ref = (x.float() @ w.float().t())
     got = QLinear(w, mode=mode, group=64)(x).float()
     assert ((got - ref).norm() / ref.norm()) < tol
+
+
+@pytest.mark.parametrize("awq", [False, True])
+def test_moe_prefill_path_equals_decode_path(awq):
+    c = tiny_cfg(moe=True)
+    m = Model(c, tiny_weights(c, awq), torch.device("cpu"), awq_group=16 if awq else None)
+    d = m.layers[0]
+    h = (torch.randn(1, 200, c.hidden) * 0.5).to(torch.bfloat16)        # 200 * top_k > 256: the grouped prefill path
+    big = m._mlp(d, h).float()
+    small = torch.cat([m._mlp(d, h[:, i:i + 1]) for i in range(200)], dim=1).float()   # decode path per token
+    assert ((big - small).norm() / small.norm()) < 0.02

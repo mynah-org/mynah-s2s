@@ -46,6 +46,7 @@ class QwenOwn:
         self.free = list(range(slots))
         self.graphs: dict = {}
         self.use_graphs = graphs and self.device.type == "cuda"
+        self.prefill_chunk = 1024
         self.sess: dict = {}
         self.mode = mode
         im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
@@ -97,11 +98,13 @@ class QwenOwn:
             self._zero(s)
         if len(ids) > self.max_len:
             raise ValueError("prompt longer than max_len")
-        new = torch.tensor([ids[start:]], device=self.device)
-        pos = torch.arange(start, len(ids), device=self.device)[None]
         slots = torch.tensor([s], device=self.device)
-        lens = torch.tensor([len(ids)], device=self.device)
-        logits = self.model.forward(new, self.state, slots, pos, lens, prefill=True)
+        for a in range(start, len(ids), self.prefill_chunk):           # bounded activations / expert buffers
+            b = min(len(ids), a + self.prefill_chunk)
+            new = torch.tensor([ids[a:b]], device=self.device)
+            pos = torch.arange(a, b, device=self.device)[None]
+            logits = self.model.forward(new, self.state, slots, pos, torch.tensor([b], device=self.device),
+                                        prefill=True)
         se["ids"] = list(ids)
         self._snapshot(s, len(ids))
         return logits[0]

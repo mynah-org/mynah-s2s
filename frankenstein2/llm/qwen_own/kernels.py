@@ -41,6 +41,22 @@ try:                                                    # pragma: no cover - nee
             acc += tl.sum(xv[:, None] * ((w - z) * s), axis=0)
         tl.store(y_ptr + p * N + cols, acc.to(tl.bfloat16), mask=cmask)
 
+    @triton.jit
+    def _w8_gemv(x_ptr, q_ptr, s_ptr, y_ptr, K, N, sxp, sqn, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        p = tl.program_id(0)
+        nb = tl.program_id(1)
+        rows = nb * BLOCK_N + tl.arange(0, BLOCK_N)                        # output features
+        rmask = rows < N
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            ks = k0 + tl.arange(0, BLOCK_K)
+            kmask = ks < K
+            xv = tl.load(x_ptr + p * sxp + ks, mask=kmask, other=0.0).to(tl.float32)
+            q = tl.load(q_ptr + rows[:, None] * sqn + ks[None, :], mask=rmask[:, None] & kmask[None, :], other=0)
+            acc += tl.sum(q.to(tl.float32) * xv[None, :], axis=1)
+        sc = tl.load(s_ptr + rows, mask=rmask, other=0.0).to(tl.float32)
+        tl.store(y_ptr + p * N + rows, (acc * sc).to(tl.bfloat16), mask=rmask)
+
     HAVE_TRITON = True
 except Exception:                                       # pragma: no cover
     HAVE_TRITON = False
@@ -59,3 +75,16 @@ def awq_expert_gemv(x, qweight, qzeros, scales, eidx, group, use_triton=True):
         return y
     w = awq_dequant(qweight[eidx], qzeros[eidx], scales[eidx], group)       # [P, N, K]
     return (x[:, None, :] @ w.transpose(-1, -2))[:, 0]
+
+
+def w8_gemv(x, q, s, use_triton=True):
+    """y = x @ (q * s)^T for a few rows: x [P, K] bf16, q [N, K] int8, s [N, 1] per-output-channel scale."""
+    P, K = x.shape
+    N = q.shape[0]
+    if use_triton and HAVE_TRITON and x.is_cuda:
+        x = x.contiguous()
+        y = torch.empty(P, N, dtype=torch.bfloat16, device=x.device)
+        grid = (P, triton.cdiv(N, 64))
+        _w8_gemv[grid](x, q, s, y, K, N, x.stride(0), q.stride(0), BLOCK_N=64, BLOCK_K=128)
+        return y
+    return torch.nn.functional.linear(x, q.to(torch.bfloat16) * s)

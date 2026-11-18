@@ -80,6 +80,10 @@ class QLinear:
         return awq_dequant(self.qweight, self.qzeros, self.scales, self.group)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode == "int8" and x.is_cuda and x.numel() // x.shape[-1] <= 16:
+            from .kernels import w8_gemv                                   # decode: fused int8 GEMV (Triton)
+            shp = x.shape
+            return w8_gemv(x.reshape(-1, shp[-1]), self.q, self.s).reshape(*shp[:-1], self.out_features)
         return F.linear(x, self.dequant())
 
     def nbytes(self) -> int:

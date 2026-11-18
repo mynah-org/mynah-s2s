@@ -56,7 +56,8 @@ def load_weights(path, device, allow_bf16_experts=False) -> tuple[dict, dict]:
                         d = experts.pop(key)
                         W[key] = torch.stack([d.pop(i) for i in range(n_exp)])
                 else:
-                    W[s] = fh.get_tensor(name)
+                    t = fh.get_tensor(name)
+                    W[s] = t.to(torch.bfloat16) if t.dtype == torch.float16 else t    # fp16 checkpoints (AWQ): bf16
     if experts:
         raise ValueError(f"incomplete expert sets: {sorted(experts)[:4]}")
     info = {"quant_method": q.get("quant_method"), "bits": q.get("bits"), "group_size": q.get("group_size"),
