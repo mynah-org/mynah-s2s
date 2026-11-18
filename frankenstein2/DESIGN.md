@@ -51,8 +51,27 @@ environment. Each session has its own language, encoder caches, GRU state and ru
   - Thresholds can be set per language (`--ep-thr it=0.85`). On the Italian session, 0.85 roughly halves the
     endpoint latency; the extra early fires fall in inner pauses and are recovered by the continuation guard and
     the unheard-barge merge.
+  - Silence fallback: after the user has spoken, 15 unvoiced frames (1.2 s) end the turn even if `p_end` stays
+    under the threshold. This is the bundle's own default policy (Tyger's live config leaves it off). We turned it on
+    because `p_end` sat at 0.89–0.90 for 8 s after an Italian turn and between 0.83 and 0.90 after English turns.
+  - "Voiced" means above max(−50 dB, tracked noise floor + 9 dB). The floor follows quiet frames at once and loud
+    ones by 0.05 dB per frame.
 - **2nd ear.** The agent channel is the agent audio exactly as the playout released it, delayed by the client delay
   and resampled 24→16 kHz with a zero-latency resampler. Backchannel audio is never in it.
+- **Batching across sessions.** One ears process serves many sessions. Hops of different sessions that are waiting
+  together go through one batched window encode and one batched GRU step per frame; each session keeps its own state
+  row, rules and language prompt. Checked on CPU: identical `p_end` and events to sequential hops.
+  - The streaming ASR (per-session caches) still runs per session. That bounds how many sessions one process keeps in
+    real time.
+  - `--ears-procs N` spreads sessions over N processes.
+  - Model loading builds the modules on the device and reads tensors one by one, so the host never holds a full copy.
+- **Barge-in assist** (`control/barge.py`). The GRU's yield head is slow on Italian (seconds). Beside it, while the
+  agent is audible, the engine runs an echo-aware onset detector:
+  - It compares the mic with the exact played agent audio, using an echo coupling learned per session (median of
+    mic minus agent level over agent-only steps).
+  - It is confirmed by a streaming-ASR word that is neither a backchannel ("sì", "ok", "mh", "yeah", "oui", …) nor
+    a word of the agent's own text, or by 1 s of continuous speech once the coupling is learned.
+  - Backchannels in the agent's pauses and the agent's own echo do not barge.
 
 ## 2. Controller (`control/`)
 
@@ -86,8 +105,15 @@ The interface is `submit(rid, messages)`, `cancel(rid)`, `poll()` and `close()`.
   - Precision `bf16` or `int4-decode`. `int4-decode` adds INT4 copies to the bf16 weights for the one-row decode
     steps (v1 G6/G8).
   - A lock serialises requests across sessions, because the INT4 prefill scratch is shared.
-- **Qwen3.5 2B/4B** (`qwen.py` + `qwen_server.py`), for an A/B later: XML tool-call parser, a splitter that keeps
-  call markup out of speech, and tool rounds. The process path is NOT VERIFIED.
+- **Qwen3.5** (`qwen.py`), in its own process. The default is our own inference engine (`qwen_own/`: bf16 or
+  weight-only int8, per-session state slots); `qwen_server.py` (HF generate) is a stand-in.
+  - Its XML tool-call parser keeps numerals as strings.
+  - A splitter keeps call markup out of speech, and the client runs the tool rounds.
+  - The history keeps calls in Qwen's own format.
+- **Tool decision.** Every LLM gets a per-language tool rule in its system prompt: when the answer needs data it
+  does not have, call the tool first, and never say "I'm checking" without calling one. For Nano, the
+  decision question is also asked in the session language. A CPU probe on the Italian catalogue question flipped
+  Nano's decision from REPLY to TOOL.
 - **No serving framework in the engine.** vLLM is used only in the lab, to compare models. The engine runs torch,
   our own code, and HF transformers / tokenizers for model definitions and loading.
   - **Today:** Nano runs on v1's own path: explicit hybrid KV / SSM cache, a one-row decode CUDA graph, the INT4
@@ -123,7 +149,12 @@ The interface is `submit(rid, messages)`, `cancel(rid)`, `poll()` and `close()`.
   - Pocket (`pocket_server.py`): one process for all sessions, language models kept in an LRU cache, and a
     per-session voice (zero-shot clone from a reference wav).
   - Flash (v1's process, one session at a time).
-  - pocket_swap (language slots) plugs in later behind the same interface. VoxCPM2 is not wired.
+  - pocket_swap (`--talker swap`): pocket_swap's own talker process. It runs one shared Pocket base plus
+    per-language packages; sessions are bound to language slots.
+    - Default: weight-only 4-bit packages (w4) in mode (b), where the compressed language terms are applied on the
+      fly, with preset `l40s-16g`.
+    - w8, wfp8 and bf16 packages, mode (a) and the other presets are selectable.
+  - VoxCPM2 is not wired.
 - **Playout:** the engine releases exactly 80 ms of audio per input step.
   - A cancel only flushes this queue, so no audio is generated ahead in the transport.
   - The played cursor is exact up to the client delay. It drives the 2nd ear and the heard text after a barge (whole
@@ -133,7 +164,9 @@ The interface is `submit(rid, messages)`, `cancel(rid)`, `poll()` and `close()`.
 
 - `server/engine.py` implements V2's Engine contract, so V2's Session and WebSocket server run it unchanged.
 - `session.start` carries `language` and `voice`; that one value drives the whole chain for the session.
-- `server/serve.py` reuses v1's start-field wrapper.
+- `server/serve.py` runs the multi-session WebSocket server (`server/multi.py`): the V2 wire format, several
+  concurrent sessions each with its own language, and a health probe for the web UI bridge (`ENGINE=frankenstein2`).
+  `--v2-server` keeps V2's single-session server.
 - All state is per session (`Pipeline`):
   - ears session and language;
   - controller, epochs and conversation;
@@ -167,9 +200,13 @@ The trace records:
 - what was heard after a barge.
 
 ## 8. Known limits
-- End-to-end runs (Italian session, fixed and reactive user): tools with parameters right for `find_customer`, but
-  the text LLM answers the catalogue question without calling `search_catalog`; barge-in by the yield head is slow
-  (seconds, Tyger's known weakness off English); cache-aware GRU features would need a fine-tune.
+- **Concurrency.** Each session costs the ears one streaming-ASR pass and the GRU window encode per hop. The LLM
+  serves one request at a time, and the talker one segment at a time. On a single GPU shared by those processes,
+  a handful of concurrent sessions keep real time; ten do not yet.
+  - What is needed for ten: batched streaming ASR, batched LLM decode across sessions, batched talker steps, and one
+    GPU scheduler instead of several processes time-slicing the GPU.
+- The GRU features use a second encoder pass because the head was trained on that regime. Fine-tuning the head on
+  streaming features would remove it.
 
 - The GRU was trained on English. In synthetic tests, Italian and French endpointing work; barge-in recall is
   weaker off English.

@@ -38,32 +38,40 @@ def main():  # pragma: no cover - GPU
     ears = B.start_ears(a, td)
     spec = B.tenant(a)
     pocket = B.start_pocket(a, td)
-    from frankenstein2.llm.nano import NanoShared
-    shared = NanoShared(a.nano_dir, str(Path(a.lab_scripts) / "multilingual"), a.nano_precision, a.nano_graph)
+    qproc = None
+    if a.llm_backend == "qwen":                  # Qwen3.5 on our own inference engine (default), in its process
+        qproc = B.start_qwen(a, td)
+        make_llm, llm_info = B.qwen_factory(a, qproc, spec), qproc.ready
+    else:                                        # Nemotron Nano 9B v2 in this process (fallback)
+        from frankenstein2.llm.nano import NanoShared
+        shared = NanoShared(a.nano_dir, str(Path(a.lab_scripts) / "multilingual"), a.nano_precision, a.nano_graph)
+        make_llm, llm_info = B.llm_factory(a, shared, spec), shared.mem
     from frankenstein2.server.engine import Frankenstein2Engine, Resources, make_pipeline
-    res = Resources(ears=ears, make_llm=B.llm_factory(a, shared, spec), make_talker=B.talker_factory(a, pocket),
+    res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket),
                     voices=B.voices(a), ears_thr=B.thresholds(a), trace_dir=str(td))
     loads = {"load_s": round(time.monotonic() - t0, 1), "ears": ears.ready, "talker": pocket.ready,
-             "nano": shared.mem}
+             "llm": llm_info}
     (td / "server_loads.json").write_text(json.dumps(loads, indent=1, default=str))
     import asyncio
     if not a.v2_server:
         from frankenstein2.server.multi import MultiServer
         srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
                           max_sessions=a.max_sessions, idle_timeout_s=a.idle_timeout,
-                          profile=f"frankenstein2-{a.nano_precision}")
+                          profile=f"frankenstein2-{a.llm_backend}")
         try:
             asyncio.run(srv.serve(a.host, a.port, ready=lambda: print(
                 f"READY port={a.port} " + json.dumps(loads, default=str), flush=True)))
         finally:
             pocket.close()
             ears.close()
+            if qproc is not None:
+                qproc.close()
         return
     eng = Frankenstein2Engine(res)
     from server.serve import make_server                     # v1's server wrapper (language / voice fields)
     from mynah_v2.transport.ws_server import ServerConfig
     cfg = ServerConfig(host=a.host, port=a.port, trace_dir=str(td), idle_timeout_s=a.idle_timeout)
-    cfg.backend_profile = f"frankenstein2-{a.nano_precision}"
+    cfg.backend_profile = f"frankenstein2-{a.llm_backend}"
     srv = make_server(eng, cfg)
     try:
         asyncio.run(srv.serve(ready=lambda: print(f"READY port={a.port} " + json.dumps(loads, default=str),

@@ -24,13 +24,13 @@ def add_args(ap) -> None:
     ap.add_argument("--lab-scripts", required=True, help="agentbench + multilingual lab scripts (tenant tools)")
     ap.add_argument("--tenant", default="tenant_furniture.json")
     ap.add_argument("--nano-dir", default="")
-    ap.add_argument("--llm-backend", default="nano", choices=["nano", "qwen"],
+    ap.add_argument("--llm-backend", default="qwen", choices=["nano", "qwen"],
                     help="nano = Nemotron Nano 9B v2 in this process; qwen = a Qwen3.5 process (own inference engine "
                          "if --qwen-src points at it, else HF generate)")
     ap.add_argument("--qwen-python", default="")
     ap.add_argument("--qwen-src", default="", help="root that contains frankenstein2.llm.qwen_own (own engine)")
     ap.add_argument("--qwen-model", default="")
-    ap.add_argument("--qwen-mode", default="bf16", help="own engine weights: bf16 | int8 | int4 (MoE: AWQ 4-bit)")
+    ap.add_argument("--qwen-mode", default="int8", help="own engine weights: int8 (default) | bf16 | MoE AWQ 4-bit")
     ap.add_argument("--qwen-slots", type=int, default=8)
     ap.add_argument("--nano-precision", default="int4-decode", choices=["bf16", "int4-decode"])
     ap.add_argument("--nano-graph", action="store_true", help="decode CUDA graph for the spoken reply (v1 G8)")
@@ -38,11 +38,11 @@ def add_args(ap) -> None:
     ap.add_argument("--ears-bundle", required=True)
     ap.add_argument("--ears-device", default="cuda")
     ap.add_argument("--ears-procs", type=int, default=1, help="ears processes; sessions are spread across them")
-    ap.add_argument("--talker", default="pocket", choices=["pocket", "swap", "flash"],
+    ap.add_argument("--talker", default="swap", choices=["pocket", "swap", "flash"],
                     help="pocket = one Pocket model per language; swap = pocket_swap (shared base + language packages)")
     ap.add_argument("--swap-root", default=str(ROOT / "pocket_swap"))
     ap.add_argument("--swap-base", default="", help="pocket_swap base checkpoint (english_2026-09_24l)")
-    ap.add_argument("--swap-packages", default="", help="pocket_swap language packages (any precision; w8 recommended)")
+    ap.add_argument("--swap-packages", default="", help="pocket_swap language packages: w4 (default choice), w8, wfp8 or bf16")
     ap.add_argument("--swap-mode", default="ondemand", choices=["ondemand", "materialise"],
                     help="ondemand = mode (b): compressed language terms applied on the fly (default)")
     ap.add_argument("--swap-preset", default="l40s-16g", help="pocket_swap preset: l40s-16g | gb10 | l4-24g")
