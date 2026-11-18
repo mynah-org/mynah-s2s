@@ -1,6 +1,9 @@
 # qwen_own — our own inference for Qwen3.5 (dense) and Qwen3.5/3.6 MoE
 
-torch + safetensors + the checkpoint's HF tokenizer and chat template. No serving framework. Triton kernels are
+Runtime dependencies: torch, triton (optional), safetensors, tokenizers and jinja2 (the chat template). config.json,
+the tokenizer and the chat template are read by our own code (`config.py`, `tokenizer.py`); HF transformers and vLLM
+are used only as test references (the tokenizer/chat template give identical ids to HF's on the three checkpoints).
+No serving framework. Triton kernels are
 optional (plain-torch fallbacks everywhere); tested on GB10 (sm_121), written for sm_80+ / sm_89 too.
 
 ## Models and weight formats
@@ -21,7 +24,7 @@ dense MLP or MoE (fp32 softmax router, renormalised top-k, shared expert with a 
 ```python
 from frankenstein2.llm.qwen_own import QwenOwn, BatchRunner
 eng = QwenOwn(path, device="cuda", mode="bf16"|"int8"|"int4", slots=16, max_len=8192, graphs=True, mtp=False,
-              tokenizer=None, stream=None)  # tokenizer: any HF-like object (default: AutoTokenizer, lazy import);
+              tokenizer=None, stream=None)  # tokenizer: default QwenTokenizer (tokenizers + jinja2, our code);
                                             # stream: torch.cuda.Stream for all of this engine's GPU work
 s = eng.open()                       # a session slot: its own KV cache + DeltaNet state (no shared state)
 ids = eng.chat_ids(messages, tools)  # chat template, thinking off
@@ -56,8 +59,7 @@ single-session greedy decoding (CPU test `test_batch_runner_matches_single_gener
 
 ### In-process use
 
-Library only: no process, no global state. Dependencies: torch, safetensors, triton (optional), and a tokenizer
-(transformers' AutoTokenizer by default, imported lazily; pass your own to avoid it). `BatchRunner.step()` does a
+Library only: no process, no global state. Dependencies: torch, safetensors, triton (optional), tokenizers, jinja2. `BatchRunner.step()` does a
 bounded amount of work (one prefill chunk per prefilling session + one batched decode token) and returns, so an
 external scheduler can interleave it with the ears and the talker; give the engine its own `stream=` to overlap.
 
@@ -70,5 +72,8 @@ JSON lines, same protocol as `../qwen_server.py` (`gen` / `cancel` / `quit` → 
 - 4B bf16 = HF transformers: top-1 6/6, greedy tokens identical; tool suite = vLLM (25/26 identical calls).
 - 4B int8: greedy = bf16 on 6/6 prompts; tool suite 24/26 calls identical to bf16.
 - MoE AWQ: tool suite calls identical to vLLM AWQ on 26/26 items.
-- MoE NVFP4 and MTP: see `.work/tyger/E_LLM_COMPARE.md` (addendum H) for the current numbers.
+- MoE AWQ after all kernel changes: tool calls identical to vLLM AWQ on 26/26 suite items.
+- MoE NVFP4 + MTP: speculative output identical to plain greedy (6/6); tool calls identical to vLLM NVFP4 on 21/26
+  (our FP8 projections run as W8A16, vLLM quantises activations too, so small numeric drift is expected).
+- 4B: re-checked equal to HF transformers greedy (6/6) after the fused DeltaNet kernels.
 - CPU tests: `frankenstein2/tests/test_qwen_own.py` (tiny random models).

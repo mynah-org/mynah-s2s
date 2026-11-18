@@ -139,6 +139,78 @@ try:                                                    # pragma: no cover - nee
         s2 = tl.load(s2_ptr + e)
         tl.store(y_ptr + rows[:, None] * sym + cols[None, :], (acc * s2).to(tl.bfloat16))
 
+    @triton.jit
+    def _delta_step(q_ptr, k_ptr, v_ptr, g_ptr, b_ptr, s_ptr, slot_ptr, o_ptr, H, scale,
+                    DK: tl.constexpr, DV: tl.constexpr, BV: tl.constexpr):
+        """One decode token of the gated delta rule for one (row, head), in place on the session's fp32 state."""
+        bh = tl.program_id(0)
+        vb = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+        slot = tl.load(slot_ptr + b).to(tl.int64)
+        dk = tl.arange(0, DK)
+        dv = vb * BV + tl.arange(0, BV)
+        q = tl.load(q_ptr + bh * DK + dk).to(tl.float32) * scale
+        k = tl.load(k_ptr + bh * DK + dk).to(tl.float32)
+        v = tl.load(v_ptr + bh * DV + dv).to(tl.float32)
+        g = tl.exp(tl.load(g_ptr + bh).to(tl.float32))
+        beta = tl.load(b_ptr + bh).to(tl.float32)
+        base = s_ptr + (slot * H + h) * DK * DV
+        S = tl.load(base + dk[:, None] * DV + dv[None, :]) * g
+        kv = tl.sum(S * k[:, None], axis=0)
+        S = S + k[:, None] * ((v - kv) * beta)[None, :]
+        tl.store(base + dk[:, None] * DV + dv[None, :], S)
+        tl.store(o_ptr + bh * DV + dv, tl.sum(S * q[:, None], axis=0))
+
+    @triton.jit
+    def _chunk_scan(vv_ptr, kc_ptr, qg_ptr, att_ptr, kd_ptr, gl_ptr, s_ptr, o_ptr, NC,
+                    C: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr, BV: tl.constexpr):
+        """Inter-chunk recurrence of the chunked gated delta rule for one (row*head, value block): the state block
+        [DK, BV] stays on chip across all chunks. Inputs per chunk (fp32, contiguous): vv [C, DV], kcum [C, DK],
+        q*exp(g) [C, DK], intra-chunk attention [C, C], k*exp(g_last - g) [C, DK], g_last; state [DK, DV] in/out."""
+        bh = tl.program_id(0)
+        vb = tl.program_id(1)
+        rc = tl.arange(0, C)
+        rk = tl.arange(0, DK)
+        rv = vb * BV + tl.arange(0, BV)
+        S = tl.load(s_ptr + bh * DK * DV + rk[:, None] * DV + rv[None, :])
+        for i in range(NC):
+            base = bh * NC + i
+            kc = tl.load(kc_ptr + base * C * DK + rc[:, None] * DK + rk[None, :])
+            vnew = tl.load(vv_ptr + base * C * DV + rc[:, None] * DV + rv[None, :]) - \
+                tl.dot(kc, S, input_precision="tf32x3")
+            qg = tl.load(qg_ptr + base * C * DK + rc[:, None] * DK + rk[None, :])
+            att = tl.load(att_ptr + base * C * C + rc[:, None] * C + rc[None, :])
+            o = tl.dot(qg, S, input_precision="tf32x3") + tl.dot(att, vnew, input_precision="tf32x3")
+            tl.store(o_ptr + base * C * DV + rc[:, None] * DV + rv[None, :], o)
+            kdT = tl.load(kd_ptr + base * C * DK + rc[None, :] * DK + rk[:, None])          # [DK, C]
+            gl = tl.load(gl_ptr + base)
+            S = S * tl.exp(gl) + tl.dot(kdT, vnew, input_precision="tf32x3")
+        tl.store(s_ptr + bh * DK * DV + rk[:, None] * DV + rv[None, :], S)
+
+    @triton.jit
+    def _wq_gemm(x_ptr, q_ptr, s_ptr, y_ptr, M, K, N, sxm, sqn, sym,
+                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        """Prefill GEMM with int8 / fp8 weights dequantised inside the tile: Y = X @ (Q * s)^T, s per output row."""
+        mb = tl.program_id(0)
+        nb = tl.program_id(1)
+        rows = mb * BM + tl.arange(0, BM)
+        cols = nb * BN + tl.arange(0, BN)
+        rmask = rows < M
+        cmask = cols < N
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            ks = k0 + tl.arange(0, BK)
+            kmask = ks < K
+            a = tl.load(x_ptr + rows[:, None] * sxm + ks[None, :], mask=rmask[:, None] & kmask[None, :], other=0.0)
+            wm = kmask[:, None] & cmask[None, :]
+            w = tl.load(q_ptr + cols[None, :] * sqn + ks[:, None], mask=wm)
+            w = tl.where(wm, w.to(tl.float32), 0.0).to(tl.bfloat16)
+            acc += tl.dot(a.to(tl.bfloat16), w)
+        sc = tl.load(s_ptr + cols, mask=cmask, other=0.0).to(tl.float32)
+        tl.store(y_ptr + rows[:, None] * sym + cols[None, :], (acc * sc[None, :]).to(tl.bfloat16),
+                 mask=rmask[:, None] & cmask[None, :])
+
     HAVE_TRITON = True
 except Exception:                                       # pragma: no cover
     HAVE_TRITON = False
@@ -182,8 +254,9 @@ def nvfp4_expert_gemv(x, q, s, s2, eidx, use_triton=True):
     if _use(x, use_triton) and K % 64 == 0:
         x = x.contiguous()
         y = torch.empty(P, N, dtype=torch.bfloat16, device=x.device)
-        _nvfp4_gemv[(P, triton.cdiv(N, 64))](x, q, s, s2, eidx, y, K, N, x.stride(0), q.stride(0), q.stride(1),
-                                              s.stride(0), s.stride(1), BLOCK_N=64, BLOCK_K=64)
+        bk = 256 if K % 256 == 0 else 64                                    # tuned on GB10 (sweep in labs/tyger)
+        _nvfp4_gemv[(P, triton.cdiv(N, 32))](x, q, s, s2, eidx, y, K, N, x.stride(0), q.stride(0), q.stride(1),
+                                              s.stride(0), s.stride(1), BLOCK_N=32, BLOCK_K=bk)
         return y
     w = nvfp4_dequant(q[eidx], s[eidx], s2[eidx])
     return (x[:, None, :] @ w.transpose(-1, -2))[:, 0]
@@ -196,7 +269,8 @@ def int8_gemv(x, q, s, use_triton=True):
     if _use(x, use_triton):
         x = x.contiguous()
         y = torch.empty(P, N, dtype=torch.bfloat16, device=x.device)
-        _int8_gemv[(P, triton.cdiv(N, 64))](x, q, s.reshape(-1), y, K, N, x.stride(0), q.stride(0), BLOCK_N=64, BLOCK_K=128)
+        _int8_gemv[(P, triton.cdiv(N, 32))](x, q, s.reshape(-1), y, K, N, x.stride(0), q.stride(0), BLOCK_N=32,
+                                             BLOCK_K=512)                    # tuned on GB10 (masked tail for any K)
         return y
     return torch.nn.functional.linear(x, (q.float() * s.reshape(-1, 1).float()).to(torch.bfloat16))
 
@@ -238,7 +312,45 @@ def moe_gemm(X, ex: dict, name: str, block_expert, awq_group=None):
     q, s, s2 = ex[name + ".weight"], ex[name + ".weight_scale"], ex[name + ".weight_scale_2"]
     N = q.shape[-2]
     Y = torch.empty(total, N, dtype=torch.bfloat16, device=X.device)
-    _nvfp4_moe_gemm[(total // BM, N // 64)](X, q, s, s2, block_expert, Y, K, N, X.stride(0), q.stride(0), q.stride(1),
-                                             s.stride(0), s.stride(1), Y.stride(0), BM=BM, BN=64, BK=64, num_stages=2,
+    bn = 128 if N % 128 == 0 else 64                                        # tuned on GB10
+    bk = 128 if K % 128 == 0 else 64
+    _nvfp4_moe_gemm[(total // BM, N // bn)](X, q, s, s2, block_expert, Y, K, N, X.stride(0), q.stride(0), q.stride(1),
+                                             s.stride(0), s.stride(1), Y.stride(0), BM=BM, BN=bn, BK=bk, num_stages=2,
                                              num_warps=4)
     return Y
+
+
+def delta_step_inplace(q, k, v, g, beta, state, slots):
+    """Decode step of the gated delta rule, updating `state[slots]` in place. q, k [B, H, dk] (l2-normalised), v [B, H,
+    dv], g, beta [B, H]; state [S, H, dk, dv] fp32 (all session slots). Returns out [B, H, dv] fp32."""
+    B, H, DK = q.shape
+    DV = v.shape[-1]
+    o = torch.empty(B, H, DV, dtype=torch.float32, device=q.device)
+    BV = 32 if DV % 32 == 0 else DV
+    _delta_step[(B * H, DV // BV)](q.contiguous(), k.contiguous(), v.contiguous(), g.float().contiguous(),
+                                   beta.float().contiguous(), state, slots, o, H, DK ** -0.5, DK=DK, DV=DV, BV=BV)
+    return o
+
+
+def chunk_scan(vv, kcum, qg, att, kd, gl, state):
+    """Triton inter-chunk scan. vv [BH, n, C, dv], kcum/qg/kd [BH, n, C, dk], att [BH, n, C, C], gl [BH, n], state
+    [BH, dk, dv] fp32 (updated in place). Returns out [BH, n, C, dv] fp32."""
+    BH, n, C, DV = vv.shape
+    DK = kcum.shape[-1]
+    o = torch.empty_like(vv)
+    BV = 32
+    _chunk_scan[(BH, DV // BV)](vv.contiguous(), kcum.contiguous(), qg.contiguous(), att.contiguous(), kd.contiguous(),
+                                gl.contiguous(), state, o, n, C=C, DK=DK, DV=DV, BV=BV, num_warps=4,
+                                num_stages=1)                  # fp32 tiles: no pipelining (~100 KB smem parts)
+    return o
+
+
+def wq_gemm(x, q, s):
+    """Prefill: x [M, K] bf16 @ (q [N, K] int8/fp8 * s [N])^T -> [M, N] bf16, without a bf16 copy of the weight."""
+    M, K = x.shape
+    N = q.shape[0]
+    x = x.contiguous()
+    y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+    _wq_gemm[(triton.cdiv(M, 64), triton.cdiv(N, 128))](x, q, s.reshape(-1), y, M, K, N, x.stride(0), q.stride(0),
+                                                         y.stride(0), BM=64, BN=128, BK=64, num_stages=2, num_warps=4)
+    return y

@@ -42,16 +42,16 @@ class QwenOwn:
 
     def __init__(self, path, device="cuda", mode="bf16", slots=4, max_len=8192, group=128, graphs=True, mtp=False,
                  tokenizer=None, stream=None):
-        """tokenizer: any object with apply_chat_template / decode / convert_tokens_to_ids (default: the checkpoint's
-        HF tokenizer, imported lazily). stream: a torch.cuda.Stream all of this engine's GPU work is issued on (an
+        """tokenizer: any object with apply_chat_template / decode / convert_tokens_to_ids (default: QwenTokenizer,
+        tokenizers + jinja2 on the checkpoint's own files). stream: a torch.cuda.Stream all of this engine's GPU work is issued on (an
         external scheduler can overlap it with other models); None = the current stream."""
         t0 = time.monotonic()
         self.path, self.device = str(path), torch.device(device)
         self.stream = stream
         self.cfg = load_cfg(path)
-        if tokenizer is None:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(self.path)
+        if tokenizer is None:                                          # tokenizers + jinja2: no transformers
+            from .tokenizer import QwenTokenizer
+            tokenizer = QwenTokenizer(self.path)
         self.tok = tokenizer
         W, info = load_weights(path, self.device, mtp=mtp)
         self.quant = info

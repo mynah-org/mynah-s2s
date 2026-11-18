@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import QwenCfg
-from .kernels import awq_expert_gemv, moe_align, moe_gemm, nvfp4_dequant, nvfp4_expert_gemv, BM as MOE_BM
+from .kernels import awq_expert_gemv, chunk_scan, delta_step_inplace, moe_align, moe_gemm, nvfp4_dequant, nvfp4_expert_gemv, BM as MOE_BM
 from .quant import QLinear, awq_dequant, nvfp4_quantize
 
 
@@ -65,9 +65,11 @@ class Rope:
 
 # ---------------------------------------------------------------------------------------------------------------
 # gated delta rule
-def chunk_delta_rule(q, k, v, g, beta, state, chunk=64):
+def chunk_delta_rule(q, k, v, g, beta, state, chunk=64, use_kernel=True):
     """Prefill. q, k [B, T, H, dk] (already l2-normalised), v [B, T, H, dv], g, beta [B, T, H]; state [B, H, dk, dv]
     fp32 (updated in place is NOT done: the new state is returned). Returns (out [B, T, H, dv] fp32, state)."""
+    if q.is_cuda and use_kernel:
+        chunk = 32                     # the on-chip scan keeps fp32 [C, dk] tiles in ~100 KB of shared memory
     q, k, v, beta, g = [x.transpose(1, 2).contiguous().float() for x in (q, k, v, beta, g)]
     B, H, T, dk = k.shape
     dv = v.shape[-1]
@@ -86,6 +88,20 @@ def chunk_delta_rule(q, k, v, g, beta, state, chunk=64):
     tri = torch.linalg.solve_triangular(eye + a, eye.expand_as(a), upper=False)       # (I + A)^-1
     vv = tri @ vb
     kcum = tri @ (kb * g.exp()[..., None])
+    if q.is_cuda and use_kernel:                                        # the scan on chip (Triton)
+        gl = g[..., -1]                                                 # [B, H, n]
+        qg = q * g.exp()[..., None]
+        att = ((q @ k.transpose(-1, -2)) * decay).tril()
+        kd = k * (gl[..., None] - g).exp()[..., None]
+        s = state.float().reshape(B * H, dk, dv).contiguous()
+        f = lambda x: x.reshape(B * H, n, *x.shape[3:])                 # noqa: E731
+        try:
+            out = chunk_scan(f(vv), f(kcum), f(qg), f(att), f(kd), gl.reshape(B * H, n), s)
+            out = out.reshape(B, H, n * chunk, dv)[:, :, :T].transpose(1, 2)
+            return out, s.reshape(B, H, dk, dv)
+        except Exception as e:                                          # e.g. too little shared memory: torch loop
+            if "out of resource" not in str(e).lower():
+                raise
     out = torch.empty_like(vv)
     s = state.float()
     for i in range(n):
@@ -212,6 +228,11 @@ class Model:
         if rep > 1:
             q, k = q.repeat_interleave(rep, dim=2), k.repeat_interleave(rep, dim=2)
         q, k = l2norm(q), l2norm(k)
+        if not prefill and T == 1 and self.use_kernels:          # fused decode step, in place on the slot's state
+            o = delta_step_inplace(q[:, 0], k[:, 0], v[:, 0], g[:, 0], beta[:, 0], st["rec"][d["i"]], slots)
+            out = o[:, None].to(x.dtype).reshape(-1, c.lin_v_dim)
+            out = gated_rms_norm(out, z.reshape(-1, c.lin_v_dim), d["gnorm"], c.eps).reshape(B, T, -1)
+            return d["out"](out)
         state = st["rec"][d["i"]][slots]
         if prefill:
             out, s = chunk_delta_rule(q, k, v, g, beta, state)
@@ -313,7 +334,9 @@ class Model:
                 X[pos] = h[tok]
                 a = F.silu(moe_gemm(X, ex, "gate_proj", bexp, grp)) * moe_gemm(X, ex, "up_proj", bexp, grp)
                 Y = moe_gemm(a, ex, "down_proj", bexp, grp)
-                out.index_add_(0, tok, Y[pos] * wts[order][:, None])
+                buf = torch.empty(flat.numel(), H, dtype=h.dtype, device=h.device)
+                buf[order] = Y[pos] * wts[order][:, None]                      # deterministic combine (no atomics)
+                out = buf.view(-1, c.top_k, H).sum(1)
                 return (out + sh).reshape(B, T, H)
             order = torch.argsort(flat, stable=True)
             e_sorted, tok = flat[order], order // c.top_k
@@ -339,7 +362,9 @@ class Model:
                 del wg, wu
                 wd = _expert_weight(ex, "down_proj", hit, grp)                 # [n_hit, H, I]
                 Y = a @ wd.transpose(-1, -2)                                   # [n_hit, maxc, H]
-            out.index_add_(0, tok, Y[row, rank] * wts[order][:, None])
+            buf = torch.empty(flat.numel(), H, dtype=h.dtype, device=h.device)
+            buf[order] = Y[row, rank] * wts[order][:, None]                    # deterministic combine (no atomics)
+            out = buf.view(-1, c.top_k, H).sum(1)
         return (out + sh).reshape(B, T, H)
 
     # ---- forward ----

@@ -96,6 +96,11 @@ class QLinear:
             else:
                 y = int8_gemv(x2, self.q, self.s)
             return y.reshape(*shp[:-1], self.out_features)
+        if self.mode in ("int8", "fp8") and x.is_cuda:                     # prefill: in-tile dequant GEMM (Triton)
+            from .kernels import HAVE_TRITON, wq_gemm
+            if HAVE_TRITON:
+                shp = x.shape
+                return wq_gemm(x.reshape(-1, shp[-1]), self.q, self.s).reshape(*shp[:-1], self.out_features)
         return F.linear(x, self.dequant())
 
     def nbytes(self) -> int:
