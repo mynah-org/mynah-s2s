@@ -85,10 +85,11 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def load_bundle(folder, check_sha: bool = True):
-    """-> (Nemotron 3.5 ASR model fp32, its processor, TurnTaker fp32, config) on the CPU. TF32 off process-wide (the
-    bundle was validated with it off)."""
-    from safetensors.torch import load_file
+def load_bundle(folder, check_sha: bool = True, device: str = "cpu"):
+    """-> (Nemotron 3.5 ASR model fp32, its processor, TurnTaker fp32, config) on ``device``. The modules are built on
+    the device and the tensors are read one by one from the safetensors file straight to it, so the host never holds
+    a whole copy of the weights (small-RAM hosts). TF32 off process-wide (the bundle was validated with it off)."""
+    from safetensors import safe_open
     from transformers import AutoConfig, AutoModel, AutoProcessor
     folder = Path(folder)
     config = json.loads((folder / "config.json").read_text())
@@ -96,18 +97,18 @@ def load_bundle(folder, check_sha: bool = True):
         raise ValueError(f"not a tyger bundle: {config.get('model_type')!r}")
     if check_sha and _sha256(folder / "model.safetensors") != config["weights_sha256"]:
         raise ValueError("model.safetensors does not match its checksum")
-    weights = load_file(str(folder / "model.safetensors"))
-    parts = {"nemotron": {}, "turn_taker": {}}
-    for k, v in weights.items():
-        prefix, _, name = k.partition(".")
-        parts[prefix][name] = v
-    del weights
-    nemotron = AutoModel.from_config(AutoConfig.from_pretrained(folder / "nemotron"), dtype=torch.float32)
-    nemotron.load_state_dict(parts["nemotron"], strict=True)
-    proc = AutoProcessor.from_pretrained(folder / "nemotron")
     arch = config["controller"]["architecture"]
-    tt = TurnTaker(arch["width"], arch["layers"])
-    tt.load_state_dict(parts["turn_taker"], strict=True)
+    with torch.device(device):
+        nemotron = AutoModel.from_config(AutoConfig.from_pretrained(folder / "nemotron"), dtype=torch.float32)
+        tt = TurnTaker(arch["width"], arch["layers"])
+    parts = {"nemotron": {}, "turn_taker": {}}
+    with safe_open(str(folder / "model.safetensors"), framework="pt", device=str(device)) as f:
+        for k in f.keys():
+            prefix, _, name = k.partition(".")
+            parts[prefix][name] = f.get_tensor(k)
+    nemotron.load_state_dict(parts.pop("nemotron"), strict=True)
+    tt.load_state_dict(parts.pop("turn_taker"), strict=True)
+    proc = AutoProcessor.from_pretrained(folder / "nemotron")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     return nemotron.eval(), proc, tt.eval(), config

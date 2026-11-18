@@ -220,7 +220,8 @@ class Pipeline:
             self.tr.emit("llm.decided", k, request_id=rid)
             self.ctl.post(Intent("LLM_DECIDED", "llm", k, request_id=rid))
         elif kind == "tool":
-            self.conv.tool(e["name"], e.get("args") or {}, e.get("result", ""))
+            self.conv.tool(e["name"], e.get("args") or {}, e.get("result", ""),
+                           markup=getattr(self.llm, "call_markup", None))
             self.tr.emit("tool.completed", k, request_id=rid, name=e["name"], args=e.get("args"),
                          args_raw=e.get("args_raw"), result=e.get("result"), call_id=e.get("call_id"),
                          turn_id=self.ctl.turn)

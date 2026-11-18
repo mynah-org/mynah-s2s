@@ -50,6 +50,7 @@ def main():  # pragma: no cover - model process
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--lookahead", type=int, default=3)
     ap.add_argument("--no-sha", action="store_true")
+    ap.add_argument("--max-batch", type=int, default=16, help="hops of different sessions encoded together")
     a = ap.parse_args()
     out = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
     sys.stdout = sys.stderr
@@ -60,13 +61,11 @@ def main():  # pragma: no cover - model process
     import numpy as np
     import torch
     from frankenstein2.ears.rules import Thresholds
-    from frankenstein2.ears.stream import EarsSession, transcribe_offline
+    from frankenstein2.ears.stream import EarsSession, hop_batch, transcribe_offline
     from frankenstein2.ears.turntaker import load_bundle
     t0 = time.monotonic()
     dev = a.device if (a.device == "cpu" or torch.cuda.is_available()) else "cpu"
-    model, proc, tt, cfg = load_bundle(a.bundle, check_sha=not a.no_sha)
-    model.to(dev)
-    tt.to(dev)
+    model, proc, tt, cfg = load_bundle(a.bundle, check_sha=not a.no_sha, device=dev)
     pdict = dict(getattr(proc, "prompt_dictionary", None) or {}) or PROMPTS
 
     def mem():
@@ -80,12 +79,53 @@ def main():  # pragma: no cover - model process
           "capability": list(torch.cuda.get_device_capability()) if dev != "cpu" else None, **mem(),
           "rss_gb": rss_gb(), "rss_peak_gb": rss_gb("VmHWM")})
     sessions, stats = {}, {}
-    for line in sys.stdin:
-        try:
-            c = json.loads(line)
-        except ValueError:
-            continue
+    import queue
+    import threading
+    inbox: queue.Queue = queue.Queue()
+
+    def reader():
+        for line in sys.stdin:
+            try:
+                inbox.put(json.loads(line))
+            except ValueError:
+                continue
+        inbox.put({"op": "quit"})
+    threading.Thread(target=reader, daemon=True).start()
+    held = []
+    while True:
+        c = held.pop(0) if held else inbox.get()
         op = c.get("op")
+        if op == "hop" and a.max_batch > 1:      # hops of other sessions waiting now: one batched window encode
+            batch, seen = [c], {c["sid"]}
+            while len(batch) < a.max_batch:
+                try:
+                    nxt = inbox.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt.get("op") == "hop" and nxt["sid"] not in seen and nxt["sid"] in sessions:
+                    batch.append(nxt)
+                    seen.add(nxt["sid"])
+                else:
+                    held.append(nxt)
+                    break
+            if len(batch) > 1:
+                try:
+                    with torch.inference_mode():
+                        rs = hop_batch([(sessions[x["sid"]], b64f32(x["u"]), b64f32(x["a"]), x["mode"],
+                                         bool(x.get("reset"))) for x in batch])
+                    for x, r in zip(batch, rs):
+                        st = stats[x["sid"]]
+                        st["hops"] += 1
+                        for key in ("ms", "enc_ms", "win_ms"):
+                            st[key].append(r[key])
+                        emit({"ev": "hop", "sid": x["sid"], "n": x["n"], "t_ns": time.monotonic_ns(), **r})
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
+                    for x in batch:
+                        emit({"ev": "error", "op": "hop", "sid": x["sid"], "n": x["n"],
+                              "error": f"{type(e).__name__}: {str(e)[:300]}"})
+                continue
         try:
             if op == "quit":
                 break

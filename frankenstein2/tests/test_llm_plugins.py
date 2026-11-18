@@ -60,3 +60,8 @@ def test_qwen_round_trip_runs_tool_and_resumes():
     assert seen == [{"name": "Mario Rossi", "postcode": "10121"}]
     assert "".join(e["text"] for e in evs if e["ev"] == "text") == "Trovato, signor Rossi."
     assert proc.sent[1]["messages"][-1] == {"role": "tool", "content": '{"ok": 1}'}
+
+
+def test_qwen_history_markup_round_trips_through_the_parser():
+    m = QwenLLM.call_markup("find_customer", {"full_name": "Mario Rossi", "postcode": "10121"})
+    assert parse_calls(m) == [{"name": "find_customer", "arguments": {"full_name": "Mario Rossi", "postcode": "10121"}}]

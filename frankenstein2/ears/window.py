@@ -62,27 +62,48 @@ class WindowL15:
         am = torch.arange(f.shape[1], device=dev)[None] < flen
         return f * am.unsqueeze(-1)
 
-    @torch.no_grad()
-    def hop(self, user: np.ndarray, agent: np.ndarray):
-        """-> (user L15 (4, 1024), agent L15 (4, 1024)) for the hop just added."""
+    def push(self, user: np.ndarray, agent: np.ndarray) -> list:
+        """Add a hop; -> the windows this session needs encoded: [user] or [user, agent] (an all-zero agent window
+        of a length already seen is served from the cache)."""
         self.win = np.concatenate([self.win, np.stack([user, agent]).astype(np.float32)], 1)[:, -WINDOW:]
         n = self.win.shape[1]
-        rows = [0, 1]
-        out = [None, None]
         if not self.win[1].any() and n in self._zero:
-            out[1] = self._zero[n]
-            rows = [0]
-        feats = self.features([self.win[r] for r in rows])
-        WindowL15._active, self._stop = self, True
-        try:
-            self.enc(input_features=feats, num_lookahead_tokens=0)
-        except _Stop:
-            pass
-        finally:
-            self._stop = False
-        h = self._h.float()
-        for i, r in enumerate(rows):
-            out[r] = h[i, -4:]
-        if 1 in rows and not self.win[1].any():
-            self._zero[n] = out[1].clone()
-        return out[0], out[1]
+            return [self.win[0]]
+        return [self.win[0], self.win[1]]
+
+    def take(self, encoded: list):
+        """``encoded``: the L15 (T, 1024) of the windows ``push`` returned, in order -> (user L15 (4,1024), agent)."""
+        n = self.win.shape[1]
+        hu = encoded[0][-4:]
+        if len(encoded) == 1:
+            return hu, self._zero[n]
+        ha = encoded[1][-4:]
+        if not self.win[1].any():
+            self._zero[n] = ha.clone()
+        return hu, ha
+
+    @torch.no_grad()
+    def encode(self, wavs: list) -> list:
+        """Layer 15 of several windows (any sessions; equal lengths batched in one encoder call)."""
+        out = [None] * len(wavs)
+        groups: dict = {}
+        for i, w in enumerate(wavs):
+            groups.setdefault(len(w), []).append(i)
+        for n, idx in groups.items():
+            feats = self.features([wavs[i] for i in idx])
+            WindowL15._active, self._stop = self, True
+            try:
+                self.enc(input_features=feats, num_lookahead_tokens=0)
+            except _Stop:
+                pass
+            finally:
+                self._stop = False
+            h = self._h.float()
+            for j, i in enumerate(idx):
+                out[i] = h[j]
+        return out
+
+    @torch.no_grad()
+    def hop(self, user: np.ndarray, agent: np.ndarray):
+        """-> (user L15 (4, 1024), agent L15 (4, 1024)) for the hop just added (one session)."""
+        return self.take(self.encode(self.push(user, agent)))

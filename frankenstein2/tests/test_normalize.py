@@ -53,6 +53,9 @@ CASES = [
     ("en", "It costs 49,90 euros.", "It costs forty-nine euros and ninety cents."),
     ("it", "Pesa 3.5 kg.", "Pesa tre virgola cinque kg."),
     ("en", "arrives on 14/11", "arrives on November fourteenth"),
+    # ISO dates from tool results (v2 run: read as digit groups before)
+    ("en", "arrives on 2026-11-14.", "arrives on November fourteenth, twenty twenty-six."),
+    ("it", "arriva il 2026-11-14.", "arriva il quattordici novembre duemilaventisei."),
     # untouched
     ("it", "Buongiorno, come posso aiutarla?", "Buongiorno, come posso aiutarla?"),
 ]

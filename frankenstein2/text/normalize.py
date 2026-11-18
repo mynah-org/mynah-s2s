@@ -328,6 +328,10 @@ def normalize(text: str, lang: str) -> str:
     t = text
     plus = {"it": "più", "fr": "plus", "en": "plus"}[lang]
 
+    # ISO dates (2026-11-14): LLMs copy them from tool results; read as a date, not as phone-number groups
+    t = _sub(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b",
+             lambda m: _date(int(m.group(3)), int(m.group(2)), int(m.group(1)), lang), t)
+
     # phone numbers: +CC and groups, or 3+ groups of digits joined by spaces / dashes / dots
     def phone(m):
         s = m.group(0)

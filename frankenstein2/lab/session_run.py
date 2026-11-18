@@ -375,7 +375,16 @@ def main():  # pragma: no cover - model run
                                "procs": proc_mem(ears, pocket)}
     save()
     shared = None
-    if a.llm == "nano":
+    qproc = None
+    if a.llm == "nano" and a.llm_backend == "qwen":
+        t = time.monotonic()
+        qproc = B.start_qwen(a, out)
+        info["qwen_ready"] = {k: v for k, v in qproc.ready.items() if k != "t_recv_ns"}
+        info["llm_load_s"] = round(time.monotonic() - t, 1)
+        res_mem["after_llm"] = {"mem_available_gb": mem_available_gb(), **cuda_snapshot(torch),
+                                "procs": proc_mem(ears, pocket)}
+        make_llm = B.qwen_factory(a, qproc, spec)
+    elif a.llm == "nano":
         from frankenstein2.llm.nano import NanoShared
         t = time.monotonic()
         shared = NanoShared(a.nano_dir, str(Path(a.lab_scripts) / "multilingual"), a.nano_precision, a.nano_graph)
@@ -383,7 +392,10 @@ def main():  # pragma: no cover - model run
         res_mem["after_nano"] = {"mem_available_gb": mem_available_gb(), **cuda_snapshot(torch), "nano": shared.mem,
                                  "engine_rss_gb": rss_gb(), "engine_rss_peak_gb": rss_gb("VmHWM"), "procs": proc_mem(ears, pocket)}
         make_llm = B.llm_factory(a, shared, spec)
-        if a.warm_llm:                    # f2-003: the first request after load took ~7 s (cold kernels)
+    else:
+        make_llm = scripted_llm_factory()
+    if a.llm == "nano" and a.warm_llm:    # f2-003: the first request after load took ~7 s (cold kernels)
+        if True:
             t = time.monotonic()
             w = make_llm("warm", "it")
             w.submit(1, [{"role": "user", "content": "Buongiorno, cerco un divano a tre posti."}])
@@ -393,8 +405,6 @@ def main():  # pragma: no cover - model run
                 time.sleep(0.05)
             w.close()
             info["llm_warm_s"] = round(time.monotonic() - t, 1)
-    else:
-        make_llm = scripted_llm_factory()
     save()
     print("LOADS", json.dumps(res_mem, default=str)[:3000], flush=True)
     from frankenstein2.server.engine import Frankenstein2Engine, Resources
@@ -437,6 +447,8 @@ def main():  # pragma: no cover - model run
         print("WS", json.dumps(info["ws"], default=str)[:6000], flush=True)
     pocket.close()
     ears.close()
+    if qproc is not None:
+        qproc.close()
     info["total_s"] = round(time.monotonic() - T0, 1)
     save()
     print("DONE", info["total_s"], flush=True)

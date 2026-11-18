@@ -30,7 +30,8 @@ def parse_calls(raw: str) -> list:
         for k, v in PAR.findall(m.group(2)):
             v = v.strip()
             try:
-                args[k] = json.loads(v) if re.fullmatch(r"true|false|null|-?\d+(\.\d+)?|[\[{].*", v, re.S) else v
+                # numerals stay strings (postcodes, ids): the backends and the digit grounding work on strings
+                args[k] = json.loads(v) if re.fullmatch(r"true|false|null|[\[{].*", v, re.S) else v
             except ValueError:
                 args[k] = v
             if isinstance(args[k], (int, float)) and not isinstance(args[k], bool) and re.fullmatch(r"0\d+", v):
@@ -76,7 +77,9 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
                  user_texts=None):
         self.p, self.ss, self.system, self.schemas, self.lang = proc, ss, system, tool_schemas, lang
         self.record: list = []
-        self.tools = wrap_tools(bound, lang, self.record, user_texts=user_texts)
+        self.last_msgs: list = []
+        self.tools = wrap_tools(bound, lang, self.record, user_texts=user_texts or (
+            lambda: [m["content"] for m in self.last_msgs if m.get("role") == "user"]))
         self.max_rounds = max_rounds
         self.jobs: dict = {}
         self.out: list = []
@@ -86,7 +89,15 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
         self.p.send({"op": "gen", "ss": self.ss, "rid": rid, "tools": self.schemas,
                      "messages": [{"role": "system", "content": self.system}] + msgs})
 
+    @staticmethod
+    def call_markup(name: str, args: dict) -> str:
+        """A tool call in the history, in Qwen3.5's own format."""
+        ps = "".join(f"<parameter={k}>\n{v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}\n</parameter>\n"
+                     for k, v in (args or {}).items())
+        return f"<tool_call>\n<function={name}>\n{ps}</function>\n</tool_call>"
+
     def submit(self, rid, messages):
+        self.last_msgs = list(messages)
         self.jobs[rid] = {"msgs": list(messages), "round": 0, "split": SpeechSplitter(), "text": "", "decided": False}
         self._gen(rid, self.jobs[rid]["msgs"])
 

@@ -23,7 +23,15 @@ ROOT = Path(__file__).resolve().parents[2]
 def add_args(ap) -> None:
     ap.add_argument("--lab-scripts", required=True, help="agentbench + multilingual lab scripts (tenant tools)")
     ap.add_argument("--tenant", default="tenant_furniture.json")
-    ap.add_argument("--nano-dir", required=True)
+    ap.add_argument("--nano-dir", default="")
+    ap.add_argument("--llm-backend", default="nano", choices=["nano", "qwen"],
+                    help="nano = Nemotron Nano 9B v2 in this process; qwen = a Qwen3.5 process (own inference engine "
+                         "if --qwen-src points at it, else HF generate)")
+    ap.add_argument("--qwen-python", default="")
+    ap.add_argument("--qwen-src", default="", help="root that contains frankenstein2.llm.qwen_own (own engine)")
+    ap.add_argument("--qwen-model", default="")
+    ap.add_argument("--qwen-mode", default="bf16", help="own engine weights: bf16 | int8 | int4 (MoE: AWQ 4-bit)")
+    ap.add_argument("--qwen-slots", type=int, default=8)
     ap.add_argument("--nano-precision", default="int4-decode", choices=["bf16", "int4-decode"])
     ap.add_argument("--nano-graph", action="store_true", help="decode CUDA graph for the spoken reply (v1 G8)")
     ap.add_argument("--ears-python", required=True)
@@ -33,10 +41,10 @@ def add_args(ap) -> None:
                     help="pocket = one Pocket model per language; swap = pocket_swap (shared base + language packages)")
     ap.add_argument("--swap-root", default=str(ROOT / "pocket_swap"))
     ap.add_argument("--swap-base", default="", help="pocket_swap base checkpoint (english_2026-09_24l)")
-    ap.add_argument("--swap-packages", default="", help="pocket_swap language packages (any precision)")
-    ap.add_argument("--swap-mode", default="ondemand", choices=["ondemand", "materialise"])
-    ap.add_argument("--swap-preset", default="gb10", help="pocket_swap planner preset (slots, host tiers)")
-    ap.add_argument("--swap-slots", type=int, default=0)
+    ap.add_argument("--swap-packages", default="", help="pocket_swap language packages (any precision; w8 recommended)")
+    ap.add_argument("--swap-mode", default="ondemand", choices=["ondemand", "materialise"],
+                    help="ondemand = mode (b): compressed language terms applied on the fly (default)")
+    ap.add_argument("--swap-preset", default="l40s-16g", help="pocket_swap preset: l40s-16g | gb10 | l4-24g")
     ap.add_argument("--pocket-python", default="")
     ap.add_argument("--pocket-hf-home", default="")
     ap.add_argument("--talker-device", default="cuda")
@@ -79,11 +87,10 @@ def start_pocket(a, log_dir: Path):  # pragma: no cover - process
     from frankenstein2.tts.procs import PocketProc
     extra = {"HF_HOME": a.pocket_hf_home} if a.pocket_hf_home else {}
     thr = ["--threads", str(a.threads)] if a.threads else []
-    if a.talker == "swap":
-        argv = [a.pocket_python, str(ROOT / "frankenstein2" / "tts" / "swap_server.py"), "--swap-root", a.swap_root,
-                "--base", a.swap_base, "--packages", a.swap_packages, "--mode", a.swap_mode, "--preset",
-                a.swap_preset, "--device", a.talker_device, *(["--slots", str(a.swap_slots)] if a.swap_slots else []),
-                *thr]
+    if a.talker == "swap":                       # pocket_swap's own talker process (same JSON-lines protocol)
+        argv = [a.pocket_python, "-m", "pocket_swap.talker_server", "--base", a.swap_base, "--packages",
+                a.swap_packages, "--mode", a.swap_mode, "--preset", a.swap_preset, "--device", a.talker_device]
+        extra = dict(extra, PYTHONPATH=a.swap_root)
     else:
         argv = [a.pocket_python, str(ROOT / "frankenstein2" / "tts" / "pocket_server.py"), "--device",
                 a.talker_device, "--max-langs", str(a.pocket_max_langs), *thr]
@@ -91,6 +98,51 @@ def start_pocket(a, log_dir: Path):  # pragma: no cover - process
     p.start()
     p.wait_ready(600)
     return p
+
+
+def start_qwen(a, log_dir: Path):  # pragma: no cover - process
+    """The Qwen LLM process: our own inference engine (frankenstein2.llm.qwen_own.server under --qwen-src) or the HF
+    generate stand-in (llm/qwen_server.py); both speak the same JSON lines."""
+    from frankenstein2.tts.procs import PocketProc               # generic JSON-lines process, replies routed by "ss"
+    if a.qwen_src:
+        argv = [a.qwen_python, "-m", "frankenstein2.llm.qwen_own.server", "--model", a.qwen_model, "--mode",
+                a.qwen_mode, "--slots", str(a.qwen_slots)]
+        env = child_env(a, {"PYTHONPATH": a.qwen_src})
+    else:
+        argv = [a.qwen_python, str(ROOT / "frankenstein2" / "llm" / "qwen_server.py"), "--model", a.qwen_model]
+        env = child_env(a)
+    p = PocketProc(argv, env, str(log_dir / "qwen_server.log"))
+    p.start()
+    p.wait_ready(900)
+    return p
+
+
+def qwen_factory(a, proc, spec):  # pragma: no cover - process
+    sys.path.insert(0, str(ROOT / "frankenstein"))
+    from tenant_backend import TenantBackend
+    from mynah_v2.agent.tools import ToolLedger, ToolRegistry
+    from e1.tools_bench import POLICY as P1, tool_schemas
+    from frankenstein_s2s.lang import session_language, with_language
+    from frankenstein2.llm.nano import BRIEF, POLICY, TOOL_RULE
+    from frankenstein2.llm.qwen import QwenLLM
+    policy = {**P1, **POLICY}
+
+    def make(sid, lang, system_prompt=None):
+        L = session_language(lang)
+        said: list = []
+        backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
+        backend._said = said
+        reg = ToolRegistry()
+        for t in spec["tools"]:
+            reg.register(t["name"], backend.handlers()[t["name"]], t["description"], t["parameters"])
+        bound = reg.bind(ToolLedger(sid, None), lambda: 0, lambda: None, timeout_s=None)
+        rule = ("\n" + TOOL_RULE.get(lang, TOOL_RULE["en"])) if a.tool_rule else ""
+        system = (with_language(system_prompt or spec["system_prompt"], L) + "\n" + policy.get(lang, policy["en"])
+                  + "\n" + BRIEF.get(lang, BRIEF["en"]) + rule)
+        llm = QwenLLM(proc, sid, system, tool_schemas(reg), bound, lang)
+        llm.backend = backend
+        return llm
+    return make
 
 
 def tenant(a):

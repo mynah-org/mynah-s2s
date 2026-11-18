@@ -39,10 +39,13 @@ class Conversation:
         del self.messages[i:]
         self.log.append({"drop_user_turn": turn})
 
-    def tool(self, name: str, args: dict, result: str) -> None:
-        call = {"name": name, "arguments": args}
-        self.messages.append({"role": "assistant",
-                              "content": "<TOOLCALL>[" + json.dumps(call, ensure_ascii=False) + "]</TOOLCALL>"})
+    def tool(self, name: str, args: dict, result: str, markup=None) -> None:
+        """``markup(name, args)``: the LLM's own call format (default: Nemotron's <TOOLCALL>[...])."""
+        if markup is not None:
+            content = markup(name, args)
+        else:
+            content = "<TOOLCALL>[" + json.dumps({"name": name, "arguments": args}, ensure_ascii=False) + "]</TOOLCALL>"
+        self.messages.append({"role": "assistant", "content": content})
         self.messages.append({"role": "tool", "content": result})
 
     def agent(self, text: str, cut: bool = False) -> None:
