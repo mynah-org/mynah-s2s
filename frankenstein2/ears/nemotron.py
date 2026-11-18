@@ -67,6 +67,7 @@ class NemotronASR:
     def __init__(self, bundle: str, device="cuda", prefix="nemotron.", dtype=torch.float32):
         from safetensors import safe_open
         self.dev = torch.device(device)
+        self.dtype = dtype
         folder = Path(bundle)
         cfg = json.loads((folder / "nemotron" / "config.json").read_text())
         ec = cfg["encoder_config"]
@@ -198,14 +199,14 @@ class NemotronASR:
     def encode(self, mel: torch.Tensor, lookahead: int, stop_after: int | None = None) -> torch.Tensor:
         """Whole clips (B, T, 128) -> hidden (B, T', 1024) after block ``stop_after`` (1-based; None = all 24), with
         the chunked-limited attention of ``lookahead``."""
-        x = self._subsample(mel)
+        x = self._subsample(mel.to(self.dtype))
         T = x.shape[1]
         chunk = lookahead + 1
         lc = self.left // chunk
         i = torch.arange(T, device=self.dev)
         d = (i[:, None] // chunk) - (i[None, :] // chunk)
         mask = ((d >= 0) & (d <= lc))[None].expand(x.shape[0], -1, -1)
-        pos = self._pos(T)
+        pos = self._pos(T).to(self.dtype)
         for n, l in enumerate(self.L[:stop_after or self.n_layers]):
             x = x + 0.5 * self._ff(l, self._ln(x, l["norm_feed_forward1.weight"], l["norm_feed_forward1.bias"]), 1)
             a, _, _ = self._attn(l, self._ln(x, l["norm_self_att.weight"], l["norm_self_att.bias"]), mask, pos)
@@ -214,7 +215,7 @@ class NemotronASR:
             x = x + c
             x = x + 0.5 * self._ff(l, self._ln(x, l["norm_feed_forward2.weight"], l["norm_feed_forward2.bias"]), 2)
             x = self._ln(x, l["norm_out.weight"], l["norm_out.bias"])
-        return x
+        return x.float()
 
     # ------------------------------------------------------------------ streaming
     def new_pool(self, slots: int, lookahead: int = 3) -> dict:

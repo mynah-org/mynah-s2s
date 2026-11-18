@@ -14,9 +14,12 @@ Formats in memory:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
-E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+ROWS_KERNEL = os.environ.get("QWEN_OWN_ROWS_KERNEL", "1") != "0"     # multi-row int8/fp8 decode GEMV (2..16 rows)
+E2M1 =(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 try:                                                    # pragma: no cover - needs a GPU
     import triton
@@ -93,6 +96,29 @@ try:                                                    # pragma: no cover - nee
             acc += tl.sum(tl.where(m2, q.to(tl.float32), 0.0) * xv[None, :], axis=1)
         sc = tl.load(s_ptr + rows, mask=rmask, other=0.0).to(tl.float32)
         tl.store(y_ptr + p * N + rows, (acc * sc).to(tl.bfloat16), mask=rmask)
+
+    @triton.jit
+    def _int8_gemv_rows(x_ptr, q_ptr, s_ptr, y_ptr, P, K, N, sxp, sqn, BLOCK_P: tl.constexpr, BLOCK_N: tl.constexpr,
+                        BLOCK_K: tl.constexpr):
+        # Several rows per program: each weight tile is read once for all P rows (the one-row kernel reads it P times,
+        # so batched decode cost grew linearly with the batch).
+        nb = tl.program_id(0)
+        prow = tl.arange(0, BLOCK_P)
+        pmask = prow < P
+        cols = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+        cmask = cols < N
+        acc = tl.zeros((BLOCK_P, BLOCK_N), dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            ks = k0 + tl.arange(0, BLOCK_K)
+            kmask = ks < K
+            xv = tl.load(x_ptr + prow[:, None] * sxp + ks[None, :], mask=pmask[:, None] & kmask[None, :], other=0.0)
+            m2 = kmask[:, None] & cmask[None, :]
+            q = tl.load(q_ptr + cols[None, :] * sqn + ks[:, None], mask=m2)       # [BLOCK_K, BLOCK_N]
+            w = tl.where(m2, q.to(tl.float32), 0.0).to(tl.bfloat16)
+            acc += tl.dot(xv.to(tl.bfloat16), w)
+        sc = tl.load(s_ptr + cols, mask=cmask, other=0.0).to(tl.float32)
+        tl.store(y_ptr + prow[:, None] * N + cols[None, :], (acc * sc[None, :]).to(tl.bfloat16),
+                 mask=pmask[:, None] & cmask[None, :])
 
     @triton.jit
     def _awq_moe_gemm(x_ptr, qw_ptr, qz_ptr, sc_ptr, be_ptr, y_ptr, K, N, G,
@@ -211,9 +237,68 @@ try:                                                    # pragma: no cover - nee
         tl.store(y_ptr + rows[:, None] * sym + cols[None, :], (acc * sc[None, :]).to(tl.bfloat16),
                  mask=rmask[:, None] & cmask[None, :])
 
+    @triton.jit
+    def _decode_attn(q_ptr, k_ptr, v_ptr, slot_ptr, len_ptr, o_ptr, scale,
+                     sqb, sqh, sks, skh, skl, svs, svh, svl, sob, soh,
+                     GROUP: tl.constexpr, GP: tl.constexpr, D: tl.constexpr, BLOCK_L: tl.constexpr):
+        # One decode token per row: the row's query heads of one KV head attend over the first `len` positions of its
+        # slot's cache, read in place (no gather of the cache into a batch tensor). Online softmax in fp32.
+        b = tl.program_id(0)
+        kh = tl.program_id(1)
+        s = tl.load(slot_ptr + b).to(tl.int64)
+        n = tl.load(len_ptr + b)
+        g = tl.arange(0, GP)
+        gmask = g < GROUP
+        d = tl.arange(0, D)
+        q = tl.load(q_ptr + b * sqb + (kh * GROUP + g)[:, None] * sqh + d[None, :], mask=gmask[:, None], other=0.0)
+        m_i = tl.full((GP,), float("-inf"), tl.float32)
+        l_i = tl.zeros((GP,), tl.float32)
+        acc = tl.zeros((GP, D), tl.float32)
+        kb = k_ptr + s * sks + kh * skh
+        vb = v_ptr + s * svs + kh * svh
+        for start in range(0, n, BLOCK_L):
+            ls = start + tl.arange(0, BLOCK_L)
+            lmask = ls < n
+            k = tl.load(kb + ls[:, None] * skl + d[None, :], mask=lmask[:, None], other=0.0)
+            sc = tl.dot(q, tl.trans(k)) * scale
+            sc = tl.where(lmask[None, :], sc, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(sc, 1))
+            p = tl.exp(sc - m_new[:, None])
+            alpha = tl.exp(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            v = tl.load(vb + ls[:, None] * svl + d[None, :], mask=lmask[:, None], other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            m_i = m_new
+        out = acc / l_i[:, None]
+        tl.store(o_ptr + b * sob + (kh * GROUP + g)[:, None] * soh + d[None, :], out.to(tl.bfloat16),
+                 mask=gmask[:, None])
+
     HAVE_TRITON = True
 except Exception:                                       # pragma: no cover
     HAVE_TRITON = False
+
+DECODE_ATTN = os.environ.get("QWEN_OWN_DECODE_ATTN", "1") != "0"
+
+
+def decode_attention(q, K, V, slots, lens):
+    """q [B, H, D] bf16 (one token per row); K, V [S, KVH, Lmax, D] caches; slots [B] long; lens [B] valid lengths
+    -> [B, H, D]. Triton reads each row's slot in place; the torch path gathers the cache (reference)."""
+    B, H, D = q.shape
+    KVH = K.shape[1]
+    if HAVE_TRITON and q.is_cuda and DECODE_ATTN:
+        q = q.contiguous()
+        o = torch.empty_like(q)
+        grp = H // KVH
+        _decode_attn[(B, KVH)](q, K, V, slots, lens.to(torch.int32), o, D ** -0.5,
+                               q.stride(0), q.stride(1), K.stride(0), K.stride(1), K.stride(2),
+                               V.stride(0), V.stride(1), V.stride(2), o.stride(0), o.stride(1),
+                               GROUP=grp, GP=max(16, triton.next_power_of_2(grp)), D=D, BLOCK_L=32)
+        return o
+    L = int(lens.max())
+    kk, vv = K[slots, :, :L], V[slots, :, :L]
+    m = torch.arange(L, device=q.device)[None, :] < lens[:, None]
+    return torch.nn.functional.scaled_dot_product_attention(q[:, :, None], kk, vv, attn_mask=m[:, None, None],
+                                                            enable_gqa=True)[:, :, 0]
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -269,6 +354,10 @@ def int8_gemv(x, q, s, use_triton=True):
     if _use(x, use_triton):
         x = x.contiguous()
         y = torch.empty(P, N, dtype=torch.bfloat16, device=x.device)
+        if P >= 2 and ROWS_KERNEL:
+            _int8_gemv_rows[(triton.cdiv(N, 64),)](x, q, s.reshape(-1), y, P, K, N, x.stride(0), q.stride(0),
+                                                   BLOCK_P=16, BLOCK_N=64, BLOCK_K=128)
+            return y
         _int8_gemv[(P, triton.cdiv(N, 32))](x, q, s.reshape(-1), y, K, N, x.stride(0), q.stride(0), BLOCK_N=32,
                                              BLOCK_K=512)                    # tuned on GB10 (masked tail for any K)
         return y

@@ -284,6 +284,7 @@ class InProcLLM:
         self.cancelled: set = set()
         self.lock = threading.Lock()
         self.turn = 0
+        self.prefix_keys: set = set()
 
     def send(self, m):
         op = m.get("op")
@@ -313,6 +314,14 @@ class InProcLLM:
             if ss not in self.slots:
                 self.slots[ss] = self.eng.open()
             ids = self.eng.chat_ids(m["messages"], m.get("tools"))
+            msgs = m["messages"]
+            if msgs and msgs[0].get("role") == "system" and hasattr(self.eng, "add_prefix"):
+                key = (msgs[0].get("content"), repr(m.get("tools")))
+                if key not in self.prefix_keys:           # once per distinct system prompt + tools
+                    self.prefix_keys.add(key)
+                    pre = self.eng.shared_prefix(msgs[0], m.get("tools"))
+                    if pre and ids[:len(pre)] == pre:
+                        self.eng.add_prefix(pre)      # later sessions copy this state instead of prefilling it
             for k in [k for k in self.active if k[0] == ss]:            # one generation per session slot
                 self.box.put(ss, {"ev": "end", "ss": ss, "rid": k[1], "n": 0, "cancelled": True})
                 del self.active[k]

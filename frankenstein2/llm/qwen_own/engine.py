@@ -37,7 +37,7 @@ from .weights import load_weights
 
 
 class QwenOwn:
-    GRAPH_B = (1, 2, 4, 8, 16)
+    GRAPH_B = (1, 2, 4, 8, 12, 16)
     GRAPH_L = (512, 1024, 2048, 4096, 8192, 16384, 32768)
 
     def __init__(self, path, device="cuda", mode="bf16", slots=4, max_len=8192, group=128, graphs=True, mtp=False,
@@ -69,6 +69,8 @@ class QwenOwn:
         self.use_mtp = mtp
         self.mtp_stats = {"steps": 0, "accepted": 0}
         self.sess: dict = {}
+        self.prefixes: list = []
+        self.prefix_hits = 0
         self.mode = mode
         im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
         self.eos_ids = sorted({*self.cfg.eos_ids, *([im_end] if isinstance(im_end, int) else [])})
@@ -103,6 +105,59 @@ class QwenOwn:
             t[s].copy_(sn["rec"][i])
         return sn["n"]
 
+    # ---- shared prompt prefix (system prompt + tools), computed once and copied into each new session ----
+    @_on_stream
+    def add_prefix(self, ids: list) -> None:
+        """Prefill `ids` once (in the scratch slot) and keep the resulting state: the linear-attention states and the
+        attention K/V of its positions. A later prompt that starts with `ids` copies this state instead of prefilling
+        those tokens again (sessions of one tenant share their system prompt and tool schemas)."""
+        ids = list(ids)
+        if not ids or any(p["ids"] == ids for p in self.prefixes):
+            return
+        s, n = self.scratch, len(ids)
+        self._zero(s)
+        for a in range(0, n, self.prefill_chunk):
+            b = min(n, a + self.prefill_chunk)
+            self.model.forward(torch.tensor([ids[a:b]], device=self.device), self.state,
+                               torch.tensor([s], device=self.device), torch.arange(a, b, device=self.device)[None],
+                               torch.tensor([b], device=self.device), prefill=True)
+        st = self.state
+        self.prefixes.append({"ids": ids, "n": n,
+                              "conv": {i: t[s].clone() for i, t in st["conv"].items()},
+                              "rec": {i: t[s].clone() for i, t in st["rec"].items()},
+                              "k": {i: t[s, :, :n].clone() for i, t in st["k"].items()},
+                              "v": {i: t[s, :, :n].clone() for i, t in st["v"].items()}})
+
+    def shared_prefix(self, system: dict, tools=None) -> list:
+        """Token ids that every prompt with this system message and tools starts with: the common part of two renders
+        that differ only in the user message (the template needs a user turn, so the system block alone can't be
+        rendered)."""
+        a = self.chat_ids([system, {"role": "user", "content": "a"}], tools)
+        b = self.chat_ids([system, {"role": "user", "content": "zz"}], tools)
+        n = 0
+        while n < min(len(a), len(b)) and a[n] == b[n]:
+            n += 1
+        return list(a[:n])
+
+    def _from_prefix(self, s, ids) -> int:
+        best = None
+        for p in self.prefixes:
+            if p["n"] < len(ids) and ids[:p["n"]] == p["ids"] and (best is None or p["n"] > best["n"]):
+                best = p
+        if best is None:
+            return 0
+        st, n = self.state, best["n"]
+        for i, t in st["conv"].items():
+            t[s].copy_(best["conv"][i])
+        for i, t in st["rec"].items():
+            t[s].copy_(best["rec"][i])
+        for i, t in st["k"].items():
+            t[s, :, :n].copy_(best["k"][i])
+        for i, t in st["v"].items():
+            t[s, :, :n].copy_(best["v"][i])
+        self.prefix_hits += 1
+        return n
+
     # ---- prompts ----
     def chat_ids(self, messages, tools=None, thinking=False) -> list:
         return self.tok.apply_chat_template(messages, tools=tools or None, add_generation_prompt=True, tokenize=True,
@@ -129,6 +184,8 @@ class QwenOwn:
             start = self._restore(s)
         else:
             self._zero(s)
+            if not (self.model.mtp is not None and self.use_mtp):         # MTP K/V of the prefix is not kept
+                start = self._from_prefix(s, ids)
         se["pending"], se["cursor"], se["hid_prev"] = list(ids), start, None
         return len(ids) - start
 

@@ -13,7 +13,8 @@ import torch
 import torch.nn.functional as F
 
 from .config import QwenCfg
-from .kernels import awq_expert_gemv, chunk_scan, delta_step_inplace, moe_align, moe_gemm, nvfp4_dequant, nvfp4_expert_gemv, BM as MOE_BM
+from . import kernels as _kern
+from .kernels import decode_attention, awq_expert_gemv, chunk_scan, delta_step_inplace, moe_align, moe_gemm, nvfp4_dequant, nvfp4_expert_gemv, BM as MOE_BM
 from .quant import QLinear, awq_dequant, nvfp4_quantize
 
 
@@ -279,6 +280,10 @@ class Model:
             for t in range(T):
                 K[slots, :, pos[:, t]] = k[:, :, t]
                 V[slots, :, pos[:, t]] = v[:, :, t]
+            if T == 1 and self.use_kernels and _kern.HAVE_TRITON and _kern.DECODE_ATTN:    # in-place cache read (no gather)
+                o = decode_attention(q[:, :, 0], K, V, slots, lens)[:, :, None]
+                o = o.transpose(1, 2).reshape(B, T, -1)
+                return d["o"](o * torch.sigmoid(gate))
             L = kv_len or K.shape[2]                                             # a static bucket >= every length
             kk, vv = K[slots, :, :L], V[slots, :, :L]
             m = torch.arange(L, device=x.device)[None, None, :] <= pos[:, :, None]          # [B, T, L]

@@ -136,7 +136,7 @@ class OwnEars:
             groups.setdefault(len(r), []).append((r, o))
         for n, grp in groups.items():
             x = torch.from_numpy(np.stack([r for r, _ in grp])).to(self.dev)
-            h = self.asr.encode(self.asr.mel(x, center=True), lookahead=0, stop_after=15)[:, -4:]
+            h = self._encode_window(x)
             for j, (_, (i, ch)) in enumerate(grp):
                 if ch == 0:
                     out_u[i] = h[j]
@@ -145,6 +145,21 @@ class OwnEars:
                     if not S[i].win[1].any():
                         self._zero_l15[n] = h[j].clone()
         return out_u, out_a
+
+    # TF32 for the 8 s window encode (the largest ears cost): GRU outputs within 0.003 of fp32 and identical events on
+    # IT/EN/FR with silent and speaking agent channels (lab/ears_featpath_check.py --precisions). The GRU itself and
+    # the streaming ASR stay fp32 with TF32 off, as the bundle requires. window_tf32=False restores plain fp32.
+    window_tf32 = True
+
+    def _encode_window(self, x):
+        tf = self.window_tf32 and self.dev.type == "cuda"
+        torch.backends.cuda.matmul.allow_tf32 = tf
+        torch.backends.cudnn.allow_tf32 = tf
+        try:
+            return self.asr.encode(self.asr.mel(x, center=True), lookahead=0, stop_after=15)[:, -4:]
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
 
     def _gru(self, S, hu, ha, users):
         m = self.gru
