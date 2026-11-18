@@ -193,6 +193,13 @@ class EarsSession:
         self.user = np.zeros(0, np.float32)   # user samples not yet consumed by the energy frames (stream mode)
         self.e_frames = 0
 
+    def begin(self, mode: str, reset: bool) -> None:
+        if reset:
+            self.rules.reset()
+            self.gru.reset()
+        if self.rules.switch_mode(mode):
+            self.gru.reset()
+
     def _gru_frames(self, l15u, l15a, energies, frames, events):
         T = len(energies)
         for j in range(T):
@@ -208,20 +215,20 @@ class EarsSession:
         if self.dev != "cpu":
             torch.cuda.synchronize()
 
-    def hop(self, user: np.ndarray, agent: np.ndarray, mode: str, reset: bool = False, l15=None) -> dict:
+    def hop(self, user: np.ndarray, agent: np.ndarray, mode: str, reset: bool = False, l15=None,
+            gru_done: tuple | None = None) -> dict:
         """One 320 ms hop of both channels. Returns frames (head outputs + rules view), events, ASR pieces.
         ``l15``: the window features already computed for this hop by a batched encode (hop_batch)."""
         t0 = time.monotonic()
-        if reset:
-            self.rules.reset()
-            self.gru.reset()
-        if self.rules.switch_mode(mode):
-            self.gru.reset()
+        if gru_done is None:
+            self.begin(mode, reset)
         user = user.astype(np.float32)
         self.pair.push(user, agent)
         frames, events, pieces = [], [], []
         t_enc = t_win = 0.0
-        if self.window is not None:
+        if gru_done is not None:                 # hop_batch ran the GRU frames of all sessions together
+            frames, events = gru_done
+        elif self.window is not None:
             tw = time.monotonic()
             hu, ha = l15 if l15 is not None else self.window.hop(user, agent.astype(np.float32))
             self._sync()
@@ -255,27 +262,67 @@ class EarsSession:
                 "frames_total": self.frames_in}
 
 
+@torch.no_grad()
+def gru_batch_frames(sessions: list, hus: list, has: list, dbs: list) -> list:
+    """The GRU frames of several sessions as one batch per frame (each session keeps its own state row and rules).
+    -> [(frames, events)] per session."""
+    m = sessions[0].gru.m
+    dev = sessions[0].dev
+    L, H = m.core.num_layers, m.core.hidden_size
+    out = [([], []) for _ in sessions]
+    T = len(dbs[0])
+    hu = torch.stack([x[:T] for x in hus]).float()           # (B, T, 1024)
+    ha = torch.stack([x[:T] for x in has]).float()
+    for j in range(T):
+        h = torch.cat([s.gru.h if s.gru.h is not None else torch.zeros(L, 1, H, device=dev) for s in sessions], 1)
+        act = torch.tensor([[max(-3.0, min(3.0, (d[j] + 50.0) / 25.0))] for d in dbs], dtype=torch.float32,
+                           device=dev)
+        prev = torch.tensor([[s.rules.gru_prev_state()] for s in sessions], dtype=torch.long, device=dev)
+        o, h2 = m(hu[:, j:j + 1], ha[:, j:j + 1], act, prev, h)
+        rows = o[:, 0].tolist()
+        for i, s in enumerate(sessions):
+            s.gru.h = h2[:, i:i + 1].contiguous()
+            evs, rst = s.rules.on_frame(rows[i], dbs[i][j], left=T - 1 - j)
+            for e in evs:
+                (out[i][0] if e["kind"] == "FRAME" else out[i][1]).append(e)
+            if rst:
+                s.gru.reset()
+    for s in sessions:
+        s.gru_frames += T
+    return out
+
+
 def hop_batch(items: list) -> list:
     """items: [(EarsSession, user, agent, mode, reset)] of DIFFERENT sessions -> their hop results. The GRU's window
-    encodes (the dominant cost) run as one batch across sessions; the streaming ASR and the GRU steps stay per session
-    (their caches / states are per session). Each row keeps its own session's language prompt (RNN-T per session)."""
+    encodes (the dominant cost) and the GRU frames run as one batch across sessions; the streaming ASR stays per
+    session (its caches are per session; each keeps its own language prompt)."""
+    t0 = time.monotonic()
+    for s, u, a, m, r in items:
+        s.begin(m, r)
     win = [(s, s.window.push(u.astype(np.float32), a.astype(np.float32))) for s, u, a, m, r in items
            if s.window is not None]
-    t0 = time.monotonic()
     feats = {}
     if win:
         flat = [w for _, ws in win for w in ws]
         enc = win[0][0].window.encode(flat)
-        if win[0][0].dev != "cpu":
-            torch.cuda.synchronize()
         i = 0
         for s, ws in win:
             feats[id(s)] = s.window.take(enc[i:i + len(ws)])
             i += len(ws)
+    gru = {}
+    ws_ = [x for x in items if id(x[0]) in feats]
+    if ws_:
+        dbs = [[energy_db(u[j * FRAME:(j + 1) * FRAME]) for j in range(len(u) // FRAME)] for _, u, *_ in ws_]
+        res = gru_batch_frames([x[0] for x in ws_], [feats[id(x[0])][0] for x in ws_],
+                               [feats[id(x[0])][1] for x in ws_], dbs)
+        for x, r in zip(ws_, res):
+            gru[id(x[0])] = r
+    if items[0][0].dev != "cpu":
+        torch.cuda.synchronize()
     t_win = time.monotonic() - t0
     out = []
     for s, u, a, m, r in items:
-        res = s.hop(u, a, m, r, l15=feats.get(id(s)))
+        res = s.hop(u, a, m, r, gru_done=gru.get(id(s), ([], [])))
         res["win_ms"] = round(t_win * 1e3 / max(1, len(items)), 2)
         res["batch"] = len(items)
         out.append(res)

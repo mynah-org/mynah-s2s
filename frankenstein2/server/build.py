@@ -37,6 +37,7 @@ def add_args(ap) -> None:
     ap.add_argument("--ears-python", required=True)
     ap.add_argument("--ears-bundle", required=True)
     ap.add_argument("--ears-device", default="cuda")
+    ap.add_argument("--ears-procs", type=int, default=1, help="ears processes; sessions are spread across them")
     ap.add_argument("--talker", default="pocket", choices=["pocket", "swap", "flash"],
                     help="pocket = one Pocket model per language; swap = pocket_swap (shared base + language packages)")
     ap.add_argument("--swap-root", default=str(ROOT / "pocket_swap"))
@@ -75,12 +76,17 @@ def child_env(a, extra: dict | None = None) -> dict:
 
 
 def start_ears(a, log_dir: Path):  # pragma: no cover - process
-    from frankenstein2.ears.client import EarsProc
-    p = EarsProc([a.ears_python, str(ROOT / "frankenstein2" / "ears" / "server.py"), "--bundle", a.ears_bundle,
-                  "--device", a.ears_device], child_env(a), str(log_dir / "ears_server.log"))
-    p.start()
-    p.wait_ready(600)
-    return p
+    """One ears process, or a pool of --ears-procs processes (sessions spread across them)."""
+    from frankenstein2.ears.client import EarsPool, EarsProc
+    procs = []
+    for i in range(max(1, a.ears_procs)):
+        p = EarsProc([a.ears_python, str(ROOT / "frankenstein2" / "ears" / "server.py"), "--bundle", a.ears_bundle,
+                      "--device", a.ears_device], child_env(a),
+                     str(log_dir / ("ears_server.log" if i == 0 else f"ears_server_{i}.log")))
+        p.start()
+        p.wait_ready(600)                         # one at a time: never two model loads at once
+        procs.append(p)
+    return procs[0] if len(procs) == 1 else EarsPool(procs)
 
 
 def start_pocket(a, log_dir: Path):  # pragma: no cover - process

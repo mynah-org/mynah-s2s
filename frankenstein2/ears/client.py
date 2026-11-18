@@ -224,3 +224,37 @@ class EarsProc:  # pragma: no cover - process plumbing, exercised on the GPU hos
             except Exception:  # noqa: BLE001
                 self.p.terminate()
         self.log.close()
+
+
+class EarsPool:
+    """Several ears processes behind the EarsProc interface: a session is placed on the process with the fewest
+    sessions when it opens and stays there (its caches and GRU state live in that process). On GPUs where the ears are
+    bound by per-session kernel launches (small batches), processes run those launches in parallel."""
+
+    def __init__(self, procs: list):
+        self.procs = procs
+        self.where: dict = {}
+        self.ready = procs[0].ready if procs else None
+
+    def _proc(self, sid):
+        if sid not in self.where:
+            load = [sum(1 for v in self.where.values() if v == i) for i in range(len(self.procs))]
+            self.where[sid] = load.index(min(load))
+        return self.procs[self.where[sid]]
+
+    def send(self, msg: dict) -> None:
+        sid = msg.get("sid")
+        p = self._proc(sid) if sid is not None else self.procs[0]
+        p.send(msg)
+        if msg.get("op") == "close":
+            self.where.pop(sid, None)
+
+    def poll(self, sid, block: bool = False) -> list:
+        return self._proc(sid).poll(sid, block=block)
+
+    def request(self, msg: dict, ev: str, timeout: float = 60.0) -> dict:
+        return self.procs[0].request(msg, ev, timeout)
+
+    def close(self):
+        for p in self.procs:
+            p.close()

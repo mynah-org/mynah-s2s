@@ -273,7 +273,7 @@ def ws_phases(a, res, out: Path) -> dict:  # pragma: no cover - model run
     from frankenstein2.server.multi import MultiServer
     port, bport, uport = 8791, 8798, 8797
     srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
-                      max_sessions=4)
+                      max_sessions=max(4, a.ws_n))
     ready = threading.Event()
     th = threading.Thread(target=lambda: asyncio.run(srv.serve("127.0.0.1", port, ready=ready.set)), daemon=True)
     th.start()
@@ -294,6 +294,32 @@ def ws_phases(a, res, out: Path) -> dict:  # pragma: no cover - model run
         tracks[lang] = (x, [u for u in fz["timeline"] if u["end_k"] * 0.08 < a.cut_s])
     res_ws = {}
     v = a.session_voice
+    if a.ws_n:                                        # one phase of N concurrent sessions, languages in turn
+        langs = ["it", "en", "fr"]
+        specs = [ClientSpec(f"n{a.ws_n}_{i:02d}_{langs[i % 3]}", via if i == 0 else direct, langs[i % 3],
+                            *tracks[langs[i % 3]], via_bridge=(i == 0), voice=v, start_delay_s=0.7 * i)
+                 for i in range(a.ws_n)]
+        snap = {}
+
+        def sampler():                            # peak memory of every process during the phase
+            while not stop.is_set():
+                try:
+                    with res.talker_proc.open_lock:   # never steal a session's "voice" reply
+                        m = proc_mem(res.ears, res.talker_proc)
+                    for k, d in m.items():
+                        for x, val in d.items():
+                            if isinstance(val, (int, float)):
+                                snap[f"{k}.{x}"] = max(snap.get(f"{k}.{x}", 0), val)
+                except Exception:  # noqa: BLE001
+                    pass
+                stop.wait(5)
+        stop = threading.Event()
+        threading.Thread(target=sampler, daemon=True).start()
+        res_ws[f"n{a.ws_n}"] = run_clients(specs, out / "ws")
+        stop.set()
+        res_ws["peak_mem"] = snap
+        bridge.terminate()
+        return res_ws
     p1 = [ClientSpec("p1_it_bridge", via, "it", *tracks["it"], via_bridge=True, voice=v),
           ClientSpec("p1_en_direct", direct, "en", *tracks["en"], voice=v, start_delay_s=1.5)]
     res_ws["phase1"] = run_clients(p1, out / "ws")
@@ -337,6 +363,7 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--session-voice", default="")
     ap.add_argument("--warm-llm", action="store_true", help="one request through the LLM before the arms")
     ap.add_argument("--ws-phases", action="store_true", help="after the arms: concurrent WebSocket sessions")
+    ap.add_argument("--ws-n", type=int, default=0, help="one phase of N concurrent sessions instead of phases 1-2")
     ap.add_argument("--content", action="store_true")
     ap.add_argument("--budget-s", type=float, default=1e9)
     a = ap.parse_args()
@@ -410,6 +437,7 @@ def main():  # pragma: no cover - model run
     from frankenstein2.server.engine import Frankenstein2Engine, Resources
     res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket), voices=B.voices(a),
                     ears_thr=B.thresholds(a), trace_dir=str(out))
+    res.talker_proc = pocket
     eng = Frankenstein2Engine(res)
     frozen, track = load_track(Path(a.asr_dir), a.cut_s)
     info["arms"] = {}

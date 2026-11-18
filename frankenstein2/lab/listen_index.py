@@ -41,6 +41,22 @@ def main():  # pragma: no cover - file plumbing
                         f"said: {html.escape(c['speech'])}<br>heard (ASR): {html.escape(c['asr'])}</li>")
         rows.append("</ul><h3>History</h3><pre>" + html.escape(json.dumps(s["history"], indent=1,
                                                                             ensure_ascii=False)) + "</pre>")
+    ws = run / "ws"
+    if ws.is_dir():
+        rows.append("<h2>WebSocket sessions (client side: L user, R agent as received)</h2>")
+        for d in sorted(ws.iterdir()):
+            if not (d / "client.json").exists():
+                continue
+            c = json.load(open(d / "client.json"))
+            (ld / "ws" / d.name).mkdir(parents=True, exist_ok=True)
+            shutil.copy(d / "mix_client_22k.wav", ld / "ws" / d.name / "mix_client_22k.wav")
+            fa = ", ".join(f"{u['label']} {u['first_audio_s']}" for u in c["utterances"])
+            rows.append(f"<h3>{d.name} ({c['language']}{', via the web UI bridge' if c['via_bridge'] else ''})</h3>"
+                        f"<audio controls preload=none src='ws/{d.name}/mix_client_22k.wav'></audio>"
+                        f"<p>first agent audio after each utterance (s): {html.escape(fa)}<br>tools: "
+                        f"{html.escape(json.dumps(c['tools'], ensure_ascii=False))}<br>user turns: "
+                        f"{html.escape(' | '.join(t or '' for t in c['turns']))}<br>agent said: "
+                        f"{html.escape(' | '.join(x or '' for x in c['said']))}</p>")
     (ld / "index.html").write_text("<meta charset=utf-8><body style='font-family:sans-serif'>" + "\n".join(rows))
 
 
