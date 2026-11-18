@@ -66,6 +66,22 @@ class QLinear:
         else:
             raise ValueError(mode)
 
+    @classmethod
+    def from_packed_int4(cls, packed: torch.Tensor, scale: torch.Tensor) -> "QLinear":
+        """compressed-tensors "pack-quantized" symmetric int4 (int32 [out, in/8], value + 8 in nibble j of word p
+        = input 8p + j; bf16 scale [out, in/group]) -> our int4 layout with zero point 8, without requantising:
+        the little-endian bytes of the int32 words already are two nibbles per byte, low nibble = even input."""
+        self = cls.__new__(cls)
+        o = packed.shape[0]
+        self.mode = "int4"
+        self.q = packed.contiguous().view(torch.uint8)                         # [out, in/2]
+        ng = scale.shape[1]
+        self.s = scale.to(torch.bfloat16).reshape(o, ng, 1).contiguous()
+        self.z = torch.full_like(self.s, 8.0)
+        self.group = self.q.shape[1] * 2 // ng
+        self.out_features = o
+        return self
+
     def dequant(self) -> torch.Tensor:
         if self.mode == "bf16":
             return self.w
@@ -87,15 +103,23 @@ class QLinear:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         rows = x.numel() // x.shape[-1]
         if self.mode in ("int8", "fp8", "nvfp4") and x.is_cuda and rows <= 16:   # decode: fused GEMV (Triton)
-            from .kernels import int8_gemv, nvfp4_expert_gemv
+            from .kernels import ROWS_KERNEL, int8_gemv, nvfp4_expert_gemv
             shp = x.shape
             x2 = x.reshape(-1, shp[-1])
-            if self.mode == "nvfp4":
+            if self.mode == "nvfp4" and x2.shape[0] >= 2 and ROWS_KERNEL:
+                from .kernels import nvfp4_gemv_rows
+                y = nvfp4_gemv_rows(x2, self.q, self.s, self.s2)
+            elif self.mode == "nvfp4":
                 z = torch.zeros(x2.shape[0], dtype=torch.long, device=x.device)
                 y = nvfp4_expert_gemv(x2, self.q[None], self.s[None], self.s2, z)
             else:
                 y = int8_gemv(x2, self.q, self.s)
             return y.reshape(*shp[:-1], self.out_features)
+        if self.mode == "int4" and x.is_cuda and rows <= 16:               # decode: fused int4 GEMV (Triton)
+            from .kernels import int4_gemv
+            shp = x.shape
+            return int4_gemv(x.reshape(-1, shp[-1]), self.q, self.s, self.z, self.group).reshape(
+                *shp[:-1], self.out_features)
         if self.mode in ("int8", "fp8") and x.is_cuda:                     # prefill: in-tile dequant GEMM (Triton)
             from .kernels import HAVE_TRITON, wq_gemm
             if HAVE_TRITON:

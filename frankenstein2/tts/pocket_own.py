@@ -20,7 +20,10 @@ de-normalised (emb_std, emb_mean) and decoded by Mimi in streaming (quantizer 1x
 from __future__ import annotations
 
 import math
+import os
 import re
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -164,6 +167,18 @@ def end_on_pause(wav: torch.Tensor, pause_sec=0.08, fade_sec=0.02, floor_db=35.0
 
 
 # ---------------------------------------------------------------------------------------------------------- model
+def _pocket_swap():
+    """pocket_swap's fused kernel + quantiser (the repo's pocket_swap/ package; torch + optional Triton only)."""
+    try:
+        from pocket_swap import fused, quant
+    except ImportError:          # the repo root's pocket_swap/ dir shadows the package as a namespace: use the inner one
+        for k in [k for k in sys.modules if k == "pocket_swap" or k.startswith("pocket_swap.")]:
+            del sys.modules[k]
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "pocket_swap"))
+        from pocket_swap import fused, quant
+    return fused, quant
+
+
 def _rope(q, k, offset, max_period=10000.0):
     """q, k (B, T, H, D); offset: int or (B,) tensor of start positions."""
     B, T, H, D = q.shape
@@ -206,11 +221,18 @@ class _KV:
 
 class PocketOwn:
     def __init__(self, weights: str, tokenizer: str, lang: str = "it", device="cuda", W: dict | None = None,
-                 dtype=torch.float32):
+                 dtype=torch.float32, wq: str = "", share_mimi: "PocketOwn | None" = None):
         """dtype: the FlowLM transformer's weights, activations and KV (bf16 halves its memory traffic; the flow net,
-        the EOS head and Mimi stay fp32)."""
+        the EOS head and Mimi stay fp32).
+        wq: weight-only quantisation of the FlowLM transformer linears, pocket_swap's mode (b) format and fused
+        kernel: "w4" (int4, group 128), "w8" (int8), "wfp8" (fp8 e4m3, sm_89+); "" = plain dtype weights. Implies
+        bf16 activations.
+        share_mimi: another language's model whose Mimi (codec + voice encoder, identical in every language)
+        tensors are reused instead of loading a second copy."""
         from safetensors import safe_open
         self.dev = torch.device(device)
+        if wq:
+            dtype = torch.bfloat16
         self.tdtype = dtype
         self.lang = lang
         self.opts = LANG_OPTS.get(lang, {"remove_semicolons": False})
@@ -218,10 +240,24 @@ class PocketOwn:
             W = {}
             with safe_open(str(weights), framework="pt", device=str(self.dev)) as f:
                 for k in f.keys():
-                    W[k] = f.get_tensor(k).float()
+                    if share_mimi is not None and k.startswith("mimi.") and k in share_mimi.W:
+                        W[k] = share_mimi.W[k]
+                    else:
+                        W[k] = f.get_tensor(k).float()
         if dtype != torch.float32:
             W = {k: (v.to(dtype) if k.startswith("flow_lm.transformer.") and v.is_floating_point() else v)
                  for k, v in W.items()}
+        self.Q: dict = {}                     # key -> (precision, codes, scales, in_features): quantised linears
+        self.wq = wq
+        if wq:
+            _, quant = _pocket_swap()
+            prec = {"w4": "int4", "w8": "int8", "wfp8": "fp8"}[wq]
+            for k in [k for k in W if k.startswith("flow_lm.transformer.") and k.endswith("_proj.weight")
+                      or k.startswith("flow_lm.transformer.") and k.endswith(("linear1.weight", "linear2.weight"))]:
+                w = W.pop(k)
+                q, sc = quant.quantize_any(w.float(), prec, 128)
+                self.Q[k] = (prec, q, sc, w.shape[1])
+                del w
         self.W = W
         self.tok = _Tok(tokenizer)
         self.n_layers = sum(1 for k in W if k.startswith("flow_lm.transformer.layers.") and k.endswith("norm1.weight"))
@@ -233,6 +269,25 @@ class PocketOwn:
                                and k.endswith("norm1.weight"))
 
     # ------------------------------------------------------------------ FlowLM
+    def _lin(self, x, key):
+        """F.linear on a plain weight, or on a quantised one: fused dequant GEMV for <= 16 rows (pocket_swap's
+        kernel), a bf16 dequantised weight otherwise (prefills)."""
+        t = self.Q.get(key)
+        if t is None:
+            return F.linear(x, self.W[key])
+        prec, q, sc, cols = t
+        fused, quant = _pocket_swap()
+        x = x.to(torch.bfloat16)
+        if x.numel() // x.shape[-1] <= 16 and fused.available(x, (prec,)):
+            return fused.fused_linear2(x, q.shape[0], (prec, q, sc), None, 128)
+        return F.linear(x, quant.dequant_any(q, sc, prec, cols, torch.bfloat16))
+
+    def nbytes(self) -> dict:
+        own = sum(v.numel() * v.element_size() for k, v in self.W.items() if not k.startswith("mimi."))
+        q = sum(t.numel() * t.element_size() for e in self.Q.values() for t in e[1:3])
+        mimi = sum(v.numel() * v.element_size() for k, v in self.W.items() if k.startswith("mimi."))
+        return {"flow_plain": own, "flow_quant": q, "mimi": mimi}
+
     def _ln(self, x, p, eps=1e-5):
         return F.layer_norm(x, (x.shape[-1],), self.W[p + ".weight"], self.W[p + ".bias"], eps)
 
@@ -241,7 +296,7 @@ class PocketOwn:
         W = self.W
         B, T, d = x.shape
         hd = d // nh
-        proj = F.linear(x, W[p + ".in_proj.weight"])
+        proj = self._lin(x, p + ".in_proj.weight")
         q = proj[..., :d].view(B, T, nh, hd)
         k, v = proj[..., d:].view(B, T, 2, nh, hd).unbind(2)
         off = 0 if kv is None else kv.off
@@ -262,7 +317,7 @@ class PocketOwn:
         if context is not None:
             mask = mask & (delta < context)
         o = F.scaled_dot_product_attention(q.transpose(1, 2), K, V, mask[None, None])
-        return F.linear(o.transpose(1, 2).reshape(B, T, d), W[p + ".out_proj.weight"])
+        return self._lin(o.transpose(1, 2).reshape(B, T, d), p + ".out_proj.weight")
 
     def _flow_transformer(self, x, kv: _KV):
         W = self.W
@@ -271,7 +326,7 @@ class PocketOwn:
             p = f"flow_lm.transformer.layers.{li}"
             x = x + self._attn(self._ln(x, p + ".norm1"), p + ".self_attn", self.nh, kv, li)
             h = self._ln(x, p + ".norm2")
-            x = x + F.linear(F.gelu(F.linear(h, W[p + ".linear1.weight"]), approximate="tanh"), W[p + ".linear2.weight"])
+            x = x + self._lin(F.gelu(self._lin(h, p + ".linear1.weight"), approximate="tanh"), p + ".linear2.weight")
         return x
 
     def _noise(self, B, gen=None):
@@ -523,6 +578,30 @@ class PocketOwn:
 
 # ---------------------------------------------------------------------------------------------------------- batching
 FUSED_ATTN = True       # bf16 batched step: in-place slot attention (qwen_own's Triton decode kernel)
+MIMI_BATCH = os.environ.get("POCKET_MIMI_BATCH", "1") != "0"     # one batched Mimi decode per frame for all rows
+MIMI_RING = 272         # Mimi decoder KV ring per row: context 250 + one frame's 16 new positions (+ margin)
+
+
+class _PoolState:
+    """Streaming conv / convtr state of all rows in pooled tensors [slots, ...]: ``get`` gathers the rows of the
+    current step (``idx``), assignment scatters them back. Same interface as the per-row dict PocketOwn uses."""
+
+    def __init__(self, slots: int):
+        self.slots, self.pool, self.idx = slots, {}, None
+
+    def get(self, key):
+        p = self.pool.get(key)
+        return None if p is None else p.index_select(0, self.idx)
+
+    def __setitem__(self, key, val):
+        p = self.pool.get(key)
+        if p is None:
+            p = self.pool[key] = val.new_zeros(self.slots, *val.shape[1:])
+        p.index_copy_(0, self.idx, val)
+
+    def reset(self, slot: int):
+        for p in self.pool.values():
+            p[slot].zero_()
 
 
 class PocketBatch:
@@ -538,6 +617,10 @@ class PocketBatch:
         self.max_len = max_len
         self.free = list(range(slots))
         self.rows: dict = {}                  # key -> row dict
+        ml, md = model.mimi_layers, 512
+        self.mkv = torch.zeros(ml, 2, slots, MIMI_RING, 8, md // 8, device=model.dev)      # Mimi decoder KV rings
+        self.mpos = torch.full((slots, MIMI_RING), -10 ** 9, dtype=torch.long, device=model.dev)
+        self.mst = _PoolState(slots)
 
     def start(self, key, voice: _KV, text: str, after: int, gen=None):
         """A new row for one prepared text chunk (PocketOwn.chunks gives them with their frames-after-EOS)."""
@@ -548,8 +631,10 @@ class PocketBatch:
         self.kv[:, :, s, :n0] = voice.c[:, :, :n0].to(self.kv.dtype)
         kv = _SlotKV(self, s, n0)
         m._flow_step(kv, text_ids=ids, gen=gen)          # text prefill on this row alone
+        self.mst.reset(s)
+        self.mpos[s] = -10 ** 9
         self.rows[key] = {"slot": s, "kv": kv, "x": torch.full((1, self.m.ldim), float("nan"), device=m.dev),
-                          "st": {}, "fade": True, "eos": None, "step": 0, "after": after, "gen": gen,
+                          "st": {}, "moff": 0, "fade": True, "eos": None, "step": 0, "after": after, "gen": gen,
                           "max_len": m.max_gen_len(len(ids)), "done": False}
         return self.rows[key]
 
@@ -577,7 +662,7 @@ class PocketBatch:
         for li in range(m.n_layers):
             p = f"flow_lm.transformer.layers.{li}"
             h = m._ln(x, p + ".norm1")
-            proj = F.linear(h, W[p + ".self_attn.in_proj.weight"])
+            proj = m._lin(h, p + ".self_attn.in_proj.weight")
             d = m.d
             q = proj[..., :d].view(B, 1, m.nh, d // m.nh)
             k, v = proj[..., d:].view(B, 1, 2, m.nh, d // m.nh).unbind(2)
@@ -593,9 +678,9 @@ class PocketBatch:
                 V = self.kv[li, 1, slots, :Lmax].transpose(1, 2)
                 mask = (torch.arange(Lmax, device=m.dev)[None] <= offs[:, None])[:, None, None, :]
                 o = F.scaled_dot_product_attention(q.transpose(1, 2), K, V, mask).transpose(1, 2)
-            x = x + F.linear(o.reshape(B, 1, d), W[p + ".self_attn.out_proj.weight"])
+            x = x + m._lin(o.reshape(B, 1, d), p + ".self_attn.out_proj.weight")
             h = m._ln(x, p + ".norm2")
-            x = x + F.linear(F.gelu(F.linear(h, W[p + ".linear1.weight"]), approximate="tanh"), W[p + ".linear2.weight"])
+            x = x + m._lin(F.gelu(m._lin(h, p + ".linear1.weight"), approximate="tanh"), p + ".linear2.weight")
         for r in rows:
             r["kv"].off += 1
         y = m._ln(x.float(), "flow_lm.out_norm")[:, -1]
@@ -618,14 +703,68 @@ class PocketBatch:
             r["step"] += 1
             r["x"] = lat[i:i + 1]
             dec.append((k, r, lat[i:i + 1]))
-        for k, r, l_ in dec:                       # Mimi per row (its streaming state); batched decode: next step
-            audio = m.mimi_decode((l_ * std + mean)[:, None], r["st"])[0, 0]
+        if MIMI_BATCH and dec:
+            lat_d = torch.cat([l_ for _, _, l_ in dec], 0) * std + mean
+            idx = torch.tensor([r["slot"] for _, r, _ in dec], device=m.dev)
+            moff = torch.tensor([r["moff"] for _, r, _ in dec], device=m.dev)
+            wav, n = self._mimi_decode(lat_d[:, None], idx, moff)
+            audios = [wav[i, 0] for i in range(len(dec))]
+            for _, r, _ in dec:
+                r["moff"] += n
+        else:                                      # Mimi per row (its own streaming state)
+            audios = [m.mimi_decode((l_ * std + mean)[:, None], r["st"])[0, 0] for _, r, l_ in dec]
+        for (k, r, l_), audio in zip(dec, audios):
             if r["fade"]:
                 n = min(SR // 200, audio.shape[-1])
                 audio[:n] *= torch.linspace(0, 1, SR // 200, device=m.dev)[:n]
                 r["fade"] = False
             out[k] = audio
         return out
+
+
+    def _mimi_decode(self, latent, idx, moff):
+        """Batched PocketOwn.mimi_decode: latent (B, 1, 32) de-normalised, rows' slots ``idx`` and Mimi positions
+        ``moff`` -> (audio (B, 1, 1920), new positions per row)."""
+        m, W = self.m, self.m.W
+        st = self.mst
+        st.idx = idx
+        x = F.conv1d(latent.transpose(1, 2), W["mimi.quantizer.output_proj.weight"])
+        x = m._convtr(x, "mimi.upsample.convtr.convtr", st, stride=16, groups=x.shape[1], bias=False)
+        n = x.shape[-1]
+        x = self._mimi_transformer(x, idx, moff)
+        return m._seanet_decoder(x, st), n
+
+    def _mimi_transformer(self, x, idx, moff):
+        """PocketOwn._mimi_transformer for B rows at different positions: keys in per-row rings, context 250."""
+        m, W = self.m, self.m.W
+        p = "mimi.decoder_transformer"
+        x = x.transpose(1, 2)
+        B, T, d = x.shape
+        nh, hd = 8, d // 8
+        pos_q = moff[:, None] + torch.arange(T, device=x.device)                      # (B, T)
+        ring = pos_q % MIMI_RING
+        self.mpos[idx[:, None], ring] = pos_q
+        pk = self.mpos[idx]                                                           # (B, R)
+        delta = pos_q[:, :, None] - pk[:, None, :]
+        mask = ((delta >= 0) & (delta < 250))[:, None]                               # (B, 1, T, R)
+        for li in range(m.mimi_layers):
+            q_ = f"{p}.transformer.layers.{li}"
+            h = m._ln(x, q_ + ".norm1")
+            proj = F.linear(h, W[q_ + ".self_attn.in_proj.weight"])
+            q = proj[..., :d].view(B, T, nh, hd)
+            k, v = proj[..., d:].view(B, T, 2, nh, hd).unbind(2)
+            q, k = _rope(q, k, moff)
+            self.mkv[li, 0, idx[:, None], ring] = k
+            self.mkv[li, 1, idx[:, None], ring] = v
+            K = self.mkv[li, 0, idx].transpose(1, 2)                                   # (B, H, R, D)
+            V = self.mkv[li, 1, idx].transpose(1, 2)
+            o = F.scaled_dot_product_attention(q.transpose(1, 2), K, V, mask)
+            a = F.linear(o.transpose(1, 2).reshape(B, T, d), W[q_ + ".self_attn.out_proj.weight"])
+            x = x + W[q_ + ".layer_scale_1.scale"] * a
+            h = m._ln(x, q_ + ".norm2")
+            u = F.linear(F.gelu(F.linear(h, W[q_ + ".linear1.weight"]), approximate="tanh"), W[q_ + ".linear2.weight"])
+            x = x + W[q_ + ".layer_scale_2.scale"] * u
+        return x.transpose(1, 2)
 
 
 class _SlotKV(_KV):

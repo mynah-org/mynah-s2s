@@ -9,6 +9,8 @@ dims, rotate-half), output gate sigmoid on attention, softmax router in fp32 wit
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -141,8 +143,9 @@ class Model:
         L = lambda n: make_linear(W, n, mode, group)                     # noqa: E731
         self.embed = W.pop("embed_tokens.weight").to(torch.bfloat16)
         self.norm = W.pop("norm.weight")
-        self.lm_head = QLinear(self.embed, mode="bf16") if cfg.tie_embeddings or "lm_head.weight" not in W \
-            else make_linear(W, "lm_head.weight", "bf16", group)
+        lm = os.environ.get("QWEN_OWN_LMHEAD", "bf16")                     # bf16 | int8 (per-row, own copy)
+        self.lm_head = QLinear(self.embed, mode=lm) if cfg.tie_embeddings or "lm_head.weight" not in W \
+            else make_linear(W, "lm_head.weight", lm, group)
         self.layers = [self._build_layer(W, f"layers.{i}.", kind, L, awq_group, group)
                        for i, kind in enumerate(cfg.layer_types)]
         self.mtp = None
@@ -425,6 +428,9 @@ def make_linear(W, name, mode, group):
     """The linear stored under `name` (".weight") in its checkpoint format: NVFP4 (with .weight_scale/.weight_scale_2),
     FP8 e4m3 (with a per-tensor .weight_scale), else bf16 weights quantised to `mode` (bf16 / int8 / int4)."""
     base = name[:-len(".weight")]
+    if base + ".weight_packed" in W:                       # compressed-tensors int4 (e.g. a 4B AWQ/GPTQ export)
+        W.pop(base + ".weight_shape", None)
+        return QLinear.from_packed_int4(W.pop(base + ".weight_packed"), W.pop(base + ".weight_scale"))
     w = W.pop(name)
     W.pop(base + ".input_scale", None)                     # static activation scale: unused (weight-only paths)
     if base + ".weight_scale_2" in W:

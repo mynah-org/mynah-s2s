@@ -654,7 +654,12 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
         tk = sorted(Path(a.pocket_tokenizers).glob(f"*/languages/{LANGS[lang]}/tokenizer.json")) or \
             sorted(Path(a.pocket_tokenizers).glob(f"languages/{LANGS[lang]}/tokenizer.json"))
         dt = {"bf16": torch.bfloat16, "fp32": torch.float32}[getattr(a, "pocket_dtype", "bf16")]
-        return PocketOwn(w, tk[0], lang=lang, device=getattr(a, "talker_device", "cuda"), dtype=dt)
+        wq = getattr(a, "pocket_wq", "w4")
+        m = PocketOwn(w, tk[0], lang=lang, device=getattr(a, "talker_device", "cuda"), dtype=dt,
+                      wq="" if wq in ("", "none") else wq, share_mimi=pocket_first.get("m"))
+        pocket_first.setdefault("m", m)                  # Mimi (codec + voice encoder) loaded once for all languages
+        return m
+    pocket_first: dict = {}
     vs = dict(x.split("=", 1) for x in getattr(a, "voice", []) or [])
     talker = InProcTalker(sched, make_pocket, slots=slots, default_voice=next(iter(vs.values()), ""))
     sched.talker = talker

@@ -3,6 +3,7 @@
 
   awq_expert_gemv / nvfp4_expert_gemv   decode: y[p] = x[p] @ W[eidx[p]]^T for a few rows (dense layers: E = 1)
   int8_gemv                              decode: int8 or fp8 weights with a per-output-channel scale
+  int4_gemv                              decode: dense int4 (group-wise scale + zero), several rows per program
   moe_align + moe_gemm                   prefill: (token, expert) pairs sorted by expert, each expert's rows padded to
                                          a multiple of BM, one program per (row block, column block); the block knows
                                          its expert. Formats: AWQ (AutoAWQ GEMM layout) and NVFP4 (ModelOpt W4A16:
@@ -118,6 +119,63 @@ try:                                                    # pragma: no cover - nee
             acc += tl.dot(xv.to(tl.bfloat16), w)
         sc = tl.load(s_ptr + cols, mask=cmask, other=0.0).to(tl.float32)
         tl.store(y_ptr + prow[:, None] * N + cols[None, :], (acc * sc[None, :]).to(tl.bfloat16),
+                 mask=pmask[:, None] & cmask[None, :])
+
+    @triton.jit
+    def _int4_gemv_rows(x_ptr, q_ptr, s_ptr, z_ptr, y_ptr, P, K, N, G, sxp, sqn, sgn,
+                        BLOCK_P: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr):
+        # Dense int4 (w = (q - z) * s, group G along K, two nibbles per byte, low nibble = even input), several rows
+        # per program: each packed byte is loaded once and split into the even / odd halves of the K tile, two dots.
+        nb = tl.program_id(0)
+        prow = tl.arange(0, BLOCK_P)
+        pmask = prow < P
+        cols = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+        cmask = cols < N
+        acc = tl.zeros((BLOCK_P, BLOCK_N), dtype=tl.float32)
+        KH = K // 2
+        for h0 in range(0, KH, BLOCK_H):
+            kh = h0 + tl.arange(0, BLOCK_H)                                   # byte index along K
+            hmask = kh < KH
+            m2 = hmask[:, None] & cmask[None, :]
+            b = tl.load(q_ptr + cols[None, :] * sqn + kh[:, None], mask=m2, other=0).to(tl.int32)   # [H, N]
+            gi = (2 * kh) // G
+            sc = tl.load(s_ptr + cols[None, :] * sgn + gi[:, None], mask=m2, other=0.0).to(tl.float32)
+            zp = tl.load(z_ptr + cols[None, :] * sgn + gi[:, None], mask=m2, other=0.0).to(tl.float32)
+            wlo = (((b & 0xF).to(tl.float32) - zp) * sc).to(tl.bfloat16)
+            whi = ((((b >> 4) & 0xF).to(tl.float32) - zp) * sc).to(tl.bfloat16)
+            xm = pmask[:, None] & hmask[None, :]
+            xe = tl.load(x_ptr + prow[:, None] * sxp + 2 * kh[None, :], mask=xm, other=0.0).to(tl.bfloat16)
+            xo = tl.load(x_ptr + prow[:, None] * sxp + 2 * kh[None, :] + 1, mask=xm, other=0.0).to(tl.bfloat16)
+            acc += tl.dot(xe, wlo)
+            acc += tl.dot(xo, whi)
+        tl.store(y_ptr + prow[:, None] * N + cols[None, :], acc.to(tl.bfloat16), mask=pmask[:, None] & cmask[None, :])
+
+    @triton.jit
+    def _nvfp4_gemv_rows(x_ptr, q_ptr, s_ptr, s2_ptr, y_ptr, P, K, N, sxp, sqn, ssn,
+                         BLOCK_P: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_H: tl.constexpr):
+        # Dense NVFP4 (one weight matrix), several rows per program: the weight tile is decoded once for all rows.
+        nb = tl.program_id(0)
+        prow = tl.arange(0, BLOCK_P)
+        pmask = prow < P
+        cols = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+        cmask = cols < N
+        acc = tl.zeros((BLOCK_P, BLOCK_N), dtype=tl.float32)
+        KH = K // 2
+        for h0 in range(0, KH, BLOCK_H):
+            kh = h0 + tl.arange(0, BLOCK_H)
+            hmask = kh < KH
+            m2 = hmask[:, None] & cmask[None, :]
+            b = tl.load(q_ptr + cols[None, :] * sqn + kh[:, None], mask=m2, other=0).to(tl.int32)
+            sc = tl.load(s_ptr + cols[None, :] * ssn + (kh // 8)[:, None], mask=m2, other=0.0).to(tl.float32)
+            wlo = (_e2m1(b & 0xF) * sc).to(tl.bfloat16)
+            whi = (_e2m1((b >> 4) & 0xF) * sc).to(tl.bfloat16)
+            xm = pmask[:, None] & hmask[None, :]
+            xe = tl.load(x_ptr + prow[:, None] * sxp + 2 * kh[None, :], mask=xm, other=0.0).to(tl.bfloat16)
+            xo = tl.load(x_ptr + prow[:, None] * sxp + 2 * kh[None, :] + 1, mask=xm, other=0.0).to(tl.bfloat16)
+            acc += tl.dot(xe, wlo)
+            acc += tl.dot(xo, whi)
+        s2 = tl.load(s2_ptr)
+        tl.store(y_ptr + prow[:, None] * N + cols[None, :], (acc * s2).to(tl.bfloat16),
                  mask=pmask[:, None] & cmask[None, :])
 
     @triton.jit
@@ -362,6 +420,34 @@ def int8_gemv(x, q, s, use_triton=True):
                                              BLOCK_K=512)                    # tuned on GB10 (masked tail for any K)
         return y
     return torch.nn.functional.linear(x, (q.float() * s.reshape(-1, 1).float()).to(torch.bfloat16))
+
+
+def int4_gemv(x, q, s, z, group, use_triton=True):
+    """Dense int4 decode: x [P<=16, K] bf16, q uint8 [N, K/2], s / z bf16 [N, K/group(, 1)] -> [P, N] bf16."""
+    P, K = x.shape
+    N = q.shape[0]
+    s2, z2 = s.reshape(N, -1), z.reshape(N, -1)
+    if _use(x, use_triton) and group % 2 == 0 and P <= 16:
+        x = x.contiguous()
+        y = torch.empty(P, N, dtype=torch.bfloat16, device=x.device)
+        _int4_gemv_rows[(triton.cdiv(N, 64),)](x, q, s2, z2, y, P, K, N, group, x.stride(0), q.stride(0),
+                                               s2.stride(0), BLOCK_P=16, BLOCK_N=64, BLOCK_H=64)
+        return y
+    lo, hi = q & 0xF, q >> 4
+    w = torch.stack((lo, hi), -1).reshape(N, -1)
+    w = ((w.reshape(N, K // group, group).to(torch.bfloat16) - z2[..., None]) * s2[..., None]).reshape(N, K)
+    return torch.nn.functional.linear(x, w)
+
+
+def nvfp4_gemv_rows(x, q, s, s2):
+    """Dense NVFP4 decode for 2..16 rows: x [P, K] bf16, q uint8 [N, K/2], s e4m3 [N, K/16], s2 fp32 [1]."""
+    P, K = x.shape
+    N = q.shape[0]
+    x = x.contiguous()
+    y = torch.empty(P, N, dtype=torch.bfloat16, device=x.device)
+    _nvfp4_gemv_rows[(triton.cdiv(N, 64),)](x, q, s, s2, y, P, K, N, x.stride(0), q.stride(0), s.stride(0),
+                                            BLOCK_P=16, BLOCK_N=64, BLOCK_H=64)
+    return y
 
 
 # ---------------------------------------------------------------------------------------------------------------

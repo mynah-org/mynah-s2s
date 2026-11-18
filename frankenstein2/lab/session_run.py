@@ -371,6 +371,9 @@ def main():  # pragma: no cover - model run
                          "measured: the encode is compute-bound and row-bucket padding costs at some batch sizes)")
     ap.add_argument("--pocket-dtype", default="bf16", choices=["bf16", "fp32"],
                     help="one-process runtime: FlowLM transformer precision of our Pocket")
+    ap.add_argument("--pocket-wq", default="w4", choices=["w4", "w8", "wfp8", "none"],
+                    help="one-process runtime: weight-only quantised FlowLM linears (pocket_swap mode b format + fused "
+                         "kernel); none = --pocket-dtype weights")
     ap.add_argument("--llm-thread", default="on", choices=["on", "off"],
                     help="one-process runtime: the LLM on its own thread and CUDA stream (on) or on the scheduler thread")
     ap.add_argument("--ws-reactive", action="store_true", help="N-session phase: each client waits for the agent")
