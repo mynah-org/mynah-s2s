@@ -32,6 +32,88 @@ from mynah_v2.agent.tools import CallStatus, ToolCall, ToolLedger
 from mynah_v2.tracing import events as E
 
 
+# Rehydration is application context, not the authoritative tool-result store. Keep the
+# latter lossless, but prevent a verbose/custom tool payload from expanding every new
+# model context indefinitely. Critical keys are emitted first by _compact_prompt_value.
+DEFAULT_FACT_SUMMARY_CHARS = 8000
+DEFAULT_RESULT_SUMMARY_CHARS = 1200
+_CRITICAL_RESULT_KEYS = (
+    "found", "status", "order_id", "claim_id", "policy_id", "customer_id", "tracking_code",
+    "delivery_date", "effective_date", "eta", "amount", "currency", "next_step", "message", "reason",
+    "error",
+)
+_CRITICAL_RESULT_ORDER = {key: index for index, key in enumerate(_CRITICAL_RESULT_KEYS)}
+
+
+def _compact_prompt_value(value, max_chars: int, depth: int = 0):
+    """Return a bounded, JSON-safe view for rehydration prompts.
+
+    This is deliberately used only for prompt text. ``FactsMemory`` and the WebUI
+    continue to receive the original result. Structured values keep their critical
+    fields before less important fields, and indicate omitted data explicitly.
+    """
+    if max_chars < 32:
+        return "..."
+    if isinstance(value, str):
+        if len(value) <= max_chars:
+            return value
+        return value[:max_chars - 1].rstrip() + "…"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= 4:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
+    if isinstance(value, dict):
+        keys = list(value)
+        keys.sort(key=lambda k: (_CRITICAL_RESULT_ORDER.get(k, len(_CRITICAL_RESULT_ORDER)), str(k)))
+        out = {}
+        omitted = 0
+        for key in keys:
+            key_text = str(key)
+            remaining = max_chars - len(json.dumps(out, ensure_ascii=False, sort_keys=True, separators=(",", ":"))) \
+                - len(key_text) - 6
+            if remaining < 16:
+                omitted += 1
+                continue
+            compact = _compact_prompt_value(value[key], remaining, depth + 1)
+            candidate = dict(out)
+            candidate[key] = compact
+            encoded_len = len(json.dumps(candidate, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+            if encoded_len > max_chars:
+                omitted += 1
+                continue
+            out[key] = compact
+        if omitted:
+            marked = dict(out)
+            marked["_omitted"] = omitted
+            if len(json.dumps(marked, ensure_ascii=False, sort_keys=True, separators=(",", ":"))) <= max_chars:
+                out = marked
+        return out
+    if isinstance(value, list):
+        out = []
+        omitted = 0
+        for item in value:
+            compact = _compact_prompt_value(item, max_chars, depth + 1)
+            candidate = out + [compact]
+            if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))) > max_chars:
+                omitted += 1
+                continue
+            out.append(compact)
+        if omitted:
+            marker = f"… {omitted} item(s) omitted"
+            if len(json.dumps(out + [marker], ensure_ascii=False, separators=(",", ":"))) <= max_chars:
+                out.append(marker)
+        return out
+    return str(value)
+
+
+def compact_result_for_prompt(result, max_chars: int = DEFAULT_RESULT_SUMMARY_CHARS) -> str:
+    """Serialize a bounded result for a rehydration prompt without changing the stored result."""
+    compact = _compact_prompt_value(result, max_chars)
+    text = json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return text if len(text) <= max_chars else json.dumps(str(text[:max_chars - 1]) + "…", ensure_ascii=False)
+
+
 @dataclass
 class Fact:
     call_id: str
@@ -97,7 +179,9 @@ def unknown_tool_error(call_text: str) -> str:
 class Controller:
     def __init__(self, base_prompt: str | None, memory: FactsMemory | None = None, max_context_s: float = 100.0,
                  history_chars: int = 600, prompt_fn=None, ledger: ToolLedger | None = None,
-                 tracer: E.Tracer | None = None, tools: dict | None = None, call_timeout_s: float = 8.0):
+                 tracer: E.Tracer | None = None, tools: dict | None = None, call_timeout_s: float = 8.0,
+                 fact_summary_chars: int = DEFAULT_FACT_SUMMARY_CHARS,
+                 result_summary_chars: int = DEFAULT_RESULT_SUMMARY_CHARS):
         """prompt_fn(extra_text) -> full system prompt; default appends extra_text to base_prompt. Use it to put
         the summary inside the system message of the NVIDIA FC template rather than after the tool list."""
         self.ledger = ledger
@@ -115,6 +199,8 @@ class Controller:
         self.memory = memory or FactsMemory()
         self.max_context_s = max_context_s
         self.history_chars = history_chars
+        self.fact_summary_chars = max(256, fact_summary_chars)
+        self.result_summary_chars = max(128, result_summary_chars)
         self.history: list[Utterance] = []
         # full duplex: user ASR and agent text deltas arrive interleaved; aggregate them per turn (user text is closed
         # when the agent opens a turn "<s>", agent text when it closes it "</s>")
@@ -235,14 +321,23 @@ class Controller:
                 out[i] = h(c.arguments)
             except Exception as e:  # noqa: BLE001
                 out[i] = json.dumps({"error": str(e)})
+        started = time.monotonic()
         ts = [threading.Thread(target=run, args=(i, c), daemon=True) for i, c in enumerate(calls)]
         for t in ts:
             t.start()
+        # One deadline for the whole call list. Joining each thread with the full
+        # timeout makes N parallel calls consume N*timeout before the model gets a
+        # response, even when the calls are independent.
+        deadline = started + self.call_timeout_s
+        timed_out = []
         for t in ts:
-            t.join(self.call_timeout_s)
-        res = [r if r is not None else error_payload("timeout", TIMEOUT_MESSAGE) for r in out]
+            t.join(max(0.0, deadline - time.monotonic()))
+            timed_out.append(t.is_alive())
+        res = [error_payload("timeout", TIMEOUT_MESSAGE) if timed_out[i] or out[i] is None else out[i]
+               for i in range(len(out))]
         if self.tracer:
-            self.tracer.emit(E.TOOL_MULTI_CALL, n=len(calls), names=[c.name for c in calls])
+            self.tracer.emit(E.TOOL_MULTI_CALL, n=len(calls), names=[c.name for c in calls],
+                             timed_out=sum(timed_out), elapsed_ms=round((time.monotonic() - started) * 1000, 2))
         return ", ".join(res)
 
     def on_session_closing(self, kind: str) -> list[ToolCall]:
@@ -258,8 +353,20 @@ class Controller:
         facts = self.memory.latest_by_key()
         if facts:
             lines.append("Verified tool results so far (use these, do not call the tool again for them):")
-            for f in facts:
-                lines.append(f"- {f.tool}({json.dumps(f.args, sort_keys=True)}) returned {json.dumps(f.result)}")
+            fact_lines = []
+            used = 0
+            omitted = 0
+            for f in reversed(facts):
+                line = (f"- {f.tool}({json.dumps(f.args, sort_keys=True)}) returned "
+                        f"{compact_result_for_prompt(f.result, self.result_summary_chars)}")
+                if fact_lines and used + len(line) > self.fact_summary_chars:
+                    omitted += 1
+                    continue
+                fact_lines.append(line)
+                used += len(line)
+            lines.extend(reversed(fact_lines))
+            if omitted:
+                lines.append(f"- {omitted} older verified result(s) omitted from this prompt; do not infer them.")
         hist = []
         n = 0
         for u in reversed(self.turns()):
