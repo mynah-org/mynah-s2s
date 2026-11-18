@@ -381,6 +381,24 @@ def test_multi_call_slot_times_out_without_blocking_the_others():
     gate.set()
 
 
+def test_multi_call_watchdog_uses_one_deadline_for_parallel_slots():
+    import time as _t
+    led = ToolLedger("s")
+    reg = ToolRegistry()
+    gate = threading.Event()
+    reg.register("stuck_a", lambda a: (gate.wait(5), "{}")[1], "d", {})
+    reg.register("stuck_b", lambda a: (gate.wait(5), "{}")[1], "d", {})
+    ctl = Controller(None, ledger=led, tools=reg.bind(led, lambda: 1, lambda: None, timeout_s=5.0),
+                     call_timeout_s=0.1)
+    t0 = _t.monotonic()
+    items = json.loads("[" + ctl.execute_calls('[{"name":"stuck_a","arguments":{}},'
+                                                  '{"name":"stuck_b","arguments":{}}]') + "]")
+    elapsed = _t.monotonic() - t0
+    assert [item["error"] for item in items] == ["timeout", "timeout"]
+    assert elapsed < 0.25
+    gate.set()
+
+
 def test_session_wires_multi_call_policy_only_in_enhanced_with_tools():
     from mynah_v2.runtime.session import EnhancedOptions
     eng = FakeEngine()

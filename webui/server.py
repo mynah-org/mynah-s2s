@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import mimetypes
+import os
 import socket
 import socketserver
 import struct
@@ -21,7 +22,7 @@ import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 SCENARIOS = {
     "ikea-orders": {
@@ -35,6 +36,10 @@ SCENARIOS = {
         "tool": {"name": "get_order_status", "label": "Look up order", "args": {"order_id": "ABC123"}, "result": {"order_id": "ABC123", "status": "out for delivery", "eta": "tomorrow, 6 PM", "tracking": "MYN-4402"}},
         "answer": "I found order ABC123: it is out for delivery and should arrive tomorrow by 6 PM. The tracking code is MYN-4402.",
         "example_user": "Where is my order ABC123?",
+        "samples": [
+            {"id": "t02", "label": "Ryan · order ABC456", "path": "corpus_v1/t02.wav", "text": "Can you look up order A B C four five six for me?", "duration_s": 30.2},
+            {"id": "t01", "label": "Vivian · order XYZ123", "path": "corpus_v1/t01.wav", "text": "Hi, I'd like to know where my order is. The order number is X Y Z one two three.", "duration_s": 30.2},
+        ],
     },
     "insurance": {
         "id": "insurance",
@@ -78,11 +83,42 @@ class StaticHandler(SimpleHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 - stdlib handler API
         path = urlparse(self.path).path
         if path == "/api/scenarios":
-            self._json({"scenarios": list(SCENARIOS.values())})
+            scenarios = []
+            for scenario in SCENARIOS.values():
+                item = dict(scenario)
+                item["samples"] = [dict(sample, available=self._sample_path(sample) is not None)
+                                    for sample in scenario.get("samples", [])]
+                scenarios.append(item)
+            self._json({"scenarios": scenarios})
             return
         if path == "/api/config":
             configured = bool(self.server.v2_ws)
-            self._json({"gpu_configured": configured, "v2_reachable": probe_v2(self.server.v2_ws) if configured else False, "ws_path": "/ws", "ws_port": self.server.ws_port})
+            self._json({
+                "gpu_configured": configured,
+                "v2_reachable": probe_v2(self.server.v2_ws) if configured else False,
+                "profile": self.server.profile,
+                "profile_label": profile_label(self.server.profile),
+                "audio_samples": bool(self.server.audio_root and self.server.audio_root.is_dir()),
+                "ws_path": "/ws",
+                "ws_port": self.server.ws_port,
+            })
+            return
+        if path.startswith("/api/samples/"):
+            parts = path.split("/")
+            if len(parts) == 5:
+                scenario = SCENARIOS.get(parts[3])
+                sample = next((s for s in (scenario or {}).get("samples", []) if s["id"] == parts[4]), None)
+                sample_path = self._sample_path(sample) if sample else None
+                if sample_path:
+                    body = sample_path.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            self.send_error(404, "sample unavailable")
             return
         if path == "/" or path == "":
             self.path = "/index.html"
@@ -97,29 +133,66 @@ class StaticHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _sample_path(self, sample: dict | None) -> Path | None:
+        if not sample or not self.server.audio_root:
+            return None
+        root = self.server.audio_root.resolve()
+        candidate = (root / sample["path"]).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return None
+        return candidate if candidate.is_file() else None
+
     def log_message(self, fmt, *args):
         if self.path.startswith("/api"):
             super().log_message(fmt, *args)
 
 
 class WebUIHTTPServer(ThreadingHTTPServer):
-    def __init__(self, address, handler, *, v2_ws: str | None):
+    def __init__(self, address, handler, *, v2_ws: str | None, profile: str, audio_root: Path | None):
         self.v2_ws = v2_ws
+        self.profile = profile
+        self.audio_root = audio_root
         super().__init__(address, handler)
 
 
+def profile_label(profile: str) -> str:
+    return {"int4": "INT4", "q8": "Q8", "bf16": "BF16", "demo": "LOCAL"}.get(profile, profile.upper())
+
+
 def probe_v2(v2_ws: str | None) -> bool:
-    """Check the V2 TCP listener without creating a model session."""
+    """Check the V2 WebSocket protocol without creating a model session.
+
+    The TCP fallback is intentionally kept for minimal/demo environments, but a
+    real WebSocket probe is preferred so a listening-but-broken port is not shown
+    as a live GPU backend.
+    """
     if not v2_ws:
         return False
     target = urlparse(v2_ws)
     if target.hostname is None or target.port is None:
         return False
     try:
-        with socket.create_connection((target.hostname, target.port), timeout=0.4):
-            return True
-    except OSError:
-        return False
+        import websockets
+
+        query = dict(parse_qsl(target.query, keep_blank_values=True))
+        query["probe"] = "1"
+        probe_url = urlunparse(target._replace(query=urlencode(query)))
+
+        async def check():
+            async with websockets.connect(probe_url, open_timeout=0.4, close_timeout=0.4, max_size=1 << 20) as ws:
+                message = await asyncio.wait_for(ws.recv(), timeout=0.6)
+                payload = json.loads(message)
+                return payload.get("type") == "server.ready" and not payload.get("unhealthy")
+
+        return bool(asyncio.run(check()))
+    except Exception:  # noqa: BLE001 - health checks must fail closed and never break /api/config
+        try:
+            with socket.create_connection((target.hostname, target.port), timeout=0.4):
+                return True
+        except OSError:
+            return False
 
 
 async def emit(ws, ev: str, **fields):
@@ -251,35 +324,71 @@ class FallbackWebSocketServer(socketserver.ThreadingMixIn, socketserver.TCPServe
     daemon_threads = True
 
 
-async def proxy_session(browser, first: str | bytes, v2_ws: str):
+async def proxy_session(browser, first: str | bytes, v2_ws: str, profile: str):
     """Relay JSON and binary frames to the real V2 transport, preserving frame order."""
     import websockets
 
     async with websockets.connect(v2_ws, max_size=2**24) as upstream:
         await upstream.send(first)
+        browser_ended = False
+        upstream_ended = False
 
         async def browser_to_gpu():
+            nonlocal browser_ended
             async for message in browser:
                 await upstream.send(message)
                 if isinstance(message, str) and json.loads(message).get("type") in {"session.end", "session.cancel"}:
+                    browser_ended = True
                     return
 
         async def gpu_to_browser():
-            async for message in upstream:
-                await browser.send(message)
-                if isinstance(message, str) and json.loads(message).get("type") == "session.closed":
-                    return
+            nonlocal upstream_ended
+            try:
+                async for message in upstream:
+                    if isinstance(message, str):
+                        try:
+                            payload = json.loads(message)
+                        except json.JSONDecodeError:
+                            payload = None
+                        if isinstance(payload, dict) and payload.get("type") == "session.created":
+                            actual_profile = payload.setdefault("backend_profile", profile)
+                            payload["backend_profile_label"] = profile_label(actual_profile)
+                            message = json_line(payload)
+                    await browser.send(message)
+                    if isinstance(message, str) and json.loads(message).get("type") == "session.closed":
+                        return
+            finally:
+                upstream_ended = True
 
         tasks = [asyncio.create_task(browser_to_gpu()), asyncio.create_task(gpu_to_browser())]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        for task in done:
-            if task.exception():
-                raise task.exception()
+        browser_task, gpu_task = tasks
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if browser_task in done and not upstream_ended:
+                # A normal end/cancel must still receive V2's session.closed;
+                # an unexpected browser disconnect gets a short cleanup window.
+                if not browser_ended:
+                    try:
+                        await upstream.send(json_line({"type": "session.cancel"}))
+                    except Exception:  # noqa: BLE001 - upstream may already be closed
+                        pass
+                try:
+                    await asyncio.wait_for(gpu_task, timeout=90.0 if browser_ended else 5.0)
+                except asyncio.TimeoutError:
+                    gpu_task.cancel()
+                    await asyncio.gather(gpu_task, return_exceptions=True)
+            else:
+                for task in done:
+                    if task.exception():
+                        raise task.exception()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def websocket_handler(ws, v2_ws: str | None):
+async def websocket_handler(ws, v2_ws: str | None, profile: str):
     try:
         first = await asyncio.wait_for(ws.recv(), timeout=30)
         if isinstance(first, bytes):
@@ -289,7 +398,7 @@ async def websocket_handler(ws, v2_ws: str | None):
         scenario = SCENARIOS.get(request.get("scenario", "ikea-orders"), SCENARIOS["ikea-orders"])
         transport = request.get("transport", "demo")
         if transport == "gpu" and v2_ws:
-            await proxy_session(ws, first, v2_ws)
+            await proxy_session(ws, first, v2_ws, profile=profile)
             return
         if transport == "gpu" and not v2_ws:
             await ws.send(json_line({"type": "error", "error": "GPU bridge is not configured: start with --v2-ws"}))
@@ -311,7 +420,7 @@ async def websocket_handler(ws, v2_ws: str | None):
             pass
 
 
-async def websocket_server(host: str, port: int, v2_ws: str | None):
+async def websocket_server(host: str, port: int, v2_ws: str | None, profile: str):
     try:
         import websockets
     except ImportError:
@@ -319,7 +428,7 @@ async def websocket_server(host: str, port: int, v2_ws: str | None):
         print(f"WebSocket bridge: ws://{host}:{port}/ws (stdlib demo fallback)", flush=True)
         await asyncio.get_running_loop().run_in_executor(None, fallback.serve_forever)
         return
-    async with websockets.serve(lambda ws: websocket_handler(ws, v2_ws), host, port, max_size=2**24):
+    async with websockets.serve(lambda ws: websocket_handler(ws, v2_ws, profile), host, port, max_size=2**24):
         print(f"WebSocket bridge: ws://{host}:{port}/ws", flush=True)
         await asyncio.Future()
 
@@ -331,10 +440,17 @@ def main():
     parser.add_argument("--port", type=int, default=8787, help="static UI port")
     parser.add_argument("--ws-port", type=int, default=8788, help="browser WebSocket port")
     parser.add_argument("--v2-ws", default=None, help="GPU server URL, e.g. ws://127.0.0.1:8765/v1/session")
+    parser.add_argument("--profile", choices=["int4", "q8", "bf16", "demo"], default=None,
+                        help="runtime profile label shown in the UI; it must match the V2 server flags")
+    parser.add_argument("--audio-root", default=os.environ.get("MYNAH_AUDIO_ROOT", str(Path.home() / "mynah-s2s" / "data" / "agent")),
+                        help="directory containing corpus_v1/ WAVs for guided real-audio input")
     args = parser.parse_args()
+    args.profile = args.profile or ("int4" if args.v2_ws else "demo")
     root = Path(__file__).parent
 
-    httpd = WebUIHTTPServer((args.host, args.port), lambda *a, **kw: StaticHandler(*a, directory=str(root), **kw), v2_ws=args.v2_ws)
+    audio_root = Path(args.audio_root).expanduser() if args.audio_root else None
+    httpd = WebUIHTTPServer((args.host, args.port), lambda *a, **kw: StaticHandler(*a, directory=str(root), **kw),
+                            v2_ws=args.v2_ws, profile=args.profile, audio_root=audio_root)
     httpd.ws_port = args.ws_port                 # reported by /api/config: the page connects to it (any UI port)
     http_thread = threading.Thread(target=httpd.serve_forever, name="webui-http", daemon=True)
     http_thread.start()
@@ -343,7 +459,7 @@ def main():
     if args.host in {"0.0.0.0", "::"}:
         print(f"Web UI LAN:   http://{browser_host}:{args.port}  (WebSocket :{args.ws_port})", flush=True)
     try:
-        asyncio.run(websocket_server(args.host, args.ws_port, args.v2_ws))
+        asyncio.run(websocket_server(args.host, args.ws_port, args.v2_ws, args.profile))
     except KeyboardInterrupt:
         pass
     finally:

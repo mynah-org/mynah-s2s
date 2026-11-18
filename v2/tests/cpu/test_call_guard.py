@@ -429,7 +429,7 @@ def test_compact_responses_same_decisions_shorter_text():
     for (rule, f), (_, c) in zip(*rules):
         if rule:
             assert len(c) < 70 and len(c) < len(f) / 2 and json.loads(c)["next_step"]
-    assert json.loads(rules[1][1][1]) == {"status": "already_done", "next_step": "Tell the caller."}
+    assert json.loads(rules[1][1][1]) == {"status": "repeat", "next_step": "Use the earlier result."}
     assert set(COMPACT) >= {"repeat", "in_flight", "busy", "side_effect_done", "side_effect_unknown", "ungrounded",
                             "budget", "closed"}
     try:

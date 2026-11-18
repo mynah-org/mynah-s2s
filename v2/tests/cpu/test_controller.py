@@ -7,7 +7,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from test_session import CS, FakeEngine  # noqa: E402
 
-from mynah_v2.agent.controller import Controller, FactsMemory  # noqa: E402
+from mynah_v2.agent.controller import Controller, FactsMemory, compact_result_for_prompt  # noqa: E402
 from mynah_v2.agent.tools import ToolLedger  # noqa: E402
 from mynah_v2.runtime.session import EnhancedOptions, Mode, Session  # noqa: E402
 from mynah_v2.tracing.events import Tracer  # noqa: E402
@@ -53,6 +53,26 @@ def test_summary_and_prompt_fn():
     p = ctl.rehydration_prompt()
     assert p.startswith("[This conversation is continuing.") and ctl.rehydrations == 1
     assert Controller("BASE").rehydration_prompt() == "BASE"
+
+
+def test_rehydration_compacts_only_prompt_view_and_keeps_critical_fields():
+    result = {"found": False, "order_id": "ABC456", "status": "not_found",
+              "message": "x" * 400, "debug_trace": "y" * 400}
+    compact = compact_result_for_prompt(result, max_chars=150)
+    body = json.loads(compact)
+    assert body["found"] is False and body["order_id"] == "ABC456" and body["status"] == "not_found"
+    assert len(compact) <= 150
+
+    mem = FactsMemory()
+    led = ToolLedger("s")
+    ctl = Controller("BASE", memory=mem, fact_summary_chars=400, result_summary_chars=150)
+    led.on_close.append(ctl.on_tool_call_closed)
+    call = led.open("lookup", {"id": "ABC456"}, 1)
+    led.complete(call.call_id, json.dumps(result))
+    assert mem.all()[0].result == result                         # authoritative store is lossless
+    summary = ctl.summary()
+    assert '"found":false' in summary and '"order_id":"ABC456"' in summary
+    assert len(summary) < 500
 
 
 def test_session_rehydrates_once_threshold_reached_and_reference_ignores_controller():

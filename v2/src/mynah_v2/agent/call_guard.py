@@ -1,4 +1,4 @@
-"""Per-session call registry + admission control (EXPERIMENT, CPU prototype; not wired, nothing uses it by default).
+"""Per-session call registry + admission control for the application tool path.
 
 Why: on the official checkpoint the FC resume contract only chooses which error the model makes. (PAD, PAD) loses
 legitimate chained calls (EN m07: verified ``find_customer`` -> ``prepare_return``); (PAD, EOTR) keeps them but
@@ -285,7 +285,10 @@ class AsrShadow:
 # the full repeat refusal is 86 tokens (87 steps, 14.1 s), these are ~30. The earlier result is NOT restated: the model
 # already read it in its own context. Admission rules are identical in both styles.
 COMPACT = {
-    "repeat": {"status": "already_done", "next_step": "Tell the caller."},
+    # Do not use ``already_done`` here: for a read-only lookup it can be decoded as
+    # the business result (for example, an order being completed). The refusal must
+    # describe the application decision, not the earlier tool outcome.
+    "repeat": {"status": "repeat", "next_step": "Use the earlier result."},
     "in_flight": {"status": "in_progress", "next_step": "Tell the caller you are still checking."},
     "busy": {"status": "busy", "next_step": "Wait for the current request."},
     "side_effect_done": {"status": "already_done", "next_step": "Tell the caller it is done."},
