@@ -5,6 +5,6 @@ swapper). Opt-in: nothing else in the repository imports this package.
 """
 
 from .core import Binding, SwapCore  # noqa: F401
-from .lru import AllSlotsBusy, CacheFull, RefLRU, SlotPool  # noqa: F401
+from .lru import AdmissionRefused, AllSlotsBusy, CacheFull, RefLRU, SlotPool  # noqa: F401
 
-__all__ = ["Binding", "SwapCore", "AllSlotsBusy", "CacheFull", "RefLRU", "SlotPool"]
+__all__ = ["Binding", "SwapCore", "AdmissionRefused", "AllSlotsBusy", "CacheFull", "RefLRU", "SlotPool"]

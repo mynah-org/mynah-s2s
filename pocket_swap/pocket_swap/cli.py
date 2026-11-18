@@ -15,7 +15,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .package import Source, build_package, verify_package, write_repo_card
+from .package import PRECISIONS, Source, build_package, verify_package, write_repo_card
 
 
 def _source(path: str, ident: str | None) -> Source:
@@ -38,7 +38,7 @@ def main(argv=None) -> int:
     b.add_argument("--lang", required=True)
     b.add_argument("--tokenizer", required=True)
     b.add_argument("--config", help="upstream language yaml (preprocessing, defaults)")
-    b.add_argument("--precision", default="int8", choices=["exact", "bf16", "int8", "int4"])
+    b.add_argument("--precision", default="int8", choices=list(PRECISIONS))
     b.add_argument("--group", type=int, default=128, help="quantisation group along input dim (0 = per row)")
     b.add_argument("--zstd", type=int, default=None, metavar="LEVEL", help="zstd-compress tensor files")
     b.add_argument("--out", required=True)

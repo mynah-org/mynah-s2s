@@ -63,3 +63,48 @@ def dequantize(codes: torch.Tensor, scales: torch.Tensor, bits: int, cols: int,
 def packed_nbytes(rows: int, cols: int, bits: int, group: int = 128) -> int:
     g = cols if group <= 0 else group
     return rows * cols * bits // 8 + rows * (cols // g) * 2
+
+
+# -- precision-generic helpers ------------------------------------------------------------------------------------
+# A "term" is (precision, codes, scales): "bf16" (codes = dense tensor, scales None), "int8" / "int4" (above) or
+# "fp8" (codes float8_e4m3fn [r, c], scales bf16 per group: x ~= codes * scale).
+FP8_MAX = 448.0
+PRECISIONS = ("bf16", "int8", "int4", "fp8")
+
+
+def quantize_any(x: torch.Tensor, precision: str, group: int = 128) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if precision == "bf16":
+        return x.to(torch.bfloat16), None
+    if precision in ("int8", "int4"):
+        return quantize(x, 8 if precision == "int8" else 4, group)
+    if precision == "fp8":
+        r, c = x.shape
+        g = c if group <= 0 else group
+        xf = x.float().reshape(r, c // g, g)
+        scale = (xf.abs().amax(-1, keepdim=True) / FP8_MAX).to(torch.bfloat16)
+        s = scale.float().clamp_min(torch.finfo(torch.float32).tiny)
+        codes = (xf / s).clamp_(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).reshape(r, c)
+        return codes, scale.reshape(r, c // g)
+    raise ValueError(f"unknown precision {precision!r}")
+
+
+def dequant_any(codes: torch.Tensor, scales: torch.Tensor | None, precision: str, cols: int,
+                dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    if precision == "bf16":
+        return codes.to(dtype)
+    if precision in ("int8", "int4"):
+        return dequantize(codes, scales, 8 if precision == "int8" else 4, cols, dtype)
+    if precision == "fp8":
+        r = codes.shape[0]
+        ng = scales.shape[1]
+        return (codes.to(dtype).reshape(r, ng, cols // ng) * scales.to(dtype).reshape(r, ng, 1)).reshape(r, cols)
+    raise ValueError(f"unknown precision {precision!r}")
+
+
+def term_nbytes(rows: int, cols: int, precision: str, group: int = 128) -> int:
+    if precision == "bf16":
+        return rows * cols * 2
+    g = cols if group <= 0 else group
+    if precision == "fp8":
+        return rows * cols + rows * (cols // g) * 2
+    return packed_nbytes(rows, cols, 8 if precision == "int8" else 4, group)

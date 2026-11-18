@@ -50,10 +50,14 @@ class PocketBackend:
     def __init__(self, base_weights: str, base_language: str, packages: str, device: str = "cuda",
                  dtype: torch.dtype = torch.bfloat16, ram_form: str = "packed", check_hashes: bool = False,
                  mode: str = "materialise", delta_precision: str | None = None, group: int = 128,
-                 fused: bool | None = None):
+                 fused: bool | None = None, base_precision: str = "bf16"):
         """mode "materialise": a slot holds a full backbone W_base + dequant(delta) (paid once per load).
-        mode "ondemand": a slot holds only the compressed delta; every forward computes W_base + dequant(delta)
-        (paid every step). delta_precision (bf16/int8/int4) must match the packages in ondemand mode."""
+        mode "ondemand": a slot holds only its compressed term; every forward computes the weight (paid every step).
+          delta_precision bf16/int8/int4: a delta on the shared base, which is kept as base_precision
+            (bf16, or int8/int4 quantised once at load);
+          delta_precision w8/w4/wfp8: weight-only, the packages hold each language's own quantised weights and no
+            base backbone is kept on the device at all.
+        The packages' precision must equal delta_precision in ondemand mode."""
         from pocket_tts import TTSModel  # noqa: F401  (import check)
         from pocket_tts.utils.config import CONFIGS_DIR, load_config
 
@@ -61,16 +65,49 @@ class PocketBackend:
             raise ValueError("ram_form is 'packed' or 'materialised'")
         if mode not in ("materialise", "ondemand"):
             raise ValueError("mode is 'materialise' or 'ondemand'")
-        if mode == "ondemand" and (delta_precision not in ("bf16", "int8", "int4") or ram_form != "packed"):
-            raise ValueError("ondemand mode needs delta_precision bf16/int8/int4 and packed host copies")
+        from .package import WEIGHT_PRECISIONS
+
+        if mode == "ondemand" and (delta_precision not in ("bf16", "int8", "int4", *WEIGHT_PRECISIONS)
+                                   or ram_form != "packed"):
+            raise ValueError("ondemand mode needs delta_precision bf16/int8/int4/w8/w4/wfp8 and packed host copies")
+        self.weight_only = mode == "ondemand" and delta_precision in WEIGHT_PRECISIONS
+        if self.weight_only:
+            base_precision = "none"
+        if base_precision not in ("bf16", "int8", "int4", "none") or (base_precision == "none") != self.weight_only:
+            raise ValueError("base_precision is bf16/int8/int4 (none only with weight-only packages)")
+        if mode == "materialise" and base_precision != "bf16":
+            raise ValueError("materialise mode keeps a bf16 base")
         self.mode, self.delta_precision, self.group, self.fused = mode, delta_precision, group, fused
+        self.base_precision = base_precision
+        self.slot_term = WEIGHT_PRECISIONS.get(delta_precision, delta_precision)
         self.device, self.dtype, self.ram_form = torch.device(device), dtype, ram_form
         self.packages_root = Path(packages)
         self.check_hashes = check_hashes
-        sd = load_file(base_weights)
-        self.base_fingerprint = backbone_fingerprint(sd)
-        # base backbone resident on the device (the source of every delta), in the slot dtype
-        self.base = {k: v.to(self.device, dtype) for k, v in sd.items() if is_delta_key(k, v)}
+        # Lean load: one tensor at a time from the safetensors file straight to the device, so host RAM never holds
+        # the whole checkpoint (small hosts); shapes come from the header.
+        from safetensors import safe_open
+
+        from .package import backbone_fingerprint_file
+
+        self.base_weights = str(base_weights)
+        self.base_fingerprint = backbone_fingerprint_file(base_weights)
+        with safe_open(self.base_weights, "pt") as f:
+            shapes = {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
+            self.base_shapes = {k: v for k, v in shapes.items() if k.startswith("flow_lm.transformer.") and len(v) == 2}
+            self.base: dict[str, torch.Tensor] = {}
+            self.base_terms: dict[str, tuple] | None = None
+            if base_precision == "bf16":
+                for k in self.base_shapes:
+                    self.base[k] = f.get_tensor(k).to(self.device, dtype)
+            elif base_precision in ("int8", "int4"):
+                from .ondemand import quantise_base
+
+                self.base_terms = {}
+                for k in self.base_shapes:
+                    self.base_terms.update(quantise_base({k: f.get_tensor(k).to(self.device, torch.bfloat16)},
+                                                         base_precision, group))
+        self.base_nbytes = sum(t.numel() * t.element_size() for t in self.base.values()) + sum(
+            x.numel() * x.element_size() for term in (self.base_terms or {}).values() for x in term[1:] if x is not None)
         cfg_yaml = Path(base_language) if str(base_language).endswith((".yaml", ".yml")) else \
             Path(CONFIGS_DIR) / f"{base_language}.yaml"
         self._tmp = tempfile.TemporaryDirectory(prefix="pocket_swap_")
@@ -80,18 +117,23 @@ class PocketBackend:
         self.slots: dict[int, Any] = {}
         self.lang_meta: dict[str, dict] = {}
         esz = torch.empty((), dtype=dtype).element_size()
-        if mode == "materialise":
-            self.slot_bytes = sum(v.numel() * (4 if (".flow_net." in k or ".out_eos." in k) else esz)
-                                  for k, v in sd.items() if k.startswith("flow_lm."))
-        else:
-            from .quant import packed_nbytes
 
-            other = sum(v.numel() * (4 if (".flow_net." in k or ".out_eos." in k) else esz)
-                        for k, v in sd.items() if k.startswith("flow_lm.") and k not in self.base)
-            bits = {"bf16": 16, "int8": 8, "int4": 4}[delta_precision]
-            self.slot_bytes = other + sum(v.numel() * 2 if bits == 16 else packed_nbytes(*v.shape, bits, group)
-                                          for v in self.base.values())
-        del sd
+        def nel(shape):
+            n = 1
+            for d in shape:
+                n *= d
+            return n
+
+        head = lambda k: 4 if (".flow_net." in k or ".out_eos." in k) else esz  # noqa: E731
+        if mode == "materialise":
+            self.slot_bytes = sum(nel(v) * head(k) for k, v in shapes.items() if k.startswith("flow_lm."))
+        else:
+            from .quant import term_nbytes
+
+            other = sum(nel(v) * head(k) for k, v in shapes.items()
+                        if k.startswith("flow_lm.") and k not in self.base_shapes)
+            self.slot_bytes = other + sum(term_nbytes(r, c, self.slot_term, group)
+                                          for r, c in self.base_shapes.values())
 
     # -- construction helpers --------------------------------------------------------------------------
     def _local_config(self, yaml_path: Path, weights: str) -> str:
@@ -111,10 +153,21 @@ class PocketBackend:
         return Path(yaml_path).stem
 
     def _build_shared_mimi(self):
-        from pocket_tts import TTSModel
+        """Mimi alone (codec + cloning encoder) from the base file, tensor by tensor: no full TTSModel in RAM."""
+        from pocket_tts.models.mimi import build_mimi
+        from safetensors import safe_open
 
-        m = TTSModel.load_model(config=self.base_config_path)
-        mimi = m.mimi.to(self.device).eval()
+        m = build_mimi(self.base_config.mimi)
+        state = {}
+        with safe_open(self.base_weights, "pt") as f:
+            for k in f.keys():
+                if k.startswith("mimi."):
+                    state[k[len("mimi."):]] = f.get_tensor(k)
+        m.load_state_dict(state, strict=True)
+        enc = [v for k, v in state.items() if k.startswith("encoder.")]
+        self._template_has_cloning = any(bool(v.abs().sum() > 0) for v in enc)
+        del state
+        mimi = m.to(self.device).eval()
         mimi_dtype = next(mimi.parameters()).dtype
         dev_type = self.device.type
         orig_decode, orig_encode = mimi.decode_from_latent, mimi.encode_to_latent
@@ -130,8 +183,6 @@ class PocketBackend:
 
         mimi.decode_from_latent = decode_from_latent
         mimi.encode_to_latent = encode_to_latent
-        self._template_has_cloning = m.has_voice_cloning
-        del m
         return mimi
 
     def _new_slot_model(self):
@@ -165,18 +216,33 @@ class PocketBackend:
 
             mod.forward = forward
 
-        t = SlotTTS._from_pydantic_config(cfg, cfg.default_temperature, 1, None, cfg.default_eos_threshold, None)
-        t.flow_lm.speaker_proj_weight = torch.nn.Parameter(torch.zeros(
-            (cfg.flow_lm.transformer.d_model, cfg.mimi.inner_dim or cfg.mimi.seanet.dimension)))
+        # Build on the meta device (no host RAM, no fp32 copy), then allocate each tensor on the device in its final
+        # dtype; every persistent tensor is written by materialise() (the FlowLM has no non-persistent buffers).
+        with torch.device("meta"):
+            t = SlotTTS._from_pydantic_config(cfg, cfg.default_temperature, 1, None, cfg.default_eos_threshold, None)
+            t.flow_lm.speaker_proj_weight = torch.nn.Parameter(torch.zeros(
+                (cfg.flow_lm.transformer.d_model, cfg.mimi.inner_dim or cfg.mimi.seanet.dimension)))
         t.mimi = self.mimi
         self._deltas = getattr(self, "_deltas", {})
         if self.mode == "ondemand":
             from .ondemand import convert_backbone
 
             # drop the per-slot backbone weights before moving to the device: the slot keeps only deltas
-            self._pending_deltas = convert_backbone(t.flow_lm, self.base, self.delta_precision, self.group,
-                                                   fused=self.fused)
-        t.flow_lm.to(self.device, self.dtype)
+            self._pending_deltas = convert_backbone(t.flow_lm, self.base or None, self.slot_term, self.group,
+                                                   fused=self.fused, base_terms=self.base_terms,
+                                                   device=self.device)
+        for mod_name, mod in t.flow_lm.named_modules():
+            fp32 = low and (mod_name.startswith("flow_net") or mod_name.startswith("out_eos"))
+            want = torch.float32 if fp32 else self.dtype
+            for n, p in list(mod._parameters.items()):
+                if p is not None and p.is_meta:
+                    mod._parameters[n] = torch.nn.Parameter(
+                        torch.empty(p.shape, device=self.device, dtype=want if p.is_floating_point() else p.dtype),
+                        requires_grad=False)
+            for n, b in list(mod._buffers.items()):
+                if b is not None and b.is_meta:
+                    mod._buffers[n] = torch.empty(b.shape, device=self.device,
+                                                  dtype=want if b.is_floating_point() else b.dtype)
         t.flow_lm.dtype = self.dtype
         if low:
             fp32_island(t.flow_lm.flow_net)
@@ -193,7 +259,8 @@ class PocketBackend:
     # -- Backend protocol -------------------------------------------------------------------------------
     def read_package(self, lang: str) -> tuple[Any, int]:
         pkg = load_package(self.packages_root / lang, check_hashes=self.check_hashes)
-        if pkg.manifest["base_backbone_bf16_sha256"] != self.base_fingerprint:
+        if pkg.manifest["precision"] not in ("w8", "w4", "wfp8") and \
+                pkg.manifest["base_backbone_bf16_sha256"] != self.base_fingerprint:
             raise ValueError(f"package {lang} was built against a different base checkpoint")
         self._lang_meta(lang, pkg)
         if self.ram_form == "materialised":
@@ -247,6 +314,18 @@ class PocketBackend:
                         temp=c.default_temperature, eos_threshold=c.default_eos_threshold)
         self.lang_meta[lang] = meta
 
+    slot_budget: int | None = None      # bytes all slots together may use (None: no cap)
+    vram_reserve: int = 512 * 2 ** 20   # keep at least this much device memory free after a new slot
+
+    def can_allocate(self) -> bool:
+        """Admission control: refuse a new slot that would exceed the slot budget or eat the device reserve."""
+        if self.slot_budget is not None and (len(self.slots) + 1) * self.slot_bytes > self.slot_budget:
+            return False
+        if self.device.type == "cuda":
+            free, _ = torch.cuda.mem_get_info(self.device)
+            return free - self.slot_bytes >= self.vram_reserve
+        return True
+
     def allocate_slot(self, index: int) -> None:
         self.slots[index] = self._new_slot_model()
         if self.mode == "ondemand":
@@ -264,7 +343,7 @@ class PocketBackend:
         dk = set(package.delta_keys())
         if self.mode == "ondemand":
             prec = package.manifest["precision"]
-            if prec not in ("base", self.delta_precision):
+            if prec not in ("base", self.delta_precision) or (prec == "base" and self.weight_only):
                 raise ValueError(f"{lang}: package precision {prec} != ondemand precision {self.delta_precision}")
             for k, dl in self._deltas[index].items():
                 if k not in dk:
@@ -298,8 +377,28 @@ class PocketBackend:
         return self.slots[index].get_state_for_audio_prompt(voice)
 
 
+def detect_precision(packages: str | Path) -> str:
+    """The precision of a package directory (all non-base packages must agree)."""
+    import json
+
+    precs = {json.loads(p.read_text())["precision"] for p in Path(packages).glob("*/manifest.json")}
+    precs.discard("base")
+    if len(precs) != 1:
+        raise ValueError(f"{packages}: expected one package precision, found {sorted(precs) or 'none'}")
+    return precs.pop()
+
+
 class PocketSwapper:
-    """Public API: sessions bound to languages; generation serialised per slot, parallel across slots."""
+    """Public API (precision-agnostic): sessions bound to languages, generation serialised per slot and parallel
+    across slots.
+
+        open(session, lang, voice)      bind / switch a session (its voice is kept across switches)
+        stream(session, text, stop)     iterator of float32 PCM chunks at `sample_rate` (24 kHz)
+        generate(session, text)         whole utterance
+        groups(sessions)                {slot: [sessions]}: one batched forward per group (same language)
+        close(session), stats(), mem(), maintenance()
+    mode="materialise" | "ondemand"; the package precision is read from the manifests when not given.
+    """
 
     def __init__(self, base_weights: str, base_language: str, packages: str, n_slots: int = 4,
                  device: str = "cuda", dtype: torch.dtype = torch.bfloat16,
@@ -308,16 +407,22 @@ class PocketSwapper:
                  ram_cap: int | float | None = None, ram_max_languages: int | None = 0,
                  host_idle_s: float | None = None, ram_form: str = "packed",
                  slot_idle_s: float | None = None, check_hashes: bool = False,
-                 mode: str = "materialise", delta_precision: str | None = None, fused: bool | None = None):
+                 mode: str = "ondemand", delta_precision: str | None = None, fused: bool | None = None,
+                 base_precision: str = "bf16", vram_reserve: int | None = None):
         """Caps: an int is bytes, a float in (0, 1] a fraction of VRAM / host RAM, None = unlimited.
         A tier with max_languages = 0 is disabled (pinned: page-locked host copies; ram: pageable copies)."""
+        if mode == "ondemand" and delta_precision is None:
+            delta_precision = detect_precision(packages)
         self.backend = PocketBackend(base_weights, base_language, packages, device, dtype, ram_form, check_hashes,
-                                     mode, delta_precision, fused=fused)
+                                     mode, delta_precision, fused=fused, base_precision=base_precision)
         if self.backend.device.type == "cuda":
             free, total = torch.cuda.mem_get_info(self.backend.device)
             cap = resolve_cap(vram_cap, total)
             if cap is not None:
                 n_slots = max(1, min(n_slots, cap // self.backend.slot_bytes))
+                self.backend.slot_budget = cap
+        if vram_reserve is not None:
+            self.backend.vram_reserve = int(vram_reserve)
         host = _host_ram_bytes()
         tiers = []
         if pinned_max_languages != 0 and pinned_cap != 0:
@@ -355,6 +460,46 @@ class PocketSwapper:
             if not kw["copy_state"]:
                 raise ValueError("copy_state=False would mutate a voice state shared by sessions")
             return self.backend.slots[b.slot].generate_audio(b.voice_state, text, **kw)
+
+    sample_rate = 24000
+
+    def stream(self, session: Hashable, text: str, stop: threading.Event | None = None, **kw):
+        """Yield float32 mono PCM chunks as they are decoded. Holds the session's slot lock for the utterance
+        (other sessions of the same language wait; other languages run in parallel). `stop` cancels."""
+        b = self.core.binding(session)
+        if kw.get("copy_state") is False:
+            raise ValueError("copy_state=False would mutate a voice state shared by sessions")
+        with self._slot_locks[b.slot]:
+            for chunk in self.backend.slots[b.slot].generate_audio_stream(b.voice_state, text, stop=stop, **kw):
+                yield chunk.float().reshape(-1)
+
+    def switch(self, session: Hashable, lang: str, timeout: float | None = 0.0) -> Binding:
+        return self.open(session, lang, timeout=timeout)
+
+    def groups(self, sessions) -> dict[int, list]:
+        return self.core.group_by_slot(sessions)
+
+    def stats(self) -> dict:
+        b = self.backend
+        return {"mode": b.mode, "precision": b.delta_precision, "base_precision": b.base_precision,
+                "slot_bytes": b.slot_bytes, "base_bytes": b.base_nbytes, "slots": self.core.resident(),
+                "host": self.core.host_resident(), "sessions": {s: x.lang for s, x in self.core.sessions.items()},
+                "sources": dict(self.core.stats.sources), "evictions": self.core.stats.slot_evictions}
+
+    def mem(self) -> dict:
+        d = {}
+        try:
+            for line in open("/proc/self/status"):
+                if line.startswith(("VmRSS", "VmHWM")):
+                    k, v = line.split(":")
+                    d[k.lower() + "_gb"] = round(int(v.split()[0]) / 2 ** 20, 3)
+        except OSError:
+            pass
+        if self.backend.device.type == "cuda":
+            d.update(cuda_allocated_gb=round(torch.cuda.memory_allocated() / 2 ** 30, 3),
+                     cuda_reserved_gb=round(torch.cuda.memory_reserved() / 2 ** 30, 3),
+                     cuda_peak_gb=round(torch.cuda.max_memory_allocated() / 2 ** 30, 3))
+        return d
 
     def maintenance(self) -> dict:
         return self.core.maintenance()

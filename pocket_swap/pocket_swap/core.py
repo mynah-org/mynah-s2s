@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Hashable, Protocol
 
-from .lru import AllSlotsBusy, CacheFull, RefLRU, Slot, SlotPool
+from .lru import AdmissionRefused, AllSlotsBusy, CacheFull, RefLRU, Slot, SlotPool
 
 
 class Backend(Protocol):
@@ -29,6 +29,9 @@ class Backend(Protocol):
         """Convert a host package for `tier` (e.g. pin / unpin its tensors); returns (package, nbytes)."""
 
     def allocate_slot(self, index: int) -> None: ...
+
+    def can_allocate(self) -> bool:
+        """Optional: False when one more slot would exceed the memory budget (admission control)."""
 
     def free_slot(self, index: int) -> None: ...
 
@@ -147,6 +150,8 @@ class SwapCore:
             while True:
                 try:
                     slot, event = self.pool.choose(lang)
+                    if event == "alloc" and not self._can_allocate():
+                        slot, event = self.pool.choose(lang, allow_alloc=False)
                     break
                 except AllSlotsBusy:
                     # the session's own old slot counts as free for itself
@@ -169,6 +174,10 @@ class SwapCore:
             self.sessions[session] = b
             self.stats.binds += 1
             return b
+
+    def _can_allocate(self) -> bool:
+        f = getattr(self.backend, "can_allocate", None)
+        return True if f is None else bool(f())
 
     def _load(self, slot: Slot, lang: str, event: str) -> tuple[str, float]:
         if event == "hot":

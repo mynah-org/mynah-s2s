@@ -366,3 +366,43 @@ def test_mixed_language_batch_grouped_per_slot():
     for slot, members in g.items():
         assert len({plan[m] for m in members}) == 1  # one language per group
     assert sorted(sorted(v) for v in g.values()) == [["c1", "c4"], ["c2", "c5"], ["c3"]]
+
+
+class BudgetBackend(FakeBackend):
+    """Admission control: at most `cap` slots may be allocated (e.g. the VRAM budget)."""
+
+    def __init__(self, cap):
+        super().__init__()
+        self.cap = cap
+        self.n = 0
+
+    def allocate_slot(self, i):
+        super().allocate_slot(i)
+        self.n += 1
+
+    def free_slot(self, i):
+        super().free_slot(i)
+        self.n -= 1
+
+    def can_allocate(self):
+        return self.n < self.cap
+
+
+def test_admission_reuses_idle_slot_instead_of_allocating():
+    from pocket_swap.lru import AdmissionRefused
+
+    be = BudgetBackend(cap=2)
+    c = SwapCore(be, n_slots=4, clock=Clock())
+    c.bind("a", "it")
+    c.bind("b", "fr")
+    c.unbind("b")
+    b = c.bind("c", "en")  # budget full: evicts fr's idle slot instead of allocating a third
+    assert b.event == "evict" and be.n == 2
+    with pytest.raises(AdmissionRefused):
+        c.bind("d", "de", timeout=0)  # both allocated slots in use: refused (or queued with a timeout)
+    done = {}
+    t = threading.Thread(target=lambda: done.setdefault("d", c.bind("d", "de", timeout=5)))
+    t.start()
+    c.unbind("a")
+    t.join(5)
+    assert done["d"].event == "evict" and be.n == 2

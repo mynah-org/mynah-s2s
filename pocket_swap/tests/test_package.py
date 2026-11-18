@@ -175,3 +175,65 @@ def test_fused_kernel_matches_torch_reference(precision, rows, monkeypatch):
     y = fused.fused_linear(x, base, precision, codes, None if precision == "bf16" else dl.s, 128)
     assert y.shape == (rows, 48)
     assert torch.allclose(y.float(), ref, rtol=2e-2, atol=2e-2), (y.float() - ref).abs().max()
+
+
+@pytest.mark.parametrize("precision,tol", [("int8", 0.02), ("int4", 0.2), ("fp8", 0.05)])
+def test_quantize_any_roundtrip(precision, tol):
+    from pocket_swap.quant import dequant_any, quantize_any, term_nbytes
+
+    x = torch.randn(32, 256, generator=torch.Generator().manual_seed(3))
+    q, s = quantize_any(x, precision, 128)
+    y = dequant_any(q, s, precision, 256)
+    assert ((y - x).norm() / x.norm()) < tol
+    assert q.numel() * q.element_size() + s.numel() * 2 == term_nbytes(32, 256, precision, 128)
+
+
+@pytest.mark.parametrize("precision,tol", [("w8", 0.02), ("w4", 0.2), ("wfp8", 0.05)])
+def test_weight_only_packages(ckpts, precision, tol):
+    d, base, tgt, tok, _ = ckpts
+    m = build_package(Source(str(d / "base.safetensors")), Source(str(d / "tgt.safetensors")), "it", d / "out", tok,
+                      precision, 16)
+    assert m["precision"] == precision and 0 < m["backbone_rel_err"] < tol
+    mb = build_package(Source(str(d / "base.safetensors")), None, "en", d / "out", tok, precision, 16)
+    assert mb["precision"] == precision and "delta" in mb["files"]  # the base language is quantised too
+    for lang, ref in (("it", tgt), ("en", base)):
+        pkg = load_package(d / "out" / lang)
+        rec = reconstruct_state(base, pkg)
+        k = "flow_lm.transformer.layers.0.linear1.weight"
+        assert (rec[k].float() - ref[k].float()).norm() / ref[k].float().norm() < tol
+        assert torch.equal(rec["flow_lm.conditioner.embed.weight"], ref["flow_lm.conditioner.embed.weight"])
+
+
+@pytest.mark.parametrize("bp,lp", [("int8", "int8"), ("int4", "int4"), (None, "int8"), (None, "int4"), (None, "fp8"),
+                                   ("bf16", "int8")])
+def test_delta_linear_terms_torch_and_fused(bp, lp):
+    """Quantised base + quantised delta, and weight-only terms: torch path == dequant reference, and the Triton
+    kernel (interpreter, when TRITON_INTERPRET=1) == torch path."""
+    import os
+
+    from pocket_swap import fused
+    from pocket_swap.ondemand import DeltaLinear
+    from pocket_swap.quant import dequant_any, quantize_any
+
+    g = torch.Generator().manual_seed(11)
+    W0 = torch.randn(48, 256, generator=g) * 0.05
+    D = torch.randn(48, 256, generator=g) * 0.05
+    if bp is None:
+        dl = DeltaLinear(None, lp, 128, fused=False, shape=(48, 256), device="cpu")
+        q, s = quantize_any(W0 + D, lp, 128)
+        dl.load(q, s)
+        ref = dequant_any(q, s, lp, 256)
+    else:
+        bterm = (bp,) + quantize_any(W0, bp, 128)
+        dl = DeltaLinear(None, lp, 128, fused=False, base_term=bterm, shape=(48, 256), device="cpu")
+        q, s = quantize_any(D, lp, 128)
+        dl.load(q, s)
+        ref = dequant_any(*bterm[1:], bp, 256) + dequant_any(q, s, lp, 256)
+    assert torch.equal(dl.weight_now(), ref.to(torch.bfloat16))
+    x = torch.randn(4, 256, generator=g).to(torch.bfloat16)
+    y_t = dl(x).float()
+    assert torch.allclose(y_t, x.float() @ ref.to(torch.bfloat16).float().t(), rtol=2e-2, atol=2e-2)
+    if os.environ.get("TRITON_INTERPRET") == "1" and fused.available(x, (lp,) + ((bp,) if bp else ())):
+        dl.fused = True
+        y_f = dl(x).float()
+        assert torch.allclose(y_f, y_t, rtol=2e-2, atol=2e-2), (y_f - y_t).abs().max()

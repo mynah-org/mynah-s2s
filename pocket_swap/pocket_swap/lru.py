@@ -21,6 +21,10 @@ class AllSlotsBusy(RuntimeError):
     """Every language slot is bound to a session that is still using it."""
 
 
+class AdmissionRefused(AllSlotsBusy):
+    """Loading another language would exceed the memory budget and no unused slot can be reused."""
+
+
 @dataclass
 class _Entry:
     value: Any
@@ -163,8 +167,9 @@ class SlotPool:
                 return s
         return None
 
-    def choose(self, lang: str) -> tuple[Slot, str]:
-        """Pick the slot for `lang` without changing anything (the caller loads, then calls `commit`)."""
+    def choose(self, lang: str, allow_alloc: bool = True) -> tuple[Slot, str]:
+        """Pick the slot for `lang` without changing anything (the caller loads, then calls `commit`).
+        allow_alloc=False: never allocate a new slot (memory admission), reuse or evict an existing one."""
         s = self.find(lang)
         if s is not None:
             return s, "hot"
@@ -172,12 +177,17 @@ class SlotPool:
         alloc_free = [s for s in free if s.allocated]
         if alloc_free:
             return alloc_free[0], "reuse"
-        if free:
+        if free and allow_alloc:
             return free[0], "alloc"
-        idle = [s for s in self.slots if s.refs == 0]
+        idle = [s for s in self.slots if s.refs == 0 and s.allocated]
         if not idle:
+            if free and not allow_alloc:
+                raise AdmissionRefused(f"no memory for another slot and all {self.n_allocated()} allocated slots are in use")
             raise AllSlotsBusy(f"all {len(self.slots)} slots are in use")
         return min(idle, key=lambda s: s.last_used), "evict"
+
+    def n_allocated(self) -> int:
+        return sum(s.allocated for s in self.slots)
 
     def commit(self, slot: Slot, lang: str, event: str) -> None:
         if event == "alloc":

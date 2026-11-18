@@ -13,6 +13,8 @@ Precisions of the backbone part:
   bf16   delta in bf16 (near-exact: rounding of the delta)
   int8   delta, symmetric per-group int8 codes + bf16 scales
   int4   delta, symmetric per-group int4 codes (packed) + bf16 scales
+  w8 / w4 / wfp8   the language's own backbone weights quantised (int8 / int4 / fp8 e4m3, per-group scales): no
+         delta, no base needed at run time (weight-only quantised end to end); the base language gets one too
 Mimi is never stored in a package: it is identical in every language and comes from the base checkpoint.
 """
 
@@ -30,10 +32,11 @@ from typing import Any
 import torch
 from safetensors.torch import load as st_load, load_file, save as st_save
 
-from .quant import dequantize, quantize
+from .quant import dequant_any, dequantize, quantize, quantize_any
 
 FORMAT = "pocket-swap-package/1"
-PRECISIONS = ("exact", "bf16", "int8", "int4")
+PRECISIONS = ("exact", "bf16", "int8", "int4", "w8", "w4", "wfp8")
+WEIGHT_PRECISIONS = {"w8": "int8", "w4": "int4", "wfp8": "fp8"}
 BACKBONE_PREFIX = "flow_lm.transformer."
 LICENCE_NOTICE = (
     "The tensors in this package are derived from Kyutai's Pocket TTS weights (https://huggingface.co/kyutai), "
@@ -66,6 +69,20 @@ def backbone_fingerprint(state: dict[str, torch.Tensor]) -> str:
         if is_delta_key(k, t):
             h.update(k.encode())
             h.update(t.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
+
+
+def backbone_fingerprint_file(path: str | os.PathLike) -> str:
+    """Same as backbone_fingerprint, reading one tensor at a time (no full checkpoint in host RAM)."""
+    from safetensors import safe_open
+
+    h = hashlib.sha256()
+    with safe_open(str(path), "pt") as f:
+        for k in sorted(f.keys()):
+            sl = f.get_slice(k)
+            if k.startswith(BACKBONE_PREFIX) and len(sl.get_shape()) == 2:
+                h.update(k.encode())
+                h.update(f.get_tensor(k).to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes())
     return h.hexdigest()
 
 
@@ -134,7 +151,16 @@ def build_package(base: Source, target: Source | None, lang: str, out_dir: str |
     for k, t in tsd.items():
         if not k.startswith("flow_lm."):
             continue  # Mimi: shared, taken from the base checkpoint
-        if target is not None and is_delta_key(k, t) and bsd[k].shape == t.shape:
+        if precision in WEIGHT_PRECISIONS and is_delta_key(k, t):
+            y = t.to(torch.bfloat16).float()
+            wp = WEIGHT_PRECISIONS[precision]
+            q, sc = quantize_any(y, wp, group)
+            delta[k + ".q"], delta[k + ".s"] = q, sc
+            rec = dequant_any(q, sc, wp, y.shape[1]).to(torch.bfloat16).float()
+            err2 += (rec - y).pow(2).sum().item()
+            w2 += y.pow(2).sum().item()
+            n_delta += t.numel()
+        elif target is not None and is_delta_key(k, t) and bsd[k].shape == t.shape:
             y = t.to(torch.bfloat16).float()
             if precision == "exact":
                 delta[k] = t.to(torch.bfloat16)
@@ -174,7 +200,7 @@ def build_package(base: Source, target: Source | None, lang: str, out_dir: str |
     manifest = {
         "format": FORMAT,
         "language": lang,
-        "precision": precision if target is not None else "base",
+        "precision": precision if (target is not None or precision in WEIGHT_PRECISIONS) else "base",
         "group": group,
         "zstd_level": zstd_level,
         "base": base.describe(),
@@ -247,6 +273,10 @@ def reconstruct_tensor(key: str, base_w: torch.Tensor, pkg: Package, dtype: torc
         q = pkg.delta[key + ".q"].to(dev, non_blocking=True)
         s = pkg.delta[key + ".s"].to(dev, non_blocking=True)
         w = base_w.float() + dequantize(q, s, 8 if prec == "int8" else 4, base_w.shape[1])
+    elif prec in WEIGHT_PRECISIONS:
+        q = pkg.delta[key + ".q"].to(dev, non_blocking=True)
+        s = pkg.delta[key + ".s"].to(dev, non_blocking=True)
+        w = dequant_any(q, s, WEIGHT_PRECISIONS[prec], base_w.shape[1])
     else:
         raise ValueError(f"no delta for precision {prec!r}")
     if out is None:

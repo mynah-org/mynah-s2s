@@ -25,8 +25,10 @@ class PocketSizes:
     base_backbone: float = 0.604 * GB      # shared EN backbone, bf16 (bench: base + Mimi = 0.689 GB allocated)
     mimi: float = 0.085 * GB               # shared codec (encoder + decoder), fp32
     slot_materialise: float = 0.658 * GB   # mode a: full backbone + per-language tensors (head fp32), bench-allocated
-    slot_ondemand: dict = field(default_factory=lambda: {"bf16": 0.652 * GB, "int8": 0.360 * GB, "int4": 0.204 * GB})
-    package: dict = field(default_factory=lambda: {"bf16": 0.632 * GB, "int8": 0.335 * GB, "int4": 0.184 * GB})
+    slot_ondemand: dict = field(default_factory=lambda: {"bf16": 0.652 * GB, "int8": 0.360 * GB, "int4": 0.204 * GB,
+                                                         "w8": 0.354 * GB, "w4": 0.203 * GB, "wfp8": 0.354 * GB})
+    package: dict = field(default_factory=lambda: {"bf16": 0.632 * GB, "int8": 0.335 * GB, "int4": 0.184 * GB,
+                                                   "w8": 0.335 * GB, "w4": 0.184 * GB, "wfp8": 0.335 * GB})
     session_state: float = 0.005 * GB      # voice/prompt KV state per (language, voice) (bench: 4.9 MB)
     gen_peak: float = 0.121 * GB           # extra allocation while one session generates (bench, mode a)
 
@@ -60,7 +62,7 @@ class Plan:
     advice: list
 
 
-def swap_estimates(t: Target, p: PocketSizes, precision: str = "int8", zstd_mbps_per_core: float = 900.0) -> dict:
+def swap_estimates(t: Target, p: PocketSizes, precision: str = "w8", zstd_mbps_per_core: float = 900.0) -> dict:
     """Estimated ms per tier for one language load (materialise mode); dequant+add is memory-bound on the GPU."""
     pkg = p.package[precision]
     slot = p.slot_materialise
@@ -73,7 +75,7 @@ def swap_estimates(t: Target, p: PocketSizes, precision: str = "int8", zstd_mbps
             "disk_uncompressed": round(disk, 1), "disk_zstd_extra_cpu": round(zstd, 1)}
 
 
-def plan(t: Target, p: PocketSizes, languages: int = 3, precision: str = "int8", sessions: int = 4) -> Plan:
+def plan(t: Target, p: PocketSizes, languages: int = 3, precision: str = "w8", sessions: int = 4) -> Plan:
     stack = sum(t.stack_vram.values())
     usable = t.vram * (1 - t.headroom) - stack
     fixed = p.base_backbone + p.mimi + sessions * (p.session_state + p.gen_peak)
@@ -124,6 +126,8 @@ PRESETS = {
                               864, _stack(7.0), 6 * GB),
     "l40s-g6e.xlarge-llm-bf16": Target("L40S 48 GB, g6e.xlarge, LLM bf16", 44.7 * GB, False, 32 * 1.0737 * GB, 4, 25, 1,
                                        864, _stack(19.0), 6 * GB),
+    "l40s-16g": Target("L40S 48 GB + 16 GiB host (reference small box, 4 vCPU)", 44.5 * GB, False, 16 * 1.0737 * GB,
+                        4, 25, 2, 864, _stack(7.0), 8 * GB, notes="host RAM is the scarce side: tiny pinned tier"),
     "rtx6000ada": Target("RTX 6000 Ada 48 GB (host 64 GB assumed)", 47.5 * GB, False, 64 * GB, 16, 25, 3, 960,
                          _stack(7.0), 8 * GB),
 }
@@ -142,7 +146,7 @@ def main(argv=None) -> int:
     ap.add_argument("--stack", default="", help="name=GB,... resident on the GPU besides Pocket")
     ap.add_argument("--stack-host-gb", type=float, default=6)
     ap.add_argument("--languages", type=int, default=3)
-    ap.add_argument("--precision", default="int8", choices=["bf16", "int8", "int4"])
+    ap.add_argument("--precision", default="w8", choices=["bf16", "int8", "int4", "w8", "w4", "wfp8"])
     ap.add_argument("--sessions", type=int, default=4)
     a = ap.parse_args(argv)
     targets = [PRESETS[p] for p in a.preset or []]
