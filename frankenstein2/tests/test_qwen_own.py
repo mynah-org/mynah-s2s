@@ -269,3 +269,26 @@ def test_mtp_speculative_is_lossless(moe, nv):
     got = [ev for ev in e.generate_mtp(s, ids, max_new=30, stop=("never",))][-1]
     assert got["ids"] == ref, (got["ids"], ref)
     assert got["mtp_steps"] > 0
+
+
+def test_batch_runner_matches_single_generation():
+    from frankenstein2.llm.qwen_own.batch import BatchRunner
+    e = tiny_engine(False, False)
+    e.use_mtp = False
+    e.free = [0, 1]
+    e.state = e.model.new_state(3, 256)
+    prompts = {"a": torch.randint(1, 97, (37,)).tolist(), "b": torch.randint(1, 97, (90,)).tolist()}
+    ref = {}
+    for k, ids in prompts.items():
+        s = e.open()
+        ref[k] = [ev for ev in e.generate(s, ids, max_new=12, stop=("never",))][-1]["ids"]
+        e.close(s)
+    run = BatchRunner(e, prefill_budget=16, stop=("never",))
+    for k, ids in prompts.items():
+        run.submit(k, ids, max_new=12)
+    done = {}
+    while run.busy():
+        for ev in run.step():
+            if ev.get("done"):
+                done[ev["key"]] = ev["ids"]
+    assert done == ref, (done, ref)

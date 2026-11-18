@@ -15,9 +15,21 @@ each). Greedy decoding.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import time
 
 import torch
+
+
+def _on_stream(fn):
+    """Run an engine method on the engine's CUDA stream (if one was given)."""
+    @functools.wraps(fn)
+    def w(self, *a, **k):
+        ctx = torch.cuda.stream(self.stream) if getattr(self, "stream", None) is not None else contextlib.nullcontext()
+        with ctx:
+            return fn(self, *a, **k)
+    return w
 
 from .config import load_cfg
 from .model import Model
@@ -28,12 +40,19 @@ class QwenOwn:
     GRAPH_B = (1, 2, 4, 8, 16)
     GRAPH_L = (512, 1024, 2048, 4096, 8192, 16384, 32768)
 
-    def __init__(self, path, device="cuda", mode="bf16", slots=4, max_len=8192, group=128, graphs=True, mtp=False):
-        from transformers import AutoTokenizer
+    def __init__(self, path, device="cuda", mode="bf16", slots=4, max_len=8192, group=128, graphs=True, mtp=False,
+                 tokenizer=None, stream=None):
+        """tokenizer: any object with apply_chat_template / decode / convert_tokens_to_ids (default: the checkpoint's
+        HF tokenizer, imported lazily). stream: a torch.cuda.Stream all of this engine's GPU work is issued on (an
+        external scheduler can overlap it with other models); None = the current stream."""
         t0 = time.monotonic()
         self.path, self.device = str(path), torch.device(device)
+        self.stream = stream
         self.cfg = load_cfg(path)
-        self.tok = AutoTokenizer.from_pretrained(self.path)
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.path)
+        self.tok = tokenizer
         W, info = load_weights(path, self.device, mtp=mtp)
         self.quant = info
         awq_group = info.get("group_size") if info.get("quant_method") == "awq" else None
@@ -91,34 +110,53 @@ class QwenOwn:
 
     # ---- forward ----
     def prefill(self, s, ids: list) -> torch.Tensor:
-        """Feed `ids` (the whole prompt) to session s, reusing the snapshot when the prompt extends the last one."""
+        """Feed `ids` (the whole prompt) to session s, reusing the snapshot when the prompt extends the last one.
+        Returns the next-token logits [V]."""
+        self.prefill_begin(s, ids)
+        while True:
+            out = self.prefill_step(s, self.prefill_chunk)
+            if out is not None:
+                return out
+
+    def prefill_begin(self, s, ids: list) -> int:
+        """Start (or restart) a prompt for session s; returns how many tokens are left to prefill (the part after the
+        session's snapshot when the prompt extends its previous prompt). Pair with prefill_step()."""
         se = self.sess[s]
+        if len(ids) > self.max_len:
+            raise ValueError("prompt longer than max_len")
         start = 0
         if se["snap"] is not None and ids[:se["snap"]["n"]] == se["ids"][:se["snap"]["n"]] and len(ids) > se["snap"]["n"]:
             start = self._restore(s)
         else:
             self._zero(s)
-        if len(ids) > self.max_len:
-            raise ValueError("prompt longer than max_len")
-        slots = torch.tensor([s], device=self.device)
+        se["pending"], se["cursor"], se["hid_prev"] = list(ids), start, None
+        return len(ids) - start
+
+    @_on_stream
+    def prefill_step(self, s, budget: int):
+        """Prefill up to `budget` more prompt tokens of session s (so prefill can be interleaved with other sessions'
+        decode steps). Returns None while tokens remain, then the next-token logits [V]."""
+        se = self.sess[s]
+        ids, a = se["pending"], se["cursor"]
+        b = min(len(ids), a + max(1, budget))
         mtp = self.model.mtp is not None and self.use_mtp
-        hid_prev = None
-        for a in range(start, len(ids), self.prefill_chunk):           # bounded activations / expert buffers
-            b = min(len(ids), a + self.prefill_chunk)
-            new = torch.tensor([ids[a:b]], device=self.device)
-            pos = torch.arange(a, b, device=self.device)[None]
-            out = self.model.forward(new, self.state, slots, pos, torch.tensor([b], device=self.device),
-                                     prefill=True, hidden=mtp)
-            logits, hid = out if mtp else (out, None)
-            if mtp and b < len(ids):                                    # MTP over this chunk: (token i+1, hidden i)
-                self._mtp_fill(s, ids[a + 1:b + 1], hid, a + 1)
-            hid_prev = (a, hid)
+        out = self.model.forward(torch.tensor([ids[a:b]], device=self.device), self.state,
+                                 torch.tensor([s], device=self.device), torch.arange(a, b, device=self.device)[None],
+                                 torch.tensor([b], device=self.device), prefill=True, hidden=mtp)
+        logits, hid = out if mtp else (out, None)
+        if mtp and b < len(ids):                                        # MTP over this chunk: (token i+1, hidden i)
+            self._mtp_fill(s, ids[a + 1:b + 1], hid, a + 1)
+        se["cursor"], se["hid_prev"] = b, (a, hid)
+        if b < len(ids):
+            return None
         se["ids"] = list(ids)
         self._snapshot(s, len(ids))
         if mtp:
-            se["mtp_tail"] = hid_prev                                   # last chunk: filled once the next token is known
+            se["mtp_tail"] = se["hid_prev"]                             # last chunk: filled once the next token is known
+        se.pop("pending", None)
         return logits[0]
 
+    @_on_stream
     def _mtp_fill(self, s, toks, hid, p0):
         """Run the MTP head over tokens `toks` paired with main hidden states `hid` [1, T, H], positions p0.. ."""
         T = len(toks)
@@ -127,6 +165,7 @@ class QwenOwn:
         return self.model.mtp_forward(ids, hid[:, :T], self.state, torch.tensor([s], device=self.device), pos,
                                       torch.tensor([p0 + T], device=self.device), prefill=True)[0]
 
+    @_on_stream
     def decode_batch(self, sessions: list, tokens: list) -> torch.Tensor:
         """One token for each session (in order). Returns logits [B, V]. With CUDA graphs: the batch is padded to a
         captured size with the scratch slot, the attention reads a static cache-length bucket."""
@@ -175,6 +214,7 @@ class QwenOwn:
         return g
 
     # ---- speculative decoding with the MTP head (greedy, lossless) ----
+    @_on_stream
     def _verify(self, s, t, d, p, L):
         """Main model on [t, d] at positions p, p+1 -> (logits [2, V], hidden [1, 2, H], rollback states)."""
         dev = self.device
@@ -192,6 +232,7 @@ class QwenOwn:
                                  prefill=False, kv_len=L, all_logits=True, hidden=True)
         return out[0][0], out[1], self.state["rollback"]
 
+    @_on_stream
     def _draft(self, s, toks, hid, p, L):
         """MTP head on 1 or 2 tokens at positions p.. -> draft logits [V]."""
         dev = self.device
