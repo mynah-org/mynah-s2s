@@ -224,6 +224,19 @@ class QwenOwn:
         return logits[0]
 
     @_on_stream
+    def extend(self, s, toks: list) -> torch.Tensor:
+        """Feed a few tokens to a session in the middle of its generation (jump-forward over fixed tool-call markup)
+        in one forward -> the next-token logits [V]. No snapshot, no MTP."""
+        se = self.sess[s]
+        a = len(se["ids"])
+        b = a + len(toks)
+        logits = self.model.forward(torch.tensor([toks], device=self.device), self.state,
+                                    torch.tensor([s], device=self.device), torch.arange(a, b, device=self.device)[None],
+                                    torch.tensor([b], device=self.device), prefill=True)
+        se["ids"] += list(toks)
+        return logits[0]
+
+    @_on_stream
     def _mtp_fill(self, s, toks, hid, p0):
         """Run the MTP head over tokens `toks` paired with main hidden states `hid` [1, T, H], positions p0.. ."""
         T = len(toks)

@@ -22,11 +22,13 @@ from .base import wrap_tools
 
 V1 = Path(__file__).resolve().parents[2] / "frankenstein"
 
+# Prices and numbers in digits: the engine's text normaliser speaks them (499 -> "quattrocentonovantanove"); asked to
+# write them in words, the 4B garbled some ("quarantanoncento novantanove", f2c_033).
 BRIEF = {
     "it": ("Rispondi come in una telefonata: al massimo due frasi brevi, senza elenchi puntati, senza markdown e "
-           "senza simboli; dì i prezzi a parole."),
+           "senza simboli; scrivi prezzi e numeri in cifre."),
     "fr": ("Réponds comme au téléphone : deux phrases courtes au maximum, sans listes, sans markdown ni symboles ; "
-           "dis les prix en toutes lettres."),
+           "écris les prix et les nombres en chiffres."),
     "en": "Answer as on a phone call: at most two short sentences, no lists, no markdown, no symbols.",
 }
 POLICY = {

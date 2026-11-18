@@ -19,6 +19,7 @@ Scheduler (one thread, the only one issuing GPU work), in priority order every t
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -388,6 +389,26 @@ class InProcLLM:
             return True
         return False
 
+    # Jump-forward over Qwen3.5's tool-call markup (lab: 12 of the 43 tokens of a two-parameter call are fixed by the
+    # format): after these suffixes the next tokens are known, so they are fed in one forward instead of one decode
+    # step each; a call whose closing is certain ends at once. OFF by default: the extra forward is eager (outside the
+    # decode graphs) and blocks the batch; at 10 sessions on GB10 calls got slower (2.4 -> 4.0 s p50, f2c_035).
+    JF_RULES = ((re.compile(r"<tool_call>$"), "\n<function"),
+                (re.compile(r"<parameter=[\w.\-]+>\n[^\n<]+\n$"), "</parameter>\n"))
+    JF_CLOSE = re.compile(r"(</parameter>|<function=[\w.\-]+>)\n</$")
+    jump_forward = False
+
+    def _jump(self, key, text):
+        """-> (forced token ids, end_now) for the generated text so far."""
+        if not self.jump_forward:
+            return None, False
+        if self.JF_CLOSE.search(text):
+            return None, True
+        for rx, s in self.JF_RULES:
+            if rx.search(text):
+                return self.eng.tok.encode(s), False
+        return None, False
+
     def _emit(self, key, tok):
         a = self.active[key]
         if a["n"] == 0:
@@ -404,6 +425,26 @@ class InProcLLM:
         if not text.endswith("�") and len(text) > a["sent"]:
             self.box.put(key[0], {"ev": "delta", "ss": key[0], "rid": key[1], "text": text[a["sent"]:]})
             a["sent"] = len(text)
+        if "<tool_call>" in text and "</tool_call>" not in text:
+            forced, end_now = self._jump(key, text)
+            if end_now:                                   # the call is complete: write its fixed closing, stop
+                rest = "function>\n</tool_call>"
+                self.box.put(key[0], {"ev": "delta", "ss": key[0], "rid": key[1], "text": rest})
+                a["sent"] = len(text) + len(rest)
+                a["jf"] = a.get("jf", 0) + 5
+                text += rest
+            elif forced:
+                import torch
+                logits = self.eng.extend(a["slot"], [tok] + forced)   # tok (sampled, not fed yet) + the markup
+                a["out"] += forced
+                a["n"] += len(forced)
+                a["jf"] = a.get("jf", 0) + len(forced)
+                a["next"] = None
+                text = self.eng.tok.decode(a["out"], skip_special_tokens=False)
+                if len(text) > a["sent"]:
+                    self.box.put(key[0], {"ev": "delta", "ss": key[0], "rid": key[1], "text": text[a["sent"]:]})
+                    a["sent"] = len(text)
+                return self._emit(key, int(host(torch.argmax(logits))))
         if "</tool_call>" in text:
             self._log_end(a, "call")
             self.box.put(key[0], {"ev": "end", "ss": key[0], "rid": key[1], "n": a["n"], "first_ms": a.get("first_ms")})
@@ -413,7 +454,7 @@ class InProcLLM:
         """Per-request timeline (submitted -> prefill start -> first token -> end), for the scheduler summary."""
         tr = dict(a.get("trace", {}))
         tr.update(kind=kind, first_ms=a.get("first_ms"), total_ms=round((time.monotonic() - a["t0"]) * 1e3, 1),
-                  n_tok=a["n"])
+                  n_tok=a["n"], jf_tok=a.get("jf", 0))
         self.log.append(tr)
 
 
