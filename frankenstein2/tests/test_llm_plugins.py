@@ -65,3 +65,29 @@ def test_qwen_round_trip_runs_tool_and_resumes():
 def test_qwen_history_markup_round_trips_through_the_parser():
     m = QwenLLM.call_markup("find_customer", {"full_name": "Mario Rossi", "postcode": "10121"})
     assert parse_calls(m) == [{"name": "find_customer", "arguments": {"full_name": "Mario Rossi", "postcode": "10121"}}]
+
+
+FORCED = ("<function=search_catalog>\n<parameter=query>\ndivano tre posti\n</parameter>\n</function>\n</tool_call>")
+
+
+def test_qwen_forces_the_call_a_turn_only_announced():
+    seen = []
+    proc = FakeQwenProc(["Cerco il divano a tre posti nel catalogo.", FORCED, "C'è il divano Fjordby."])
+    q = QwenLLM(proc, "s", "sys", [], {"search_catalog": lambda a: (seen.append(a), json.dumps({"ok": 1}))[1]}, "it")
+    q.submit(1, [{"role": "user", "content": "Avete divani a tre posti?"}])
+    evs = q.poll() + q.poll() + q.poll()
+    assert proc.sent[1]["assistant_prefix"] == "Cerco il divano a tre posti nel catalogo.\n<tool_call>\n"
+    assert seen == [{"query": "divano tre posti"}] and q.forced == 1
+    said = "".join(e["text"] for e in evs if e["ev"] == "text")
+    assert "<" not in said and said.endswith("C'è il divano Fjordby.")
+    hist = proc.sent[2]["messages"]
+    assert hist[-2]["role"] == "assistant" and hist[-2]["content"].startswith("Cerco il divano")
+    assert parse_calls(hist[-2]["content"]) == [{"name": "search_catalog", "arguments": {"query": "divano tre posti"}}]
+
+
+def test_qwen_does_not_force_a_plain_answer():
+    proc = FakeQwenProc(["Siamo aperti dalle nove alle diciannove."])
+    q = QwenLLM(proc, "s", "sys", [], {}, "it")
+    q.submit(1, [{"role": "user", "content": "Che orari fate?"}])
+    evs = q.poll()
+    assert [e["ev"] for e in evs][-1] == "done" and len(proc.sent) == 1 and q.forced == 0

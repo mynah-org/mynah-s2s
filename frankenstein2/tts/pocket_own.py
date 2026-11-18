@@ -29,6 +29,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..gpu import host
+
 REPLACE = {'"': '', '“': '', '”': '', '„': '', '«': '', '»': '', '’': "'", '‘': "'", '(': '', ')': '', '[': '',
            ']': '', '–': ','}
 LANG_OPTS = {"it": {"remove_semicolons": False}, "fr": {"remove_semicolons": True}, "en": {"remove_semicolons": False}}
@@ -691,7 +693,7 @@ class PocketBatch:
             noise = m._noise(B)
         lat = noise + m._flow_net(y, noise)
         mean, std = W["flow_lm.emb_mean"], W["flow_lm.emb_std"]
-        eos_l = eos.tolist()                                                         # the one host sync per frame
+        eos_l = host(eos)                                                            # the one host sync per frame
         out, dec = {}, []
         for i, (k, r) in enumerate(zip(keys, rows)):
             if eos_l[i] and r["eos"] is None and r["step"] >= MIN_FRAMES_BEFORE_EOS:

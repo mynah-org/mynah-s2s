@@ -65,6 +65,8 @@ def main():  # pragma: no cover - model process
             slots[c["ss"]] = eng.open()
         sid = slots[c["ss"]]
         ids = eng.chat_ids(c["messages"], c.get("tools"))
+        if c.get("assistant_prefix"):
+            ids = ids + eng.tok.encode(c["assistant_prefix"])
         t0 = time.monotonic()
         first, n = None, 0
         for ev in eng.generate(sid, ids, max_new=a.max_new, stop_flag=lambda: key in cancelled):

@@ -17,6 +17,7 @@ import time
 import numpy as np
 import torch
 
+from ..gpu import host, ready
 from .nemotron import HOP_LEN, NemotronASR
 from .rules import RulesState, Thresholds, energy_db
 
@@ -79,6 +80,13 @@ class OwnEars:
         self.free = list(range(slots))
         self.sess: dict = {}
         self._zero_l15: dict = {}
+        self.greedy_graphs = False                      # warm_greedy_graphs() turns the graph path on
+        self.prof = None                                # dict: per-phase GPU-synchronised times (lab profiling)
+
+    def warm_greedy_graphs(self) -> int:
+        n = self.asr.warm_greedy_graphs()
+        self.greedy_graphs = n > 0
+        return n
 
     # ------------------------------------------------------------------ sessions
     def open(self, sid, lang: str, thr: Thresholds | None = None) -> None:
@@ -108,14 +116,26 @@ class OwnEars:
                 s.gru_h = None
             s.win = np.concatenate([s.win, np.stack([u, a]).astype(np.float32)], 1)[:, -WINDOW:]
             s.buf = np.concatenate([s.buf, u.astype(np.float32)])
+        prof = self.prof
         hu, ha = self._windows(S)
+        if prof is not None:
+            torch.cuda.synchronize()
+            tw = time.monotonic()
+            prof.setdefault("win_ms", []).append((tw - t0) * 1e3)
         t_win = time.monotonic() - t0
         frames, events = self._gru(S, hu, ha, [x[1] for x in items])
         t1 = time.monotonic()
+        if prof is not None:
+            torch.cuda.synchronize()
+            t1 = time.monotonic()
+            prof.setdefault("gru_ms", []).append((t1 - tw) * 1e3)
         pieces = self._stream(S)
         if self.dev.type == "cuda":
-            torch.cuda.synchronize()
+            ready()
         t_asr = time.monotonic() - t1
+        if prof is not None:
+            prof.setdefault("asr_ms", []).append(t_asr * 1e3)
+            prof.setdefault("hop_ms", []).append((time.monotonic() - t0) * 1e3)
         out = []
         for i, s in enumerate(S):
             s.hops += 1
@@ -218,7 +238,7 @@ class OwnEars:
             act = torch.tensor([[max(-3.0, min(3.0, (d[j] + 50.0) / 25.0))] for d in dbs], device=self.dev)
             prev = torch.tensor([[s.rules.gru_prev_state()] for s in S], dtype=torch.long, device=self.dev)
             o, h2 = m(xu[:, j:j + 1], xa[:, j:j + 1], act, prev, h)
-            rows = o[:, 0].tolist()
+            rows = host(o[:, 0])
             for i, s in enumerate(S):
                 s.gru_h = h2[:, i:i + 1].contiguous()
                 evs, rst = s.rules.on_frame(rows[i], dbs[i][j], left=3 - j)
@@ -254,7 +274,8 @@ class OwnEars:
                 last = asr.stream_step(self.pool, slots, mel, first=first)
                 enc = asr.project(last, [S[i].prompt for i in grp])
                 sl = torch.tensor(slots, device=self.dev)
-                toks, d, h, c = asr.greedy(enc, self.pred["d"][sl], self.pred["h"][:, sl], self.pred["c"][:, sl])
+                greedy = asr.greedy_fast if self.greedy_graphs else asr.greedy
+                toks, d, h, c = greedy(enc, self.pred["d"][sl], self.pred["h"][:, sl], self.pred["c"][:, sl])
                 self.pred["d"][sl], self.pred["h"][:, sl], self.pred["c"][:, sl] = d, h, c
                 for j, i in enumerate(grp):
                     s = S[i]

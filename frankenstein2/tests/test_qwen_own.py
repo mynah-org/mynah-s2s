@@ -255,6 +255,7 @@ def tiny_engine(moe, nv):
     e.state = e.model.new_state(3, 256)
     e.scratch, e.max_len, e.free, e.sess, e.graphs, e.use_graphs = 2, 256, [0, 1], {}, {}, False
     e.prefill_chunk, e.use_mtp, e.mtp_stats, e.eos_ids = 1024, True, {"steps": 0, "accepted": 0}, [0]
+    e.prefixes, e.prefix_hits, e.live_hits, e.graphs_frozen, e.stream = [], 0, 0, False, None
     return e
 
 

@@ -29,6 +29,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..gpu import host
+
 SR = 16000
 N_FFT, WIN, HOP_LEN, N_MELS = 512, 400, 160, 128
 LOG_GUARD = 2.0 ** -24
@@ -337,10 +339,89 @@ class NemotronASR:
             d = torch.where(u, d2, d)
             h = torch.where(u[None], h2, h)
             c = torch.where(u[None], c2, c)
-            if (step + 1) % sync_every == 0 and bool((idx >= T).all()):
+            if (step + 1) % sync_every == 0 and bool(host((idx >= T).all())):
                 break
-        tk, fr, va = torch.stack(toks, 1).tolist(), torch.stack(frames, 1).tolist(), torch.stack(valid, 1).tolist()
+        tk, fr, va = host(torch.stack(toks, 1)), host(torch.stack(frames, 1)), host(torch.stack(valid, 1))
         return [[(fr[i][s], tk[i][s]) for s in range(len(tk[i])) if va[i][s]] for i in range(B)], d, h, c
+
+    # ---- greedy RNN-T as one CUDA graph per (row bucket, frames): the eager loop issues ~15 tiny kernels per step
+    # plus a host sync every 4 steps; next to another model's kernels on the GPU each of them waits its turn, so the
+    # loop's latency grows with contention. The graph runs the full T * (max_sym + 1) steps (the eager loop's extra
+    # steps after every row is done are no-ops: blank, no emit, state unchanged), one launch, one sync at the end.
+    GREEDY_B = (1, 2, 4, 8, 12, 16)
+
+    def _greedy_steps(self, enc, d, h, c, steps):
+        W = self.W
+        B, T, _ = enc.shape
+        ar = torch.arange(B, device=self.dev)
+        idx = torch.zeros(B, dtype=torch.long, device=self.dev)
+        sym = torch.zeros(B, dtype=torch.long, device=self.dev)
+        toks, frames, valid = [], [], []
+        for _ in range(steps):
+            done = idx >= T
+            e = enc[ar, idx.clamp(max=T - 1)]
+            tok = F.linear(F.relu(e + d), W["joint.head.weight"], W["joint.head.bias"]).argmax(-1)
+            is_blank = (tok == self.blank) | done
+            emit = ~is_blank
+            toks.append(tok)
+            frames.append(idx)
+            valid.append(emit)
+            sym = torch.where(is_blank, torch.zeros_like(sym), sym + 1)
+            force = sym >= self.max_sym
+            idx = idx + (is_blank | force).long()
+            sym = torch.where(force, torch.zeros_like(sym), sym)
+            d2, h2, c2 = self._lstm(W["decoder.embedding.weight"][tok], h, c)
+            u = emit[:, None]
+            d = torch.where(u, d2, d)
+            h = torch.where(u[None], h2, h)
+            c = torch.where(u[None], c2, c)
+        return torch.stack(toks, 1), torch.stack(frames, 1), torch.stack(valid, 1), d, h, c
+
+    def warm_greedy_graphs(self, frames=(3, 4)) -> int:
+        """Capture the greedy graphs for every row bucket and the given chunk lengths (call before other threads use
+        the GPU: a capture fails if another thread synchronises meanwhile)."""
+        self._gg = getattr(self, "_gg", {})
+        n = 0
+        for T in frames:
+            for B in self.GREEDY_B:
+                key = (B, T)
+                if key in self._gg:
+                    continue
+                d0, h0, c0 = self.pred_start(B)
+                g = {"enc": torch.zeros(B, T, self.W["joint.head.weight"].shape[1], device=self.dev,
+                                        dtype=self.W["joint.head.weight"].dtype),
+                     "d": d0.clone(), "h": h0.clone(), "c": c0.clone()}
+                run = lambda g=g, T=T: self._greedy_steps(g["enc"], g["d"], g["h"], g["c"],   # noqa: E731
+                                                          T * (self.max_sym + 1))
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    run()
+                torch.cuda.current_stream().wait_stream(side)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                    g["out"] = run()
+                g["graph"] = graph
+                self._gg[key] = g
+                n += 1
+        return n
+
+    def greedy_fast(self, enc, d, h, c):
+        """greedy() through a captured graph when one fits (same results), else the eager loop."""
+        B, T, _ = enc.shape
+        gg = getattr(self, "_gg", {})
+        Bb = next((x for x in self.GREEDY_B if x >= B), None)
+        g = gg.get((Bb, T)) if Bb is not None else None
+        if g is None:
+            return self.greedy(enc, d, h, c)
+        g["enc"].zero_()
+        g["enc"][:B] = enc
+        g["d"][:B], g["h"][:, :B], g["c"][:, :B] = d, h, c
+        g["graph"].replay()
+        tk, fr, va, d2, h2, c2 = g["out"]
+        tk, fr, va = tk[:B].tolist(), fr[:B].tolist(), va[:B].tolist()
+        out = [[(fr[i][s], tk[i][s]) for s in range(len(tk[i])) if va[i][s]] for i in range(B)]
+        return out, d2[:B].clone(), h2[:, :B].clone(), c2[:, :B].clone()
 
     def pieces(self, ids: list) -> list:
         return [self.tokenizer.id_to_token(i) for i in ids]

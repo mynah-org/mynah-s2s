@@ -40,6 +40,24 @@ def parse_calls(raw: str) -> list:
     return out
 
 
+# Tool-call forcing: a turn that ends saying it is searching / checking, without a call, is continued in the same
+# assistant turn with "<tool_call>" already written, so the model has to complete the call it announced (the MoE
+# narrated "Cerco il divano ..." and stopped in the f2c_025 gate, despite the tool rule in the system prompt).
+NARRATES = {
+    "it": re.compile(r"\b(cerco|controllo|verifico|sto cercando|sto controllando|vado a (cercare|controllare|vedere)|"
+                     r"lasci[ao] che (controlli|verifichi|cerchi)|un (attimo|momento)|attend[ai])\b", re.I),
+    "fr": re.compile(r"\b(je (vais )?(vérifie|vérifier|cherche|chercher|regarde|regarder|consulte)|un instant|"
+                     r"un moment|je recherche)\b", re.I),
+    "en": re.compile(r"\b(let me (check|look|search|find)|one moment|i('ll| will) (check|look|search)|i'm (checking|"
+                     r"searching|looking)|checking|searching|looking (it |that )?up)\b", re.I),
+}
+FORCE_PREFIX = "\n<tool_call>\n"
+
+
+def narrates_lookup(text: str, lang: str) -> bool:
+    return bool(NARRATES.get(lang, NARRATES["en"]).search(text or ""))
+
+
 class SpeechSplitter:
     """Streaming text -> (speakable deltas, call markup). Text after ``<tool_call>`` is never spoken; a partial tag
     at the end is held back until it is decided."""
@@ -81,13 +99,18 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
         self.tools = wrap_tools(bound, lang, self.record, user_texts=user_texts or (
             lambda: [m["content"] for m in self.last_msgs if m.get("role") == "user"]))
         self.max_rounds = max_rounds
+        self.force_calls = True
+        self.forced = 0
         self.jobs: dict = {}
         self.out: list = []
         self.calls: list = []
 
-    def _gen(self, rid, msgs):
-        self.p.send({"op": "gen", "ss": self.ss, "rid": rid, "tools": self.schemas,
-                     "messages": [{"role": "system", "content": self.system}] + msgs})
+    def _gen(self, rid, msgs, assistant_prefix=None):
+        m = {"op": "gen", "ss": self.ss, "rid": rid, "tools": self.schemas,
+             "messages": [{"role": "system", "content": self.system}] + msgs}
+        if assistant_prefix:
+            m["assistant_prefix"] = assistant_prefix
+        self.p.send(m)
 
     @staticmethod
     def call_markup(name: str, args: dict) -> str:
@@ -123,8 +146,26 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
             elif m["ev"] == "end":
                 sp = j["split"]
                 calls = parse_calls(sp.call) if sp.in_call else []
+                if (not calls and self.force_calls and not j.get("forced") and j["round"] < self.max_rounds
+                        and not m.get("cancelled") and narrates_lookup(j["text"] + sp.buf, self.lang)):
+                    j["forced"] = True                  # once per request: continue the turn with the call opened
+                    self.forced += 1
+                    rest = sp.flush()
+                    if rest:
+                        j["text"] += rest
+                        out.append({"ev": "text", "rid": rid, "text": rest})
+                    j["said_before_call"] = j["text"]
+                    sp2 = SpeechSplitter()
+                    sp2.in_call, sp2.call = True, FORCE_PREFIX.lstrip("\n")
+                    j["split"] = sp2
+                    if not j["decided"]:
+                        j["decided"] = True
+                        out.append({"ev": "decided", "rid": rid})
+                    self._gen(rid, j["msgs"] + [], assistant_prefix=j["text"] + FORCE_PREFIX)
+                    continue
                 if calls and j["round"] < self.max_rounds:
-                    j["msgs"].append({"role": "assistant", "content": sp.call})
+                    j["msgs"].append({"role": "assistant", "content": (j.pop("said_before_call", "") + "\n" + sp.call)
+                                      .lstrip("\n")})
                     for c in calls:
                         res = self.tools[c["name"]](c["arguments"]) if c["name"] in self.tools else \
                             json.dumps({"error": f"unknown tool {c['name']}"})

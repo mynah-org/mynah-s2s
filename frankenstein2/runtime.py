@@ -23,6 +23,8 @@ import threading
 import time
 from collections import deque
 
+from .gpu import host
+
 
 class _Boxes:
     def __init__(self):
@@ -315,6 +317,8 @@ class InProcLLM:
             if ss not in self.slots:
                 self.slots[ss] = self.eng.open()
             ids = self.eng.chat_ids(m["messages"], m.get("tools"))
+            if m.get("assistant_prefix"):             # continue an assistant turn from forced text (tool-call forcing)
+                ids = ids + self.eng.tok.encode(m["assistant_prefix"])
             msgs = m["messages"]
             if msgs and msgs[0].get("role") == "system" and hasattr(self.eng, "add_prefix"):
                 key = (msgs[0].get("content"), repr(m.get("tools")))
@@ -361,7 +365,7 @@ class InProcLLM:
         if self.active and (not self.wait_q or self.turn % 2 == 0):
             keys = list(self.active)
             logits = self.eng.decode_batch([self.active[k]["slot"] for k in keys], [self.active[k]["next"] for k in keys])
-            toks = torch.argmax(logits, -1).tolist()
+            toks = host(torch.argmax(logits, -1))
             for k, t in zip(keys, toks):
                 self._emit(k, t)
             return True
@@ -380,7 +384,7 @@ class InProcLLM:
                                                              "after_tool": r.get("after_tool"),
                                                              "queue_ms": round((r["t_pf"] - r["t0"]) * 1e3, 1),
                                                              "prefill_ms": round((time.monotonic() - r["t_pf"]) * 1e3, 1)}}
-                self._emit(key, int(out.argmax()))
+                self._emit(key, int(host(out.argmax())))
             return True
         return False
 
