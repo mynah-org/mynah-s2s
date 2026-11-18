@@ -364,6 +364,8 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--session-voice", default="")
     ap.add_argument("--warm-llm", action="store_true", help="one request through the LLM before the arms")
     ap.add_argument("--ws-phases", action="store_true", help="after the arms: concurrent WebSocket sessions")
+    ap.add_argument("--llm-thread", default="on", choices=["on", "off"],
+                    help="one-process runtime: the LLM on its own thread and CUDA stream (on) or on the scheduler thread")
     ap.add_argument("--ws-reactive", action="store_true", help="N-session phase: each client waits for the agent")
     ap.add_argument("--ws-n", type=int, default=0, help="one phase of N concurrent sessions instead of phases 1-2")
     ap.add_argument("--content", action="store_true")

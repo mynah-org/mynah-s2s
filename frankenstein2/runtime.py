@@ -667,7 +667,7 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
             return q, {"load_s": round(time.monotonic() - t0, 1), **q.footprint(), **sched.mem(), "rss_peak_gb": rss()}
         q, ready["llm"] = sched.call(load_llm, timeout=1800)
         inner = InProcLLM(sched, q)
-        if getattr(a, "llm_thread", True):
+        if str(getattr(a, "llm_thread", "on")) != "off":
             t0 = time.monotonic()
             n = sched.call(lambda: q.warm_graphs(), timeout=1800)     # all captures before any session runs
             ready["llm"].update(graphs_captured=n, graphs_s=round(time.monotonic() - t0, 1))
