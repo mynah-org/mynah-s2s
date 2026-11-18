@@ -100,11 +100,14 @@ class RulesState:
     sil_run: int = 0                 # listen mode: unvoiced frames since the user's last voiced frame
     floor_db: float = -70.0          # tracked noise floor of the mic (slow up, fast down)
 
-    def reset(self) -> None:
-        """A new turn (Tyger: Conversation resets the session at a turn end and after a barge)."""
+    def reset(self, keep_turn: bool = False) -> None:
+        """A new turn (Tyger: Conversation resets the session at a turn end and after a barge). keep_turn: the user's
+        turn is still open (the controller cancelled a reply because the user went on speaking): the next silence
+        must end it, even when the continuation was already over by the time the reset arrived (else no endpoint
+        ever fires and the turn waits for the user's next utterance)."""
         self.prev_state = SPEAK if self.mode == "speaking" else LISTEN
         self.warm = self.ep_run = self.yield_run = self.bc_run = self.bc_cooldown = 0
-        self.voiced_ms, self.in_turn = 0.0, False
+        self.voiced_ms, self.in_turn = (MIN_SPEECH_MS, True) if keep_turn else (0.0, False)
         self.talk_frames = self.quiet_frames = 0
         self.sil_run = 0
 

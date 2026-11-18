@@ -310,7 +310,7 @@ class Pipeline:
             if n:
                 self.tr.emit("asr.drop", k, pieces_dropped=n, why="spoken_over_agent")
         elif a.kind == "EARS_RESET":
-            self.ears.request_reset()
+            self.ears.request_reset(keep_turn=a.reason == "user_continues")
             self.tr.emit("ears.reset", k, reason=a.reason)
 
     def _check_played_out(self, k: int) -> None:

@@ -195,7 +195,7 @@ class EarsSession:
 
     def begin(self, mode: str, reset: bool) -> None:
         if reset:
-            self.rules.reset()
+            self.rules.reset(keep_turn=reset == "turn")
             self.gru.reset()
         if self.rules.switch_mode(mode):
             self.gru.reset()

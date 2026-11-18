@@ -100,3 +100,16 @@ def test_noise_floor_raises_the_voiced_threshold_on_a_noisy_line():
     for _ in range(800):
         r.on_frame(out(), -40.0)            # a steady -40 dB line noise for 64 s
     assert r.floor_db > -50 and not r.voiced(-40.0) and r.voiced(-20.0)
+
+
+def test_reset_keeping_the_turn_still_ends_it_in_silence():
+    # the controller cancelled a reply because the user went on speaking, but the continuation was over by the time
+    # the reset arrived: the turn must still end on the following silence (f2c_032: it waited 25 s for the next
+    # utterance)
+    r = RulesState()
+    run(r, [(out(), SPEECH)] * 10 + [(out(0.95), SIL)] * 3)
+    r.reset(keep_turn=True)
+    eps = [e for e in run(r, [(out(0.95), SIL)] * 12) if e["kind"] == "ENDPOINT"]
+    assert len(eps) == 1
+    r.reset()
+    assert not [e for e in run(r, [(out(0.95), SIL)] * 30) if e["kind"] == "ENDPOINT"]

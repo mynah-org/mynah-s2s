@@ -112,7 +112,7 @@ def main():  # pragma: no cover - model process
                 try:
                     with torch.inference_mode():
                         rs = hop_batch([(sessions[x["sid"]], b64f32(x["u"]), b64f32(x["a"]), x["mode"],
-                                         bool(x.get("reset"))) for x in batch])
+                                         (x.get("reset") or False)) for x in batch])
                     for x, r in zip(batch, rs):
                         st = stats[x["sid"]]
                         st["hops"] += 1
@@ -143,7 +143,7 @@ def main():  # pragma: no cover - model process
             elif op == "hop":
                 sid = c["sid"]
                 with torch.inference_mode():
-                    r = sessions[sid].hop(b64f32(c["u"]), b64f32(c["a"]), c["mode"], bool(c.get("reset")))
+                    r = sessions[sid].hop(b64f32(c["u"]), b64f32(c["a"]), c["mode"], (c.get("reset") or False))
                 st = stats[sid]
                 st["hops"] += 1
                 for key in ("ms", "enc_ms", "win_ms"):

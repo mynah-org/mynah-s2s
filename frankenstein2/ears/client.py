@@ -95,8 +95,9 @@ class EarsLink:
     def close(self) -> None:
         self.b.send({"op": "close", "sid": self.sid})
 
-    def request_reset(self) -> None:
-        self.reset_next = True
+    def request_reset(self, keep_turn: bool = False) -> None:
+        """keep_turn: the user's turn stays open after the reset ("turn"), see RulesState.reset."""
+        self.reset_next = "turn" if keep_turn else True
 
     def push(self, user_step, agent_step, mode: str) -> None:
         """One 80 ms step of both channels (16 kHz float). ``mode`` is the controller's mode at this step; a hop

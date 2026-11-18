@@ -110,7 +110,7 @@ class OwnEars:
         S = [self.sess[x[0]] for x in items]
         for s, (sid, u, a, mode, reset) in zip(S, items):
             if reset:
-                s.rules.reset()
+                s.rules.reset(keep_turn=reset == "turn")
                 s.gru_h = None
             if s.rules.switch_mode(mode):
                 s.gru_h = None

@@ -140,7 +140,7 @@ class InProcEars:
             items, self.pending = list(self.pending.values()), {}
         if not items:
             return False
-        res = self.e.hop([(m["sid"], m["u"], m["a"], m["mode"], bool(m.get("reset"))) for m in items])
+        res = self.e.hop([(m["sid"], m["u"], m["a"], m["mode"], (m.get("reset") or False)) for m in items])
         self.e.batch_sizes = getattr(self.e, "batch_sizes", []) + [len(items)]
         for m, r in zip(items, res):
             self.box.put(m["sid"], {"ev": "hop", "sid": m["sid"], "n": m["n"], "t_ns": time.monotonic_ns(), **r})
