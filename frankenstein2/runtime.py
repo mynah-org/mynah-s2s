@@ -285,6 +285,7 @@ class InProcLLM:
         self.lock = threading.Lock()
         self.turn = 0
         self.prefix_keys: set = set()
+        self.log: list = []
 
     def send(self, m):
         op = m.get("op")
@@ -327,10 +328,28 @@ class InProcLLM:
                 del self.active[k]
             self.wait_q = deque(r for r in self.wait_q if r["ss"] != ss)
             self.wait_max = max(getattr(self, "wait_max", 0), len(self.wait_q) + 1)
-            self.wait_q.append({"ss": ss, "rid": m["rid"], "ids": ids, "slot": self.slots[ss], "begun": False,
-                                "t0": time.monotonic()})
+            req = {"ss": ss, "rid": m["rid"], "ids": ids, "slot": self.slots[ss], "begun": False,
+                   "t0": time.monotonic(), "after_tool": bool(msgs) and msgs[-1].get("role") == "tool"}
+            if req["after_tool"]:          # a reply after a tool result goes first: its caller is already waiting
+                pos = next((i for i, r in enumerate(self.wait_q) if not r["begun"] and not r.get("after_tool")),
+                           len(self.wait_q))
+                self.wait_q.insert(pos, req)
+            else:
+                self.wait_q.append(req)
 
-    def run(self) -> bool:
+    def run(self, budget_ms: float = 0.0, stop=None) -> bool:
+        """One LLM action (a batched decode step or one prefill chunk); with a budget, keep going until it is spent
+        or ``stop()`` says another component is due (the ears' cohort): decode needs many short steps and taking only
+        one per scheduler round left the GPU idle between rounds."""
+        t_end = time.monotonic() + budget_ms / 1e3
+        did = False
+        while self._run_one():
+            did = True
+            if time.monotonic() >= t_end or (stop is not None and stop()):
+                break
+        return did
+
+    def _run_one(self) -> bool:
         import torch
         with self.lock:
             cancelled = set(self.cancelled)
@@ -349,14 +368,18 @@ class InProcLLM:
         if self.wait_q:
             r = self.wait_q[0]
             if not r["begun"]:
-                self.eng.prefill_begin(r["slot"], r["ids"])
+                r["n_prefill"] = self.eng.prefill_begin(r["slot"], r["ids"])
                 r["begun"] = True
+                r["t_pf"] = time.monotonic()
             out = self.eng.prefill_step(r["slot"], self.chunk)
             if out is not None:
                 self.wait_q.popleft()
                 key = (r["ss"], r["rid"])
                 self.active[key] = {"slot": r["slot"], "out": [], "text": "", "sent": 0, "next": None, "n": 0,
-                                    "t0": r["t0"]}
+                                    "t0": r["t0"], "trace": {"n_prompt": len(r["ids"]), "n_prefill": r.get("n_prefill"),
+                                                             "after_tool": r.get("after_tool"),
+                                                             "queue_ms": round((r["t_pf"] - r["t0"]) * 1e3, 1),
+                                                             "prefill_ms": round((time.monotonic() - r["t_pf"]) * 1e3, 1)}}
                 self._emit(key, int(out.argmax()))
             return True
         return False
@@ -366,6 +389,7 @@ class InProcLLM:
         if a["n"] == 0:
             a["first_ms"] = round((time.monotonic() - a["t0"]) * 1e3, 1)
         if tok in set(self.eng.eos_ids) or a["n"] >= self.max_new:
+            self._log_end(a, "eos")
             self.box.put(key[0], {"ev": "end", "ss": key[0], "rid": key[1], "n": a["n"], "first_ms": a.get("first_ms")})
             del self.active[key]
             return
@@ -377,13 +401,108 @@ class InProcLLM:
             self.box.put(key[0], {"ev": "delta", "ss": key[0], "rid": key[1], "text": text[a["sent"]:]})
             a["sent"] = len(text)
         if "</tool_call>" in text:
+            self._log_end(a, "call")
             self.box.put(key[0], {"ev": "end", "ss": key[0], "rid": key[1], "n": a["n"], "first_ms": a.get("first_ms")})
             del self.active[key]
 
+    def _log_end(self, a, kind):
+        """Per-request timeline (submitted -> prefill start -> first token -> end), for the scheduler summary."""
+        tr = dict(a.get("trace", {}))
+        tr.update(kind=kind, first_ms=a.get("first_ms"), total_ms=round((time.monotonic() - a["t0"]) * 1e3, 1),
+                  n_tok=a["n"])
+        self.log.append(tr)
+
+
+def _req_stats(log):
+    import numpy as np
+    out = {}
+    for kind, sel in (("call", lambda r: r.get("kind") == "call"),
+                      ("reply_after_tool", lambda r: r.get("kind") == "eos" and r.get("after_tool")),
+                      ("reply", lambda r: r.get("kind") == "eos" and not r.get("after_tool"))):
+        rs = [r for r in log if sel(r)]
+        if not rs:
+            continue
+        d = {"n": len(rs)}
+        for f in ("queue_ms", "prefill_ms", "first_ms", "total_ms", "n_prefill", "n_tok"):
+            v = [r[f] for r in rs if r.get(f) is not None]
+            if v:
+                d[f] = {"p50": round(float(np.percentile(v, 50)), 1), "p95": round(float(np.percentile(v, 95)), 1)}
+        out[kind] = d
+    return out
+
+
+class ThreadedLLM(threading.Thread):
+    """The LLM part of the one-process engine on its own thread and CUDA stream: requests and cancels go to its queue,
+    it runs batched decode steps (CUDA graphs) and prefill chunks back to back. Ears and talker keep the scheduler
+    thread and the default stream; the GPU interleaves both streams, so decode fills the gaps the ears' host-side
+    work leaves (with one thread the LLM got a step only every few hundred ms under 10 sessions). Same process, same
+    weights, same per-session isolation; the scheduler still owns ears and talker deadlines."""
+    def __init__(self, inner: "InProcLLM", budget_ms: float = 25.0):
+        import torch
+        self.__dict__["inner"] = inner
+        super().__init__(daemon=True, name="f2-llm")
+        self.budget_ms = budget_ms
+        self.q: queue.Queue = queue.Queue()
+        self.ev = threading.Event()
+        # own stream, default priority: stream priorities (ears high, LLM low) were tried on GB10 and made the ears'
+        # rounds slower, not faster
+        self.stream = torch.cuda.Stream()
+        self.stop_flag = False
+        self.err = None
+        self.busy_s = 0.0
+
+    def __getattr__(self, k):              # log, wait_max, slots, box, ... of the wrapped InProcLLM
+        inner = self.__dict__.get("inner")
+        if inner is None:
+            raise AttributeError(k)
+        return getattr(inner, k)
+
+    def send(self, m):
+        if m.get("op") == "cancel":
+            with self.inner.lock:
+                self.inner.cancelled.add((m["ss"], m["rid"]))
+        else:
+            self.q.put(m)
+        self.ev.set()
+
+    def control(self, m):
+        self.q.put(m)
+        self.ev.set()
+
+    def poll(self, ss):
+        return self.inner.poll(ss)
+
+    def close(self):
+        self.stop_flag = True
+        self.ev.set()
+
+    def run(self, *args, **kw):            # Thread.run: the worker loop (the scheduler never calls this)
+        import torch
+        with torch.inference_mode(), torch.cuda.stream(self.stream):
+            while not self.stop_flag:
+                try:
+                    while True:
+                        try:
+                            self.inner.control(self.q.get_nowait())
+                        except queue.Empty:
+                            break
+                    t = time.monotonic()
+                    did = self.inner.run(self.budget_ms)
+                    if did:
+                        self.busy_s += time.monotonic() - t
+                    else:
+                        self.ev.wait(0.004)
+                        self.ev.clear()
+                except Exception as e:  # noqa: BLE001 - keep the LLM thread alive, report
+                    import traceback
+                    traceback.print_exc()
+                    self.err = repr(e)
+
 
 class Scheduler(threading.Thread):
-    def __init__(self, talker_budget_ms: float = 40.0):
+    def __init__(self, talker_budget_ms: float = 40.0, llm_budget_ms: float = 60.0):
         super().__init__(daemon=True, name="f2-gpu")
+        self.llm_budget_ms = llm_budget_ms
         self.inbox: queue.Queue = queue.Queue()
         self.cv = threading.Event()
         self.ears = self.talker = self.llm = None
@@ -411,7 +530,9 @@ class Scheduler(threading.Thread):
                 "llm_ms": pc(self.stats["llm_ms"]), "idle_s": round(self.stats.get("idle_s", 0.0), 1),
                 "ctl": {k: {"n": len(v), "sum_s": round(sum(v) / 1e3, 2), "max_ms": round(max(v), 1)}
                         for k, v in self.stats.items() if k.startswith("ctl_")},
-                "llm_wait_q_max": getattr(self.llm, "wait_max", None), "ears_batch": pc(getattr(e, "batch_sizes", [])), "error": self.err,
+                "llm_wait_q_max": getattr(self.llm, "wait_max", None),
+                "llm_thread_busy_s": round(getattr(self.llm, "busy_s", 0.0), 1) if isinstance(self.llm, ThreadedLLM) else None,
+                "llm_requests": _req_stats(getattr(self.llm, "log", [])), "ears_batch": pc(getattr(e, "batch_sizes", [])), "error": self.err,
                 **self.mem()}
 
     def mem(self) -> dict:
@@ -472,7 +593,8 @@ class Scheduler(threading.Thread):
                     if self.ears is not None and self.ears.due():
                         continue                              # a cohort of hops is due: ears first
                     t = time.monotonic()
-                    if self.llm is not None and self.llm.run():
+                    if (self.llm is not None and not isinstance(self.llm, ThreadedLLM)
+                            and self.llm.run(self.llm_budget_ms, stop=self.ears.due if self.ears else None)):
                         self.stats["llm"] += 1
                         self.stats["llm_ms"].append((time.monotonic() - t) * 1e3)
                         did = True
@@ -544,7 +666,16 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
             q = QwenOwn(a.qwen_model, device=dev, mode=a.qwen_mode, slots=max(slots, int(getattr(a, "qwen_slots", 0))), max_len=getattr(a, "qwen_max_len", 8192))
             return q, {"load_s": round(time.monotonic() - t0, 1), **q.footprint(), **sched.mem(), "rss_peak_gb": rss()}
         q, ready["llm"] = sched.call(load_llm, timeout=1800)
-        llm = InProcLLM(sched, q)
+        inner = InProcLLM(sched, q)
+        if getattr(a, "llm_thread", True):
+            t0 = time.monotonic()
+            n = sched.call(lambda: q.warm_graphs(), timeout=1800)     # all captures before any session runs
+            ready["llm"].update(graphs_captured=n, graphs_s=round(time.monotonic() - t0, 1))
+            llm = ThreadedLLM(inner)
+            q.stream = llm.stream          # all of qwen_own's GPU work on the LLM's own stream
+            llm.start()
+        else:
+            llm = inner
         llm.ready = {"ev": "ready", **ready["llm"]}
         sched.llm = llm
     talker.ready = {"ev": "ready", "inproc": True}

@@ -65,12 +65,14 @@ class QwenOwn:
         self.free = list(range(slots))
         self.graphs: dict = {}
         self.use_graphs = graphs and self.device.type == "cuda"
+        self.graphs_frozen = False
         self.prefill_chunk = 1024
         self.use_mtp = mtp
         self.mtp_stats = {"steps": 0, "accepted": 0}
         self.sess: dict = {}
         self.prefixes: list = []
         self.prefix_hits = 0
+        self.live_hits = 0
         self.mode = mode
         im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
         self.eos_ids = sorted({*self.cfg.eos_ids, *([im_end] if isinstance(im_end, int) else [])})
@@ -180,7 +182,15 @@ class QwenOwn:
         if len(ids) > self.max_len:
             raise ValueError("prompt longer than max_len")
         start = 0
-        if se["snap"] is not None and ids[:se["snap"]["n"]] == se["ids"][:se["snap"]["n"]] and len(ids) > se["snap"]["n"]:
+        live = len(se["ids"])
+        mtp_on = self.model.mtp is not None and self.use_mtp
+        if live and not mtp_on and "pending" not in se and len(ids) > live and ids[:live] == se["ids"]:
+            # continue from the live state: the new prompt extends everything this session has already fed (its last
+            # prompt + the tokens it generated, e.g. a tool call); only the new part (the tool result) is prefilled,
+            # as one continuation (VoiceChat V2's "fast phase 2" idea, here without re-feeding the call tokens)
+            start = live
+            self.live_hits += 1
+        elif se["snap"] is not None and ids[:se["snap"]["n"]] == se["ids"][:se["snap"]["n"]] and len(ids) > se["snap"]["n"]:
             start = self._restore(s)
         else:
             self._zero(s)
@@ -231,9 +241,13 @@ class QwenOwn:
         cur = [len(self.sess[s]["ids"]) for s in sessions]
         L = next((x for x in self.GRAPH_L if x >= max(cur) + 1), self.max_len)
         L = min(L, self.max_len)
+        g = None
         if self.use_graphs and B <= self.GRAPH_B[-1]:
             Bg = next(x for x in self.GRAPH_B if x >= B)
-            g = self.graphs.get((Bg, L)) or self._capture(Bg, L)
+            g = self.graphs.get((Bg, L))
+            if g is None and not self.graphs_frozen:
+                g = self._capture(Bg, L)
+        if g is not None:
             g["ids"][:B, 0] = torch.tensor(tokens, device=dev)
             g["pos"][:B, 0] = torch.tensor(cur, device=dev)
             g["lens"][:B] = g["pos"][:B, 0] + 1
@@ -249,6 +263,21 @@ class QwenOwn:
             self.sess[s]["ids"].append(t)
         return logits
 
+    def warm_graphs(self, max_len: int | None = None) -> int:
+        """Capture every decode graph (batch bucket x cache-length bucket up to max_len) now, then freeze: a missing
+        bucket later runs eager instead of being captured. In the one-process engine other threads use the GPU while
+        the LLM decodes, and a capture during their work fails (a device sync is not allowed while a stream
+        captures), so all captures happen before the sessions start."""
+        top = min(max_len or self.max_len, self.max_len)
+        n = 0
+        for L in [x for x in self.GRAPH_L if x <= top] + ([top] if top not in self.GRAPH_L else []):
+            for B in self.GRAPH_B:
+                if (B, L) not in self.graphs:
+                    self._capture(B, L)
+                    n += 1
+        self.graphs_frozen = True
+        return n
+
     def _capture(self, B, L):
         dev = self.device
         g = {"ids": torch.zeros(B, 1, dtype=torch.long, device=dev), "pos": torch.zeros(B, 1, dtype=torch.long, device=dev),
@@ -263,7 +292,7 @@ class QwenOwn:
                 run()
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.graphs.get("pool")):
+        with torch.cuda.graph(graph, pool=self.graphs.get("pool"), capture_error_mode="thread_local"):
             g["out"] = run()
         self.graphs.setdefault("pool", graph.pool())
         g["graph"] = graph
@@ -328,7 +357,7 @@ class QwenOwn:
                 run()
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.graphs.get("pool")):
+        with torch.cuda.graph(graph, pool=self.graphs.get("pool"), capture_error_mode="thread_local"):
             g["out"] = run()
         self.graphs.setdefault("pool", graph.pool())
         g["graph"] = graph
