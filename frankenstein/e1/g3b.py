@@ -308,6 +308,10 @@ def main():  # pragma: no cover - GPU
             res["talker_content"] = {"error": repr(e)[:300]}
         if a.talker_session == "auto":
             ok = res.get("stepgraph_vs_eagerstatic", {}).get("identical") == len(tv.get("stepgraph", {}).get("codes", [1]))
+            # G9: the static-cache step graph was consistent but SLOWER than the dynamic cache + code-predictor graph
+            # (attention over the whole static buffer); it only wins if it is also faster
+            ok = ok and (tv.get("stepgraph", {}).get("step_ms_mean") or 1e9) < (tv.get("cpgraph", {}).get("step_ms_mean")
+                                                                              or 0)
             a.talker_session = "stepgraph" if ok else "cpgraph"
         res["talker_session"] = a.talker_session
         for v in tv.values():
