@@ -50,6 +50,12 @@ The current custom bundle has the following verified results:
 - GPU specialized tests: `5 passed`, including dense/grouped ConvTranspose,
   RNNT fused B=4, MoG, RVQ, pointwise and depthwise paths.
 
+For quality experiments, the dynamic path also supports a protected W8A16
+profile. Run with `--int8 --int8-protected`; it keeps the Thinker text and
+function heads in BF16 while retaining the Q8 weight-only paths elsewhere.
+This is intentionally not supported by the existing offline bundle yet, and
+does not change the default Q8 behavior.
+
 The offline bundle is also wired into the real multi-session runner. Use one
 switch; the runner loads one model, opens all sessions, and batches Thinker,
 perception, codec, and EarTTS work where possible:

@@ -149,6 +149,8 @@ def main():
                     "e.g. fc_ctx_fix")
     ap.add_argument("--int8", action="store_true", default=os.environ.get("MYNAH_INT8", "").lower() in {"1", "true", "yes", "on"},
                     help="enable the complete runtime Q8 path, including specialized batched-safe kernels")
+    ap.add_argument("--int8-protected", action="store_true", default=os.environ.get("MYNAH_INT8_PROTECTED", "").lower() in {"1", "true", "yes", "on"},
+                    help="EXPERIMENT: dynamic W8A16 with Thinker text/function heads left in BF16")
     ap.add_argument("--int8-pack", default=os.environ.get("MYNAH_INT8_PACK"),
                     help="load one offline Q8 .safetensors bundle and enable its complete runtime path")
     ap.add_argument("--breakdown", action=argparse.BooleanOptionalAction, default=None,
@@ -219,6 +221,8 @@ def main():
         raise SystemExit("use only one of --int8 and --int8-pack")
     if a.int8_pack:
         a.int8 = True
+    if a.int8_protected and a.int8_pack:
+        raise SystemExit("--int8-protected is currently supported only for the dynamic Q8 path")
     if a.int8:
         # The offline bundle and the dynamic Q8 path already replace these
         # Thinker linears.  Leaving the profile's legacy experiment in place
@@ -244,7 +248,7 @@ def main():
             from mynah_v2.model.eartts_q8 import quantize_eartts_w8
             from mynah_v2.model.quant import quantize_extended_w8, quantize_thinker_w8
             q8_info = {
-                "thinker": quantize_thinker_w8(eng, include_heads=True),
+                "thinker": quantize_thinker_w8(eng, include_heads=not a.int8_protected),
                 "eartts": quantize_eartts_w8(eng),
                 "extended": quantize_extended_w8(eng),
             }
