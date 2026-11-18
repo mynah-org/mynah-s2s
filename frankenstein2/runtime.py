@@ -632,8 +632,11 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
     def load_ears():
         from .ears.own import OwnEars
         t0 = time.monotonic()
-        e = OwnEars(a.ears_bundle, device=dev, slots=slots)
-        return e, {"load_s": round(time.monotonic() - t0, 1), **sched.mem(), "rss_peak_gb": rss()}
+        e = OwnEars(a.ears_bundle, device=dev, slots=slots, window_precision=getattr(a, "ears_window", "bf16"))
+        t1 = time.monotonic()
+        ng = e.warm_window_graphs(2 * slots) if str(getattr(a, "ears_graphs", "off")) == "on" else 0
+        return e, {"load_s": round(time.monotonic() - t0, 1), "window_graphs": ng,
+                   "window_graphs_s": round(time.monotonic() - t1, 1), **sched.mem(), "rss_peak_gb": rss()}
     ears_m, ready["ears"] = sched.call(load_ears)
     ears = InProcEars(ears_m, sched)
     ears.ready = {"ev": "ready", **ready["ears"]}
@@ -650,7 +653,8 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
                       or sorted(root.parent.glob(f"*/languages/{LANGS[lang]}/model.safetensors"))))
         tk = sorted(Path(a.pocket_tokenizers).glob(f"*/languages/{LANGS[lang]}/tokenizer.json")) or \
             sorted(Path(a.pocket_tokenizers).glob(f"languages/{LANGS[lang]}/tokenizer.json"))
-        return PocketOwn(w, tk[0], lang=lang, device=getattr(a, "talker_device", "cuda"))
+        dt = {"bf16": torch.bfloat16, "fp32": torch.float32}[getattr(a, "pocket_dtype", "bf16")]
+        return PocketOwn(w, tk[0], lang=lang, device=getattr(a, "talker_device", "cuda"), dtype=dt)
     vs = dict(x.split("=", 1) for x in getattr(a, "voice", []) or [])
     talker = InProcTalker(sched, make_pocket, slots=slots, default_voice=next(iter(vs.values()), ""))
     sched.talker = talker

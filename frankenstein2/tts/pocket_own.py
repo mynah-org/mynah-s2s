@@ -205,9 +205,13 @@ class _KV:
 
 
 class PocketOwn:
-    def __init__(self, weights: str, tokenizer: str, lang: str = "it", device="cuda", W: dict | None = None):
+    def __init__(self, weights: str, tokenizer: str, lang: str = "it", device="cuda", W: dict | None = None,
+                 dtype=torch.float32):
+        """dtype: the FlowLM transformer's weights, activations and KV (bf16 halves its memory traffic; the flow net,
+        the EOS head and Mimi stay fp32)."""
         from safetensors import safe_open
         self.dev = torch.device(device)
+        self.tdtype = dtype
         self.lang = lang
         self.opts = LANG_OPTS.get(lang, {"remove_semicolons": False})
         if W is None:
@@ -215,6 +219,9 @@ class PocketOwn:
             with safe_open(str(weights), framework="pt", device=str(self.dev)) as f:
                 for k in f.keys():
                     W[k] = f.get_tensor(k).float()
+        if dtype != torch.float32:
+            W = {k: (v.to(dtype) if k.startswith("flow_lm.transformer.") and v.is_floating_point() else v)
+                 for k, v in W.items()}
         self.W = W
         self.tok = _Tok(tokenizer)
         self.n_layers = sum(1 for k in W if k.startswith("flow_lm.transformer.layers.") and k.endswith("norm1.weight"))
@@ -259,6 +266,7 @@ class PocketOwn:
 
     def _flow_transformer(self, x, kv: _KV):
         W = self.W
+        x = x.to(self.tdtype)
         for li in range(self.n_layers):
             p = f"flow_lm.transformer.layers.{li}"
             x = x + self._attn(self._ln(x, p + ".norm1"), p + ".self_attn", self.nh, kv, li)
@@ -292,7 +300,7 @@ class PocketOwn:
         kv.grow(kv.off + T)
         y = self._flow_transformer(x, kv)
         kv.off += T
-        y = self._ln(y, "flow_lm.out_norm")
+        y = self._ln(y.float(), "flow_lm.out_norm")
         y = y[:, -max(n_lat, 1):] if n_lat else y[:, -1:]
         y = y.float()[:, -1]
         eos = F.linear(y, W["flow_lm.out_eos.weight"], W["flow_lm.out_eos.bias"]) > EOS_THR
@@ -451,7 +459,7 @@ class PocketOwn:
         cond = F.linear(lat.float(), self.W["flow_lm.speaker_proj_weight"])
         if "flow_lm.bos_before_voice" in self.W:
             cond = torch.cat([self.W["flow_lm.bos_before_voice"], cond], 1)
-        kv = _KV(self.n_layers, cond.shape[1], self.nh, self.d // self.nh, self.dev, torch.float32)
+        kv = _KV(self.n_layers, cond.shape[1], self.nh, self.d // self.nh, self.dev, self.tdtype)
         self._flow_step(kv, audio_cond=cond)
         return kv
 
@@ -514,6 +522,9 @@ class PocketOwn:
 
 
 # ---------------------------------------------------------------------------------------------------------- batching
+FUSED_ATTN = True       # bf16 batched step: in-place slot attention (qwen_own's Triton decode kernel)
+
+
 class PocketBatch:
     """Many sessions of ONE language model stepped together (mynah-tts design: fixed KV slots, one batched step per
     latent frame for all active rows, one host sync per frame). A row = one segment being generated: its FlowLM KV
@@ -523,7 +534,7 @@ class PocketBatch:
     def __init__(self, model: PocketOwn, slots: int = 16, max_len: int = 1024):
         self.m = model
         L, H, D = model.n_layers, model.nh, model.d // model.nh
-        self.kv = torch.zeros(L, 2, slots, max_len, H, D, device=model.dev)
+        self.kv = torch.zeros(L, 2, slots, max_len, H, D, device=model.dev, dtype=model.tdtype)
         self.max_len = max_len
         self.free = list(range(slots))
         self.rows: dict = {}                  # key -> row dict
@@ -555,10 +566,14 @@ class PocketBatch:
         B = len(rows)
         lat_in = torch.cat([r["x"] for r in rows], 0)[:, None]                       # (B, 1, ldim)
         seq = torch.where(torch.isnan(lat_in), W["flow_lm.bos_emb"], lat_in)
-        x = F.linear(seq, W["flow_lm.input_linear.weight"])
+        x = F.linear(seq, W["flow_lm.input_linear.weight"]).to(m.tdtype)
         slots = torch.tensor([r["slot"] for r in rows], device=m.dev)
         offs = torch.tensor([r["kv"].off for r in rows], device=m.dev)
         Lmax = int(offs.max()) + 1
+        fused = m.tdtype == torch.bfloat16 and x.is_cuda and FUSED_ATTN
+        if fused:
+            from ..llm.qwen_own.kernels import HAVE_TRITON, decode_attention
+            fused = HAVE_TRITON
         for li in range(m.n_layers):
             p = f"flow_lm.transformer.layers.{li}"
             h = m._ln(x, p + ".norm1")
@@ -569,16 +584,21 @@ class PocketBatch:
             q, k = _rope(q, k, offs)
             self.kv[li, 0, slots, offs] = k[:, 0]
             self.kv[li, 1, slots, offs] = v[:, 0]
-            K = self.kv[li, 0, slots, :Lmax].transpose(1, 2)                         # (B, H, Lmax, D)
-            V = self.kv[li, 1, slots, :Lmax].transpose(1, 2)
-            mask = (torch.arange(Lmax, device=m.dev)[None] <= offs[:, None])[:, None, None, :]
-            o = F.scaled_dot_product_attention(q.transpose(1, 2), K, V, mask)
-            x = x + F.linear(o.transpose(1, 2).reshape(B, 1, d), W[p + ".self_attn.out_proj.weight"])
+            if fused:                     # read each row's slot in place (no gather of the pool into a batch)
+                o = decode_attention(q[:, 0], self.kv[li, 0].permute(0, 2, 1, 3), self.kv[li, 1].permute(0, 2, 1, 3),
+                                     slots, offs + 1)                                   # (B, H, D)
+                o = o[:, None]                                                          # (B, 1, H, D)
+            else:
+                K = self.kv[li, 0, slots, :Lmax].transpose(1, 2)                     # (B, H, Lmax, D)
+                V = self.kv[li, 1, slots, :Lmax].transpose(1, 2)
+                mask = (torch.arange(Lmax, device=m.dev)[None] <= offs[:, None])[:, None, None, :]
+                o = F.scaled_dot_product_attention(q.transpose(1, 2), K, V, mask).transpose(1, 2)
+            x = x + F.linear(o.reshape(B, 1, d), W[p + ".self_attn.out_proj.weight"])
             h = m._ln(x, p + ".norm2")
             x = x + F.linear(F.gelu(F.linear(h, W[p + ".linear1.weight"]), approximate="tanh"), W[p + ".linear2.weight"])
         for r in rows:
             r["kv"].off += 1
-        y = m._ln(x, "flow_lm.out_norm").float()[:, -1]
+        y = m._ln(x.float(), "flow_lm.out_norm")[:, -1]
         eos = (F.linear(y, W["flow_lm.out_eos.weight"], W["flow_lm.out_eos.bias"]) > EOS_THR)[:, 0]
         if all(r["gen"] is not None for r in rows):
             noise = torch.cat([m._noise(1, r["gen"]) for r in rows], 0)

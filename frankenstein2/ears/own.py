@@ -49,13 +49,18 @@ class _Sess:
 
 
 class OwnEars:
-    def __init__(self, bundle: str, device="cuda", slots: int = 16):
+    def __init__(self, bundle: str, device="cuda", slots: int = 16, window_precision: str = "tf32"):
         from .turntaker import TurnTaker
         import json
         from pathlib import Path
         from safetensors import safe_open
         self.asr = NemotronASR(bundle, device)
         self.dev = self.asr.dev
+        # the GRU's 8 s window encode (layers 1-15, lookahead 0): fp32 | tf32 (events identical to fp32) | bf16 (own
+        # bf16 copy of the encoder; ~2.4x faster, a few events move by one 80 ms frame: lab/ears_featpath_check.py)
+        self.window_precision = window_precision
+        self.window_tf32 = window_precision == "tf32"
+        self.asr_win = NemotronASR(bundle, device, dtype=torch.bfloat16) if window_precision == "bf16" else self.asr
         cfg = json.loads((Path(bundle) / "config.json").read_text())
         arch = cfg["controller"]["architecture"]
         with torch.device(self.dev):
@@ -149,14 +154,55 @@ class OwnEars:
     # TF32 for the 8 s window encode (the largest ears cost): GRU outputs within 0.003 of fp32 and identical events on
     # IT/EN/FR with silent and speaking agent channels (lab/ears_featpath_check.py --precisions). The GRU itself and
     # the streaming ASR stay fp32 with TF32 off, as the bundle requires. window_tf32=False restores plain fp32.
-    window_tf32 = True
+    WIN_B = (1, 2, 4, 8, 12, 16, 24, 32)       # row buckets of the full-window encode graphs (rows = mic + agent)
+
+    def warm_window_graphs(self, max_rows: int | None = None) -> int:
+        """Capture the full 8 s window encode (fixed shape) for every row bucket now, then freeze (a later miss runs
+        eager): captures must not happen while other threads use the GPU (the one-process engine's LLM thread)."""
+        if self.dev.type != "cuda":
+            return 0
+        self._wg = getattr(self, "_wg", {})
+        top = max_rows or self.WIN_B[-1]
+        n = 0
+        for b in self.WIN_B:
+            if b > top or b in self._wg:
+                continue
+            xs = torch.zeros(b, WINDOW, device=self.dev)
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    self._encode_window_eager(xs)
+            torch.cuda.current_stream().wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=self._wg.get("pool"), capture_error_mode="thread_local"):
+                out = self._encode_window_eager(xs)
+            self._wg.setdefault("pool", g.pool())
+            self._wg[b] = {"x": xs, "out": out, "graph": g}
+            n += 1
+        self._wg_frozen = True
+        return n
 
     def _encode_window(self, x):
+        wg = getattr(self, "_wg", None)
+        if wg and x.shape[1] == WINDOW and x.shape[0] <= self.WIN_B[-1]:
+            b = next(v for v in self.WIN_B if v >= x.shape[0])
+            g = wg.get(b)
+            if g is not None:
+                g["x"][:x.shape[0]].copy_(x)
+                if x.shape[0] < b:
+                    g["x"][x.shape[0]:].zero_()
+                g["graph"].replay()
+                return g["out"][:x.shape[0]].clone()
+        return self._encode_window_eager(x)
+
+    def _encode_window_eager(self, x):
         tf = self.window_tf32 and self.dev.type == "cuda"
         torch.backends.cuda.matmul.allow_tf32 = tf
         torch.backends.cudnn.allow_tf32 = tf
         try:
-            return self.asr.encode(self.asr.mel(x, center=True), lookahead=0, stop_after=15)[:, -4:]
+            w = self.asr_win
+            return w.encode(w.mel(x, center=True), lookahead=0, stop_after=15)[:, -4:]
         finally:
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False

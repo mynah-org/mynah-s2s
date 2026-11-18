@@ -364,6 +364,13 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--session-voice", default="")
     ap.add_argument("--warm-llm", action="store_true", help="one request through the LLM before the arms")
     ap.add_argument("--ws-phases", action="store_true", help="after the arms: concurrent WebSocket sessions")
+    ap.add_argument("--ears-window", default="bf16", choices=["fp32", "tf32", "bf16"],
+                    help="one-process runtime: precision of the GRU's 8 s window encode")
+    ap.add_argument("--ears-graphs", default="off", choices=["on", "off"],
+                    help="one-process runtime: CUDA graphs for the full 8 s window encode (captured at start; no gain "
+                         "measured: the encode is compute-bound and row-bucket padding costs at some batch sizes)")
+    ap.add_argument("--pocket-dtype", default="bf16", choices=["bf16", "fp32"],
+                    help="one-process runtime: FlowLM transformer precision of our Pocket")
     ap.add_argument("--llm-thread", default="on", choices=["on", "off"],
                     help="one-process runtime: the LLM on its own thread and CUDA stream (on) or on the scheduler thread")
     ap.add_argument("--ws-reactive", action="store_true", help="N-session phase: each client waits for the agent")
