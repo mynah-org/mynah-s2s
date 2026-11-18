@@ -160,6 +160,90 @@ def graph_generate(cp, torch, stats, profile=False):
     return gen
 
 
+class StepGraph:
+    """G9: the WHOLE talker frame step (backbone decode position with a static KV cache + the 15-step code
+    predictor + sampling) as one CUDA graph, replayed once per codec frame.
+
+    The backbone's growing DynamicCache (a cat per step: new shapes every frame) is replaced by transformers'
+    StaticCache of ``max_len`` positions, filled by an eager prefill per segment; the decode position enters the
+    graph as a device tensor (cache_position). The code predictor runs its plain loop inside the same capture (no
+    nested graph). Code-0 sampling and the end-of-segment check stay outside (they decide on the host, as before).
+    Numerics: attention now runs over the static buffer with a causal mask instead of the exact-length cache, so the
+    codes are expected to differ slightly from the dynamic-cache talker; the check is graph replay vs the same
+    static-cache step run eagerly (must be identical) and the content of the audio (caller's ASR check)."""
+
+    def __init__(self, ft, torch, s, max_len=2048, stats=None):
+        from transformers.cache_utils import StaticCache
+        self.ft, self.torch, self.s, self.max_len, self.stats = ft, torch, s, max_len, stats
+        self.cache = StaticCache(config=ft.tk.config, max_cache_len=max_len)
+        self.g = None
+        self.failed = None
+        self.eager_only = False
+        dev = ft.dev
+        H = ft.pad.shape[-1]
+        self.ids = torch.zeros(1, 1, dtype=torch.long, device=dev)
+        self.ph = torch.zeros(1, 1, H, dtype=ft.pad.dtype, device=dev)
+        self.add = torch.zeros(1, 1, H, dtype=ft.pad.dtype, device=dev)
+        self.pos = torch.zeros(1, dtype=torch.long, device=dev)
+        self.out = None
+        self.info = {"captured": False, "failed": None, "replays": 0, "eager_steps": 0}
+        if stats is not None:
+            stats["step_graph"] = self.info
+
+    def prefill(self, embeds):
+        torch = self.torch
+        self.cache.reset()
+        T = embeds.shape[1]
+        out = self.ft.tk(inputs_embeds=embeds, past_key_values=self.cache, use_cache=True, attention_mask=None,
+                         generation_step=None, cache_position=torch.arange(T, device=self.ft.dev))
+        return T, out
+
+    def _fwd(self):
+        s = self.s
+        out = self.ft.tk(input_ids=self.ids, past_key_values=self.cache, past_hidden=self.ph,
+                         trailing_text_hidden=self.add, tts_pad_embed=self.ft.pad, generation_step=0, use_cache=True,
+                         subtalker_dosample=True, subtalker_top_k=s.sub_top_k, subtalker_top_p=1.0,
+                         subtalker_temperature=s.sub_temperature, cache_position=self.pos)
+        return {"logits": out.logits, "codes": out.hidden_states[1], "past_hidden": out.past_hidden}
+
+    def step(self, c, past_hidden, add, pos):
+        """-> (logits, codes [16] list, past_hidden). The caller seeds the RNG for this frame before calling."""
+        torch = self.torch
+        self.ids.fill_(c)
+        self.ph.copy_(past_hidden)
+        self.add.copy_(add)
+        self.pos.fill_(pos)
+        if self.g is None and not self.eager_only:
+            rng = torch.cuda.get_rng_state()
+            snap = [(l.keys.clone(), l.values.clone()) for l in self.cache.layers]   # warm-up writes slot `pos`
+            try:
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    self._fwd()
+                torch.cuda.current_stream().wait_stream(side)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    self.out = self._fwd()
+                self.g = g
+                self.info["captured"] = True
+            except Exception as e:  # noqa: BLE001
+                self.failed = self.info["failed"] = repr(e)[:400]
+                self.eager_only = True
+            torch.cuda.synchronize()
+            for l, (k, v) in zip(self.cache.layers, snap):
+                l.keys.copy_(k)
+                l.values.copy_(v)
+            torch.cuda.set_rng_state(rng)
+        if self.eager_only:
+            o = self._fwd()
+            self.info["eager_steps"] += 1
+            return o["logits"], o["codes"][0].tolist(), o["past_hidden"]
+        self.g.replay()
+        self.info["replays"] += 1
+        return self.out["logits"].clone(), self.out["codes"][0].tolist(), self.out["past_hidden"].clone()
+
+
 def timed_generate(orig, torch, stats):
     def gen(*a, **kw):
         torch.cuda.synchronize()
@@ -182,6 +266,10 @@ def main():  # pragma: no cover - GPU, talker env
     ap.add_argument("--fast-cp", action="store_true", help="plain loop instead of HF generate for the code predictor")
     ap.add_argument("--profile", action="store_true", help="time the code predictor separately (extra syncs)")
     ap.add_argument("--cp-graph", action="store_true", help="G5: the code-predictor loop as one CUDA graph")
+    ap.add_argument("--step-graph", action="store_true",
+                    help="G9: static KV cache + the whole frame step (backbone + code predictor) as one CUDA graph")
+    ap.add_argument("--step-eager-static", action="store_true",
+                    help="G9 check: the same static-cache step without the graph (numerics reference)")
     ap.add_argument("--clone", action="append", default=[], help="NAME=reference.wav: a selectable clone voice")
     ap.add_argument("--prio", default="", choices=["", "high"],
                     help="G4: run all talker GPU work on a highest-priority CUDA stream of this process. CUDA stream "
@@ -232,7 +320,12 @@ def main():  # pragma: no cover - GPU, talker env
     stats = {"step_ms": [], "prefill_ms": [], "decode_ms": [], "cp_ms": [], "segments": [], "cancels": 0,
              "fast_cp": a.fast_cp, "profile": a.profile, "cp_graph_on": a.cp_graph}
     cp = ft.tk.code_predictor
-    if a.cp_graph:
+    sg = None
+    if a.step_graph or a.step_eager_static:
+        cp.generate = fast_generate(cp, torch)          # the code predictor runs inside the step graph
+        sg = StepGraph(ft, torch, Sampling(), stats=stats)
+        sg.eager_only = a.step_eager_static
+    elif a.cp_graph:
         cp.generate = graph_generate(cp, torch, stats, a.profile)
     elif a.fast_cp:
         cp.generate = fast_generate(cp, torch, stats, a.profile)
@@ -349,8 +442,11 @@ def main():  # pragma: no cover - GPU, talker env
                     continue
                 sync()
                 c0 = time.perf_counter()
-                out = ft.tk(inputs_embeds=prefill(g.ids[0]), use_cache=True,
-                            attention_mask=None, generation_step=None)
+                if sg is not None:
+                    g.plen, out = sg.prefill(prefill(g.ids[0]))
+                else:
+                    out = ft.tk(inputs_embeds=prefill(g.ids[0]), use_cache=True,
+                                attention_mask=None, generation_step=None)
                 sync()
                 stats["prefill_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
                 g.past, g.past_hidden, g.logits = out.past_key_values, out.past_hidden, out.logits
@@ -371,14 +467,23 @@ def main():  # pragma: no cover - GPU, talker env
             torch.manual_seed(a.seed * 100003 + g.k + 7919)
             sync()
             c0 = time.perf_counter()
-            out = ft.tk(input_ids=torch.tensor([[c]], device=ft.dev), past_key_values=g.past,
-                        past_hidden=g.past_hidden, trailing_text_hidden=add, tts_pad_embed=ft.pad, generation_step=0,
-                        use_cache=True, subtalker_dosample=True, subtalker_top_k=s.sub_top_k, subtalker_top_p=1.0,
-                        subtalker_temperature=s.sub_temperature)
-            g.codes.append(out.hidden_states[1][0].tolist())
-            sync()
-            stats["step_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
-            g.past, g.past_hidden, g.logits = out.past_key_values, out.past_hidden, out.logits
+            if sg is not None:
+                if g.plen + g.k >= sg.max_len:
+                    finish(g, "max")
+                    continue
+                g.logits, codes, g.past_hidden = sg.step(c, g.past_hidden, add, g.plen + g.k)
+                g.codes.append(codes)
+                sync()
+                stats["step_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+            else:
+                out = ft.tk(input_ids=torch.tensor([[c]], device=ft.dev), past_key_values=g.past,
+                            past_hidden=g.past_hidden, trailing_text_hidden=add, tts_pad_embed=ft.pad,
+                            generation_step=0, use_cache=True, subtalker_dosample=True, subtalker_top_k=s.sub_top_k,
+                            subtalker_top_p=1.0, subtalker_temperature=s.sub_temperature)
+                g.codes.append(out.hidden_states[1][0].tolist())
+                sync()
+                stats["step_ms"].append(round((time.perf_counter() - c0) * 1e3, 2))
+                g.past, g.past_hidden, g.logits = out.past_key_values, out.past_hidden, out.logits
             g.hist.append(c)
             g.k += 1
             deliver(g)

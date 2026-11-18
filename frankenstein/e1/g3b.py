@@ -25,23 +25,33 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def run_codes_check(proc, ref_path):  # pragma: no cover - GPU
+def run_codes_check(proc, ref_path, audio_dir=None):  # pragma: no cover - GPU
     """The G1 texts through a running talker process, one segment at a time, all text available: codes vs the G1
     plain-loop codes, step / decode statistics, codec frames per second."""
     ref = json.load(open(ref_path))
     proc.reset()
-    same, frames, gen_s = [], 0, 0.0
+    same, frames, gen_s, codes_all = [], 0, 0.0, []
     for i, (text, rs) in enumerate(zip(ref["texts"], ref["fast"]["segments"])):
         t_send = time.monotonic_ns()
         proc.submit_raw({"op": "start", "epoch": 0, "turn": i + 1, "seg": 0, "text": text})
         proc.submit_raw({"op": "final", "epoch": 0, "turn": i + 1, "seg": 0})
-        done, t_end = None, time.monotonic() + 60
+        done, t_end, pcm = None, time.monotonic() + 60, []
         while done is None and time.monotonic() < t_end:
             for ev in proc.poll():
                 if ev.get("ev") == "done" and ev["turn"] == i + 1:
                     done = ev
+                elif ev.get("ev") == "audio" and ev["turn"] == i + 1:
+                    pcm.append(ev["pcm"])
             time.sleep(0.005)
         same.append(done is not None and done["codes"] == rs.get("codes"))
+        if done is not None:
+            codes_all.append(done["codes"])
+        if audio_dir is not None and pcm:
+            import numpy as np
+            import soundfile as sf
+            d = Path(audio_dir) / f"seg{i + 1:02d}"
+            d.mkdir(parents=True, exist_ok=False)
+            sf.write(d / "output.wav", np.concatenate(pcm), 24000, subtype="PCM_16")
         if done is not None:
             frames += done["frames"]
             gen_s += (done["t_ns"] - t_send) / 1e9
@@ -52,8 +62,9 @@ def run_codes_check(proc, ref_path):  # pragma: no cover - GPU
             "step_ms_p50": xs[len(xs) // 2] if xs else None,
             "step_ms_mean": round(sum(xs) / len(xs), 2) if xs else None, "frames": frames,
             "fps": round(frames / gen_s, 2) if gen_s else None, "stream_priority": st.get("stream_priority"),
-            "cp_graph": st.get("cp_graph"), "ref_fast": {"step_ms_mean": ref["fast"]["step_ms"]["mean"],
-                                                          "fps": ref["fast"]["fps"]}}
+            "cp_graph": st.get("cp_graph"), "step_graph": st.get("step_graph"),
+            "ref_fast": {"step_ms_mean": ref["fast"]["step_ms"]["mean"], "fps": ref["fast"]["fps"]},
+            "codes": codes_all}
 
 
 def warm_graph(graph, spec, tok, m, B2):  # pragma: no cover - GPU
@@ -218,6 +229,10 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--thinker-ref", default="", help="G7: frames.jsonl of a fixed-track arm; Thinker ids compared")
     ap.add_argument("--standalone-bench", action="store_true",
                     help="G5: before the engine loads, the G1 texts through the talker alone (codes vs G1, speed)")
+    ap.add_argument("--talker-variants", default="",
+                    help="G9: comma list of talker variants benched alone before the engine loads "
+                         "(cpgraph, eagerstatic, stepgraph); per segment audio kept for the content check")
+    ap.add_argument("--talker-session", default="cpgraph", help="G9: talker variant for the sessions (or 'auto')")
     ap.add_argument("--stop-if-codes-differ", action="store_true",
                     help="G5: no session if the standalone codes are not identical to G1")
     a = ap.parse_args()
@@ -250,15 +265,58 @@ def main():  # pragma: no cover - GPU
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
 
-    def make_proc():
+    VARIANT = {"cpgraph": ["--cp-graph"], "eagerstatic": ["--step-eager-static"], "stepgraph": ["--step-graph"]}
+
+    def make_proc(variant=None):
+        extra = VARIANT[variant] if variant else (["--cp-graph"] if a.cp_graph else [])
         p = FlashProc([a.flash_python, str(Path(__file__).resolve().parent / "flash_server.py"), "--harness",
                        a.flash_harness, "--root", a.flash_root, "--voice", a.flash_voice, "--lang", "it",
-                       "--fast-cp", *(["--prio", "high"] if a.talker_prio else []),
-                       *(["--cp-graph"] if a.cp_graph else [])], env, str(out / "flash_server.log"))
+                       "--fast-cp", *(["--prio", "high"] if a.talker_prio else []), *extra], env,
+                      str(out / f"flash_server_{variant or 'session'}.log"))
         p.start()
         res["flash_ready"] = p.wait_ready(240)
         return p
     proc = None
+    if a.talker_variants:                                # G9: talker variants alone on the GPU, before the engine
+        res["talker_variants"] = {}
+        for v in a.talker_variants.split(","):
+            pv = make_proc(v)
+            r = run_codes_check(pv, a.codes_ref, audio_dir=out / "talker_items" / v)
+            pv.close()
+            res["talker_variants"][v] = r
+            print("TALKER", v, json.dumps({k: x for k, x in r.items() if k not in ("codes",)})[:900], flush=True)
+        tv = res["talker_variants"]
+        if "eagerstatic" in tv and "stepgraph" in tv:
+            same = [x == y for x, y in zip(tv["eagerstatic"]["codes"], tv["stepgraph"]["codes"])]
+            res["stepgraph_vs_eagerstatic"] = {"segments": len(same), "identical": sum(same)}
+            print("STEPGRAPH_VS_EAGERSTATIC", res["stepgraph_vs_eagerstatic"], flush=True)
+        try:                                             # content of each variant's audio (evaluation ASR)
+            from e1.g23 import wer_cer
+            dirs = [str(out / "talker_items" / v) for v in tv]
+            oenv = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            oenv["FAIRSEQ2_CACHE_DIR"] = a.omni_cache
+            subprocess.run([a.omni_python, a.omni_script, *dirs], env=oenv, capture_output=True, text=True, timeout=300)
+            texts = json.load(open(a.codes_ref))["texts"]
+            res["talker_content"] = {}
+            for v in tv:
+                rows = json.load(open(out / "talker_items" / v / "asr_omni3b.json"))["sessions"]
+                hyp = {r["scenario"]: " ".join(x["text"] for x in r["segments"]) for r in rows}
+                ref_all = " ".join(texts[int(k[3:]) - 1] for k in sorted(hyp))
+                res["talker_content"][v] = wer_cer(ref_all, " ".join(hyp[k] for k in sorted(hyp)))
+            print("TALKER_CONTENT", json.dumps(res["talker_content"]), flush=True)
+        except Exception as e:  # noqa: BLE001
+            res["talker_content"] = {"error": repr(e)[:300]}
+        if a.talker_session == "auto":
+            ok = res.get("stepgraph_vs_eagerstatic", {}).get("identical") == len(tv.get("stepgraph", {}).get("codes", [1]))
+            # G9: the static-cache step graph was consistent but SLOWER than the dynamic cache + code-predictor graph
+            # (attention over the whole static buffer); it only wins if it is also faster
+            ok = ok and (tv.get("stepgraph", {}).get("step_ms_mean") or 1e9) < (tv.get("cpgraph", {}).get("step_ms_mean")
+                                                                              or 0)
+            a.talker_session = "stepgraph" if ok else "cpgraph"
+        res["talker_session"] = a.talker_session
+        for v in tv.values():
+            v.pop("codes", None)
+        save()
     if a.standalone_bench:                               # G5: the talker alone on the GPU
         proc = make_proc()
         res["standalone"] = run_codes_check(proc, a.codes_ref)
@@ -287,7 +345,7 @@ def main():  # pragma: no cover - GPU
     res["nano_load_s"] = round(time.monotonic() - t0, 1)
     res["mem_after_nano_gb"] = round(mem_available_gb(), 1)
     if proc is None:
-        proc = make_proc()
+        proc = make_proc(a.talker_session if a.talker_variants else None)
     res["mem_after_flash_gb"] = round(mem_available_gb(), 1)
     live = LiveASR(str(lab / "multilingual"), lang="it", att_right=3, window_s=12.0, every=8)
     res["mem_after_asr_gb"] = round(mem_available_gb(), 1)
