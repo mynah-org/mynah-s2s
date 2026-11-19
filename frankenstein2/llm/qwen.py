@@ -84,6 +84,11 @@ NARRATES = {
 FORCE_PREFIX = "\n<tool_call>\n"
 
 
+def reply_reminder(lang: str) -> str:
+    """Appended to the last tool result of a round (non-English sessions)."""
+    return f"(Answer the caller in {_langs.get(lang).name}.)"
+
+
 def narrates_lookup(text: str, lang: str) -> bool:
     return bool(NARRATES.get(lang, NARRATES["en"]).search(text or ""))
 
@@ -238,6 +243,10 @@ class QwenLLM:
             self.calls.append(ev)
             out.append(ev)
             j["msgs"].append({"role": "tool", "content": res})
+        if self.lang != "en" and j["msgs"] and j["msgs"][-1]["role"] == "tool":
+            # tool results are English JSON: without a reminder the reply after them can drift into English
+            # (seen in Russian), which the session's talker cannot speak
+            j["msgs"][-1] = dict(j["msgs"][-1], content=f"{j['msgs'][-1]['content']}\n{reply_reminder(self.lang)}")
         if self.timeout_reply == "canned" and all(st == "timed_out" for st in statuses):
             # nothing came back in time: say so directly, no extra LLM round (it would only add latency)
             msg = _langs.phrase(self.lang, "apology")

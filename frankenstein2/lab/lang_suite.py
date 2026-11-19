@@ -47,6 +47,8 @@ QUESTION = {
 }
 SCRIPT = {"ko": r"[가-힣]", "ja": r"[぀-ヿ一-鿿]", "hi": r"[ऀ-ॿ]",
           "ru": r"[Ѐ-ӿ]"}
+LETTERS = {"cs": r"[ěščřžýůťďň]", "tr": r"[ışğçöü]", "pl": r"[ąćęłńśźż]", "et": r"[õäöü]", "de": r"[äöüß]",
+           "es": r"[ñáéíóú¿¡]", "pt": r"[ãõçâêô]", "fr": r"[éèêàçùœ]", "it": r"[àèéìòù]"}
 STOP = {
     "it": "il la di che è un una per non con sono abbiamo costa euro ha le",
     "en": "the a is we have it for you and costs our this",
@@ -73,6 +75,8 @@ def in_language(text: str, code: str) -> bool:
     words = re.findall(r"\w+", t)
     own = sum(w in set(STOP.get(code, "").split()) for w in words)
     eng = sum(w in set(STOP["en"].split()) for w in words)
+    if code != "en" and own == 0 and LETTERS.get(code):         # few stop words in a short reply: its own letters
+        own = len(re.findall(LETTERS[code], t))
     return own > 0 and (code == "en" or own > eng)
 
 

@@ -72,7 +72,7 @@ def test_qwen_round_trip_runs_tool_and_resumes():
     assert kinds[0] == "decided" and "tool" in kinds and kinds[-1] == "done"
     assert seen == [{"name": "Mario Rossi", "postcode": "10121"}]
     assert "".join(e["text"] for e in evs if e["ev"] == "text") == "Trovato, signor Rossi."
-    assert proc.sent[1]["messages"][-1] == {"role": "tool", "content": '{"ok": 1}'}
+    assert proc.sent[1]["messages"][-1] == {"role": "tool", "content": '{"ok": 1}' + "\n(Answer the caller in Italian.)"}
 
 
 def test_qwen_history_markup_round_trips_through_the_parser():
@@ -139,7 +139,7 @@ def test_qwen_slow_tool_never_blocks_poll_and_reports_the_wait():
     evs = drain(q)
     tool = next(e for e in evs if e["ev"] == "tool")
     assert tool["status"] == "completed" and tool["result"] == '{"ok": 1}' and tool["call_id"] == "call1"
-    assert proc.sent[1]["messages"][-1] == {"role": "tool", "content": '{"ok": 1}'}
+    assert proc.sent[1]["messages"][-1] == {"role": "tool", "content": '{"ok": 1}' + "\n(Answer the caller in Italian.)"}
 
 
 def test_qwen_tool_past_the_deadline_is_stopped_and_the_caller_hears_a_fixed_apology():
@@ -173,7 +173,7 @@ def test_qwen_timeout_reply_model_lets_the_llm_answer_from_the_error():
     clock.t = 10.5
     evs = drain(q)
     gate.set()
-    assert proc.sent[1]["messages"][-1]["content"] == TIMEOUT_PAYLOAD
+    assert proc.sent[1]["messages"][-1]["content"] == TIMEOUT_PAYLOAD + "\n(Answer the caller in Italian.)"
     assert "".join(e["text"] for e in evs if e["ev"] == "text") == "Il sistema è lento, riprovi."
 
 
@@ -195,7 +195,7 @@ def test_qwen_runs_the_calls_of_a_round_in_parallel_and_answers_in_call_order():
     q.submit(1, [{"role": "user", "content": "divano, Mario Rossi"}])
     evs = drain(q)
     assert [e["name"] for e in evs if e["ev"] == "tool"] == ["search_catalog", "find_customer"]
-    assert [m["content"] for m in proc.sent[1]["messages"][-2:]] == ['{"tool": "search"}', '{"tool": "customer"}']
+    assert [m["content"] for m in proc.sent[1]["messages"][-2:]] == ['{"tool": "search"}', '{"tool": "customer"}' + "\n(Answer the caller in Italian.)"]   # reminder on the last one
 
 
 def test_qwen_cancel_while_a_tool_runs_drops_its_result():
@@ -209,3 +209,9 @@ def test_qwen_cancel_while_a_tool_runs_drops_its_result():
     time.sleep(0.05)
     assert q.poll() == [] and len(proc.sent) == 1 and q.dropped == 1
     assert not any(m["op"] == "cancel" for m in proc.sent)   # nothing was generating: no cancel to the engine
+
+
+def test_reply_reminder_names_the_session_language():
+    from frankenstein2.llm.qwen import reply_reminder
+    assert reply_reminder("ru") == "(Answer the caller in Russian.)"
+    assert "Italian" in reply_reminder("it")
