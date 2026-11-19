@@ -131,6 +131,15 @@ The interface is `submit(rid, messages)`, `cancel(rid)`, `poll()` and `close()`.
       and sm_121 before it is promoted.
     - *All candidates*: batching across sessions (one row per active request, continuous decode), a per-session
       KV / state slot, and the tool-suite identity check as the promotion gate for every precision.
+- **Asynchronous tool calls** (`qwen.py`, controller `LLM_WAIT`). The calls of a round run together on a thread
+  pool, never on the scheduler thread, and `poll()` never waits for them.
+  - While they run, the request is parked. The plugin reports `waiting` every second; the controller says an
+    on-hold reminder only after about a second of agent silence (at most two per turn, 4 s apart). The waits keep
+    the reply timer alive.
+  - At `--tool-timeout` (default 10 s) a running call is stopped and its late result is never used. When every
+    call of the round timed out, a fixed apology in the session language ends the reply without another LLM round.
+  - A barge-in drops the results of the parked request. Session close cancels the open calls in the `ToolLedger`.
+  - User-facing behaviour is described in `docs/frankenstein2.md`.
 - **Tool arguments** (`text/spoken_numbers.py`), in the session language:
   1. Spoken digits and capital letters become codes: "X Y Z uno due tre" → "XYZ123", "uno zero uno due uno" → "10121".
   2. Code-like values are then grounded on what the caller said. Every model we tried garbles "uno zero uno due uno"
@@ -225,6 +234,10 @@ The trace records:
 - LLM text and tool events (raw, normalised and grounded arguments);
 - talker segments (text and spoken form), first audio, cancels and flushes;
 - what was heard after a barge.
+
+Listeners (`obs.py`) turn the events into short log lines, a per-server SQLite store and the web UI's debug
+lines. The store's tables are sessions, events (short line plus full JSON) and spans (turn, LLM request, tool call
+and first audio, with durations). Viewer: `python -m frankenstein2.obs DB`. See `docs/frankenstein2.md`.
 
 ## 8. Known limits
 - **Concurrency.** The one-process runtime batches the ears, the LLM decode and the talker across sessions, and four

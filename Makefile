@@ -37,7 +37,7 @@ test-cpu: ## unit tests, no GPU or weights needed
 test-gpu: ## GPU tests (weights needed)
 	$(M) test-gpu
 
-# ---- Frankenstein v2: the recommended engine (multilingual, ~15 GB of weights, one GPU process) ----------------
+# ---- Frankenstein v2: the recommended engine (multilingual, ~14 GB of weights, one GPU process) ----------------
 # F2_PYTHON: a Python with frankenstein2/requirements.txt installed (torch with CUDA for serving; only pytest +
 # numpy for test-f2). F2_ENV: the paths written by f2-setup.
 F2_PYTHON ?= python3

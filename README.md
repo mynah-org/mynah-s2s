@@ -8,6 +8,38 @@ the open S2S ecosystem (Moshi-family models, PersonaPlex, MoshiRAG, NVIDIA Voice
 calls fail or are grounded wrongly, and built **V2**, an experimental runtime for
 [NVIDIA NemotronLabs VoiceChat 11B](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B).
 
+## Recommended: Frankenstein v2 (multilingual, light)
+
+**Frankenstein v2** (`frankenstein2/`) is the engine we recommend today. It is a full-duplex voice agent built from
+open models, with no training:
+
+- **ears:** Nemotron 3.5 ASR Streaming plus the Tyger turn-taking GRU;
+- **brain:** Qwen3.5-4B with tools, on our own int8 inference engine;
+- **talker:** Kyutai Pocket TTS with voice cloning.
+
+It needs about 14 GB of weights for three languages and runs as one GPU process that several sessions share, each
+in its own language.
+
+- **Languages:** Italian, English and French are tested end to end. German, Spanish, Portuguese and Dutch have
+  official models for all three parts and are not wired yet. Community voices exist for a few more. The ASR covers
+  40 locales and the LLM 201 languages; the talker sets the limit. Matrix and how to add one:
+  [`docs/frankenstein2-languages.md`](docs/frankenstein2-languages.md).
+- **Tools:** calls run asynchronously and the agent keeps the caller informed: a holding phrase, a reminder when a
+  call is slow, and an apology when a call times out (10 s by default).
+- **Tracing:** short per-event log lines, a per-server SQLite store of events and spans with durations, and a
+  Debug log switch in the web UI.
+
+```bash
+pip install -r frankenstein2/requirements.txt     # torch with CUDA first
+export HF_TOKEN=...                               # kyutai/pocket-tts is gated: accept its terms first
+make f2-setup                                     # downloads it/en/fr (F2_LANGS=it,en,fr,de for more)
+make f2-webui                                     # server + web UI on http://127.0.0.1:8787
+make test-f2                                      # unit tests, no GPU or weights (test-f2-gpu: on the real models)
+```
+
+Everything else (setup, tool behaviour, tracing, tests, limits): [`docs/frankenstein2.md`](docs/frankenstein2.md).
+The rest of this README is about the VoiceChat engine (V2), which stays available and unchanged.
+
 ## What V2 is
 
 V2 splits the problem in two, on purpose:

@@ -6,7 +6,7 @@
 What it fetches (official repositories, nothing re-hosted):
   ears    nineninesix/tyger                       Nemotron 3.5 ASR streaming 0.6B + turn-taking GRU (OpenMDW-1.1)
   brain   Qwen/Qwen3.5-4B                         the text LLM with tools (Apache-2.0)
-  talker  kyutai/pocket-tts                       languages/<lang>/model.safetensors (voice cloning; CC-BY-4.0,
+  talker  kyutai/pocket-tts                       languages/<lang>/model.safetensors only (voice cloning; CC-BY-4.0,
                                                   gated: accept the terms on the model page and set HF_TOKEN)
           kyutai/pocket-tts-without-voice-cloning languages/<lang>/tokenizer.* (CC-BY-4.0, not gated)
   voice   kyutai/tts-voices                       one reference WAV for cloning (default alba-mackenna/casual.wav,
@@ -42,7 +42,7 @@ def plan(langs: list, llm: str, voice: str) -> list:
     return [
         (EARS, None, "ears"),
         (llm, ["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja", "LICENSE*"], "llm"),
-        (POCKET_CLONE, [f"languages/{POCKET[x]}/*" for x in langs], "talker weights (gated)"),
+        (POCKET_CLONE, [f"languages/{POCKET[x]}/model.safetensors" for x in langs], "talker weights (gated)"),
         (POCKET_TOK, [f"languages/{POCKET[x]}/tokenizer*" for x in langs], "talker tokenizers"),
         (VOICES, [voice], "reference voice"),
     ]

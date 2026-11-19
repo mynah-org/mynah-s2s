@@ -13,7 +13,8 @@ from frankenstein2.scripts.setup_models import POCKET, TESTED, check_langs, plan
 def test_plan_fetches_only_the_requested_languages():
     steps = {role: (repo, pats) for repo, pats, role in plan(["it", "fr"], "Qwen/Qwen3.5-4B", "alba-mackenna/casual.wav")}
     assert steps["ears"] == ("nineninesix/tyger", None)
-    assert steps["talker weights (gated)"][1] == ["languages/italian_24l/*", "languages/french_24l/*"]
+    assert steps["talker weights (gated)"][1] == ["languages/italian_24l/model.safetensors",
+                                                     "languages/french_24l/model.safetensors"]
     assert steps["talker tokenizers"][1] == ["languages/italian_24l/tokenizer*", "languages/french_24l/tokenizer*"]
     assert steps["reference voice"] == ("kyutai/tts-voices", ["alba-mackenna/casual.wav"])
 
