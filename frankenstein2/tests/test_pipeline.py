@@ -169,3 +169,29 @@ def test_barge_assist_stops_audible_audio_on_the_first_user_word():
     assert b and b[0]["by"] == "asr_word" and b[0]["onset_frame"] == 28
     fl = tr.of("audio.flush")
     assert fl and fl[0]["model_step"] <= 36                      # stop <= 0.64 s after the onset
+
+
+def test_ears_link_open_error_drops_hops_without_stalling():
+    """The server could not open the session (no free ears slot): the link stops sending hops and never waits."""
+    import numpy as np
+    from frankenstein2.ears.client import HOP, STEP, EarsLink
+
+    class B:
+        def __init__(self):
+            self.sent, self.box = [], [{"ev": "error", "sid": "s1", "error": "ears: no free slot (6 sessions open)"}]
+
+        def send(self, m):
+            self.sent.append(m)
+
+        def poll(self, sid, block=False):
+            out, self.box = self.box, []
+            return out
+
+    b = B()
+    link = EarsLink(b, "s1", "it", sync=True, sync_timeout_s=0.05)
+    link.open()
+    link.poll()
+    for _ in range(2 * HOP // STEP):
+        link.push(np.zeros(STEP, np.float32), np.zeros(STEP, np.float32), "listen")
+        link.poll()
+    assert link.open_error and [m["op"] for m in b.sent] == ["open"] and not link.queued

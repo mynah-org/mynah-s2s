@@ -90,6 +90,10 @@ class OwnEars:
 
     # ------------------------------------------------------------------ sessions
     def open(self, sid, lang: str, thr: Thresholds | None = None) -> None:
+        if sid in self.sess:
+            self.close(sid)
+        if not self.free:
+            raise RuntimeError(f"ears: no free slot ({len(self.sess)} sessions open)")
         s = self.free.pop(0)
         self.asr.reset_slot(self.pool, s)
         d, h, c = self.asr.pred_start(1)

@@ -60,6 +60,7 @@ def main():  # pragma: no cover - model run
     from frankenstein2.server.engine import Resources, make_pipeline
     from frankenstein2.server.multi import MultiServer
     from frankenstein2.lab.ws_sessions import ClientSpec, run_clients
+    a.max_sessions = max(int(getattr(a, "max_sessions", 4) or 4), a.wave_n + 2)   # ears / talker slots = admitted
     ears = B.start_ears(a, out)
     spec = B.tenant(a)
     pocket = B.start_pocket(a, out)

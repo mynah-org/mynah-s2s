@@ -111,7 +111,11 @@ class InProcEars:
         from .ears.rules import Thresholds
         op = m.get("op")
         if op == "open":
-            self.e.open(m["sid"], m.get("lang", "it"), Thresholds(**(m.get("thr") or {})))
+            try:
+                self.e.open(m["sid"], m.get("lang", "it"), Thresholds(**(m.get("thr") or {})))
+            except RuntimeError as ex:                  # no free slot: this session fails, the others go on
+                self.box.put(m["sid"], {"ev": "error", "sid": m["sid"], "error": str(ex)})
+                return
             self.box.put(m["sid"], {"ev": "opened", "sid": m["sid"]})
         elif op == "close":
             self.e.close(m["sid"])
@@ -140,6 +144,7 @@ class InProcEars:
             return False
         with self.lock:
             items, self.pending = list(self.pending.values()), {}
+        items = [m for m in items if m["sid"] in self.e.sess]     # a session whose open failed never hops
         if not items:
             return False
         res = self.e.hop([(m["sid"], m["u"], m["a"], m["mode"], (m.get("reset") or False)) for m in items])

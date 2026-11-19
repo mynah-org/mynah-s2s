@@ -23,6 +23,8 @@ import math
 import os
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +32,11 @@ import torch
 import torch.nn.functional as F
 
 from ..gpu import host
+
+# Mimi latents of the voice files seen, keyed by (file, mtime, size, Mimi weights): Mimi is identical in every language,
+# so a voice is encoded once and each language only runs its own (cheap) FlowLM prompt over the latents.
+_VOICE_LATENTS: dict = {}
+_VOICE_LOCK = threading.Lock()
 
 REPLACE = {'"': '', '“': '', '”': '', '„': '', '«': '', '»': '', '’': "'", '‘': "'", '(': '', ')': '', '[': '',
            ']': '', '–': ','}
@@ -682,10 +689,12 @@ class PocketOwn:
 
     # ------------------------------------------------------------------ voice + generation
     @torch.no_grad()
-    def voice_state(self, wav_24k: torch.Tensor) -> _KV:
-        """Clone a voice from a 24 kHz mono prompt (1, N): the prompted FlowLM KV cache."""
-        wav = end_on_pause(wav_24k.to(self.dev).float())
-        lat = self.mimi_encode(wav[None])
+    def voice_state(self, wav_24k: torch.Tensor, lat: torch.Tensor | None = None) -> _KV:
+        """Clone a voice from a 24 kHz mono prompt (1, N): the prompted FlowLM KV cache. ``lat``: its Mimi latents,
+        if already known (Mimi is the same in every language, so a voice is encoded once for all of them)."""
+        if lat is None:
+            wav = end_on_pause(wav_24k.to(self.dev).float())
+            lat = self.mimi_encode(wav[None])
         cond = F.linear(lat.float(), self.W["flow_lm.speaker_proj_weight"])
         if "flow_lm.bos_before_voice" in self.W:
             cond = torch.cat([self.W["flow_lm.bos_before_voice"], cond], 1)
@@ -700,9 +709,27 @@ class PocketOwn:
             sr, ch = w.getframerate(), w.getnchannels()
             pcm = np.frombuffer(w.readframes(w.getnframes()), "<i2").astype(np.float32) / 32768.0
         pcm = pcm.reshape(-1, ch)[:, 0]
+        key = (str(Path(path).resolve()), os.path.getmtime(path), os.path.getsize(path),
+               self.W["mimi.encoder.model.0.conv.weight"].data_ptr())     # same Mimi tensors = same latents
+        with _VOICE_LOCK:
+            lat = _VOICE_LATENTS.get(key)
+        if lat is not None:
+            self.voice_timing = {"cached": True}
+            return self.voice_state(None, lat=lat)
+        t0 = time.monotonic()
         if sr != SR:
             pcm = resample_poly(pcm, SR, sr).astype(np.float32)
-        return self.voice_state(torch.from_numpy(np.ascontiguousarray(pcm))[None])
+        wav = end_on_pause(torch.from_numpy(np.ascontiguousarray(pcm))[None].to(self.dev).float())
+        lat = self.mimi_encode(wav[None])
+        if self.dev.type == "cuda":
+            torch.cuda.current_stream(self.dev).synchronize()
+        self.voice_timing = {"cached": False, "encode_ms": round((time.monotonic() - t0) * 1000, 1),
+                             "seconds": round(pcm.shape[0] / SR, 1)}
+        with _VOICE_LOCK:
+            while len(_VOICE_LATENTS) >= 16:
+                _VOICE_LATENTS.pop(next(iter(_VOICE_LATENTS)))
+            _VOICE_LATENTS[key] = lat
+        return self.voice_state(None, lat=lat)
 
     def max_gen_len(self, n_tokens: int) -> int:
         return math.ceil((n_tokens / 3.0 + 2.0) * FRAME_RATE)

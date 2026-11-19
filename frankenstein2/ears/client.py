@@ -87,6 +87,7 @@ class EarsLink:
         self.results: list = []
         self.lag_hops_max = 0
         self.errors: list = []
+        self.open_error = None
 
     def open(self) -> None:
         self.b.send({"op": "open", "sid": self.sid, "lang": self.lang, "thr": self.thr,
@@ -111,6 +112,9 @@ class EarsLink:
         self._send_next()
 
     def _send_next(self) -> None:
+        if self.open_error:                # the server could not open this session: its hops are dropped
+            self.queued.clear()
+            return
         while self.in_flight is None and self.queued:
             u, a, mode = self.queued.pop(0)
             self.b.send({"op": "hop", "sid": self.sid, "n": self.n_sent, "mode": mode, "reset": self.reset_next,
@@ -135,6 +139,9 @@ class EarsLink:
                 self.results.append(m)
             elif m.get("ev") == "error":
                 self.errors.append(m)
+                if m.get("op") is None and "slot" in str(m.get("error", "")):
+                    self.open_error = m.get("error")
+                    self.in_flight = None
                 if m.get("op") == "hop" and m.get("n") == self.in_flight:
                     self.in_flight = None
 
