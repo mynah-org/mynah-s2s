@@ -64,3 +64,19 @@ def test_llm_preset_sets_backend_and_mode_unless_given():
     assert resolved("--llm-preset", "moe") == ("qwen", "bf16")
     assert resolved("--llm-preset", "nano")[0] == "nano"
     assert resolved("--llm-preset", "qwen4b", "--qwen-mode", "bf16") == ("qwen", "bf16")
+
+
+def test_package_card_rows_come_from_the_folders_manifests(tmp_path):
+    import json
+    from frankenstein2.scripts.build_packages import rows_from_folder, write_card
+    for code, fam, prec in (("ko", "24l", "int4"), ("it", "24l", "int8"), ("it", "24l", "int4"), ("en", "24l", "base"),
+                            ("it@03", "24l", "int4")):
+        d = tmp_path / code / fam / prec
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({"total_bytes": 1e8, "backbone_rel_err": 0.1,
+                                                     "source": {"repo": "o/r", "licence": "CC-BY-4.0"}}))
+    rows = rows_from_folder(tmp_path)
+    assert [(r["code"], r["precision"]) for r in rows] == [("en", "base"), ("it", "int4"), ("it", "int8"), ("ko", "int4")]
+    write_card(tmp_path, rows)
+    card = (tmp_path / "README.md").read_text()
+    assert "| ko | language suite passed |" in card and "it@03" not in card

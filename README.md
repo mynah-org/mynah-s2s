@@ -22,8 +22,9 @@ as one GPU process that several sessions share, each in its own language. A larg
 "Choosing the brain" in the docs).
 
 - **Languages:** 15 with an open-licence voice that the ASR and the LLM also cover. They are Kyutai's official
-  seven (it, en, fr, de, es, pt, nl) and eight community models (ko, tr, ja, cs, hi, pl, ru, et). Italian, English
-  and French are tested end to end.
+  seven (it, en, fr, de, es, pt, nl) and eight community models (ko, tr, ja, cs, hi, pl, ru, et).
+  - Italian, English and French are tested end to end.
+  - The others passed a short per-language suite, except Czech, whose voice is weak.
 - **Language folder:** each language is a small delta against one English base. Adding one is copying its folder;
   the running server picks it up. Details: [`docs/frankenstein2-languages.md`](docs/frankenstein2-languages.md).
 - **Tools:** calls run asynchronously and the agent keeps the caller informed: a holding phrase, a reminder when a

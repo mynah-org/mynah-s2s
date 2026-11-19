@@ -8,8 +8,14 @@ is the limit.
   - Kyutai's official seven: Italian, English, French, German, Spanish, Portuguese, Dutch;
   - eight community models: Korean, Turkish, Japanese, Czech, Hindi, Polish, Russian, Estonian.
 - **Tested end to end**, with tool-call suites and multi-session gates: Italian, English, French.
-- **The rest** is checked for the voice only: a GPU test has the talker speak a sentence and the ears must
-  understand it. The conversation is not tested yet.
+- **The other twelve** passed the language suite (`make f2-lang-suite`), with one exception: Czech, whose voice the
+  ASR understands only in part. The suite checks three things per language:
+  - the talker speaks a question and the ears must understand it;
+  - the LLM alone must call the catalogue tool and answer in the language;
+  - one spoken end-to-end session must call the tool and answer with audio in the language.
+
+  It uses synthetic speech and one scenario per language: it shows the parts work together, not conversation
+  quality.
 - **Adding a language is copying a folder**, see "Adding a language" below.
 
 ## What each model covers
@@ -39,24 +45,29 @@ engine's default) and **6l** (6-layer students: smaller and faster, lower qualit
 | it | Italian | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | **tested** |
 | en | English | ready | Kyutai official (the base) | 24l, 6l | CC-BY-4.0 | **tested** |
 | fr | French | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | **tested** |
-| de | German | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
-| es | Spanish | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
-| pt | Portuguese | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
-| nl | Dutch | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
-| ko | Korean | ready | [seastar105/pocket-tts-korean-300m](https://huggingface.co/seastar105/pocket-tts-korean-300m) | 24l | CC-BY-4.0 | voice check pending |
-| tr | Turkish | ready | [alperiox/pocket-tts-turkish](https://huggingface.co/alperiox/pocket-tts-turkish) | 24l, 6l | MIT | voice check pending |
-| ja | Japanese | ready | [takuma104/pocket-tts-ja-cc](https://huggingface.co/takuma104/pocket-tts-ja-cc) | 24l, 6l | CC-BY-4.0 | voice check pending |
-| cs | Czech | broad | [vvolhejn/pocket-tts-czech](https://huggingface.co/vvolhejn/pocket-tts-czech) | 6l | CC-BY-4.0 | voice check pending |
-| hi | Hindi | ready | [saryps-labs/pocket-tts-hindi](https://huggingface.co/saryps-labs/pocket-tts-hindi) | 6l | CC-BY-4.0 | voice check pending |
-| pl | Polish | broad | [shefowl/pocket-tts-polish-6l](https://huggingface.co/shefowl/pocket-tts-polish-6l) | 6l | CC-BY-4.0 | voice check pending |
-| ru | Russian | ready | [ArtShtorm/Shtorm-PocketTTS-RU](https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU) | 6l | CC-BY-4.0 | voice check pending |
-| et | Estonian | broad | [cbentes/pocket-tts-estonian](https://huggingface.co/cbentes/pocket-tts-estonian) | 6l | CC-BY-SA-4.0 | voice check pending |
+| de | German | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
+| es | Spanish | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
+| pt | Portuguese | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
+| nl | Dutch | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
+| ko | Korean | ready | [seastar105/pocket-tts-korean-300m](https://huggingface.co/seastar105/pocket-tts-korean-300m) | 24l | CC-BY-4.0 | suite passed |
+| tr | Turkish | ready | [alperiox/pocket-tts-turkish](https://huggingface.co/alperiox/pocket-tts-turkish) | 24l, 6l | MIT | suite passed; the voice sometimes drops a sentence end |
+| ja | Japanese | ready | [takuma104/pocket-tts-ja-cc](https://huggingface.co/takuma104/pocket-tts-ja-cc) | 24l, 6l | CC-BY-4.0 | suite passed |
+| cs | Czech | broad | [vvolhejn/pocket-tts-czech](https://huggingface.co/vvolhejn/pocket-tts-czech) | 6l | CC-BY-4.0 | weak voice (ASR understands it in part) |
+| hi | Hindi | ready | [saryps-labs/pocket-tts-hindi](https://huggingface.co/saryps-labs/pocket-tts-hindi) | 6l | CC-BY-4.0 | suite passed |
+| pl | Polish | broad | [shefowl/pocket-tts-polish-6l](https://huggingface.co/shefowl/pocket-tts-polish-6l) | 6l | CC-BY-4.0 | suite passed |
+| ru | Russian | ready | [ArtShtorm/Shtorm-PocketTTS-RU](https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU) | 6l | CC-BY-4.0 | suite passed |
+| et | Estonian | broad | [cbentes/pocket-tts-estonian](https://huggingface.co/cbentes/pocket-tts-estonian) | 6l | CC-BY-SA-4.0 | suite passed |
 
 **Left out:**
 - Persian, Indonesian, Welsh, Gujarati and Tamil have community voices but are not in the ASR.
 - A Persian and a Japanese model are non-commercial (CC-BY-NC).
 - Arabic, Vietnamese, Ukrainian, Chinese, Swedish and others are in the ASR, but we found no Pocket voice for them.
 - Several community repositories are ONNX / CoreML / MLX exports only, which the torch runtime does not load.
+
+In the suite, the catalogue search of the test scenario only knows the sofa under a few names, so in Japanese,
+Korean, Dutch, Estonian and Turkish the tool call is right but the product is "not found". That is the test data, not
+the engine. The LLM gets the session language again after each tool result. Without that reminder, a Russian
+session once answered in English after the (English) tool result.
 
 The fixed phrases of the community languages (holding, reminder, apology, backchannel) were written by us, not by
 native speakers. Each one can be corrected in its `language.json` without touching code.
@@ -107,8 +118,12 @@ folder from the sources in its `SOURCES` table:
 **The cache at run time.** The engine keeps up to `--talker-vram-langs` languages on the GPU (default 4) and
 `--talker-host-langs` packages in pinned host RAM (default 8). The rest stay on disk.
 - A session whose language is not loaded waits for it; every other session keeps talking. The load runs on its own
-  thread and CUDA stream, never on the scheduler.
-- A language in use is never evicted.
+  thread and CUDA stream, never on the scheduler. A language comes from disk in well under a second; only the
+  very first one takes longer, because it also encodes the cloning voice, which every later language reuses.
+- The language of an open session is never evicted, also between its replies. The VRAM limit is therefore soft:
+  with more concurrent languages than `--talker-vram-langs`, all of them stay loaded until their sessions close.
+- Every language is its own batch. Sessions in different languages do not share a talker batch, so many concurrent
+  languages cost more GPU time per audio frame than the same sessions in one language.
 - All languages share one pool of per-session talker state per family.
 - `frankenstein2/lab/talker_stress.py` stresses it with end-to-end sessions over many languages
   (`--talker-rotate`).

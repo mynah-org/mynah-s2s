@@ -64,6 +64,37 @@ SOURCES = [s for c, (n24, n6) in OFFICIAL.items() for s in (_ky(c, "24l", n24), 
 ]
 
 
+# What was checked per language with the engine (frankenstein2/lab/lang_suite.py: the talker speaks a question and
+# the ASR must understand it; the LLM alone calls the catalogue tool and answers in the language; one spoken
+# end-to-end session). Shown in the repository card.
+STATUS = {
+    "it": "tested end to end (tool-call suites, multi-session gates)",
+    "en": "tested end to end (tool-call suites, multi-session gates)",
+    "fr": "tested end to end (tool-call suites, multi-session gates)",
+    **{c: "language suite passed" for c in ("de", "es", "pt", "nl", "hi", "ja", "ko", "pl", "ru", "et")},
+    "tr": "language suite passed; the voice sometimes drops the end of a sentence",
+    "cs": "weak voice: the ASR understands it only in part; the LLM and the session work",
+}
+
+
+def rows_from_folder(root: Path) -> list:
+    """The card's rows from the manifests already in ``root`` (so --upload-only can rewrite the card)."""
+    rows = []
+    for mf in sorted(root.glob("*/*/*/manifest.json")):
+        code, fam, prec = mf.parts[-4:-1]
+        if "@" in code:
+            continue
+        m = json.loads(mf.read_text())
+        src = m.get("source") or {}
+        rows.append({"code": code, "family": fam, "precision": prec, "MB": round(m.get("total_bytes", 0) / 1e6, 1),
+                     "backbone_rel_err": round(m.get("backbone_rel_err", 0.0), 5), "licence": src.get("licence", ""),
+                     "source": src.get("repo", "")})
+    order = {"base": 0, "int4": 1, "int8": 2, "bf16": 3}
+    first = ["en", "it", "fr"]
+    return sorted(rows, key=lambda r: (first.index(r["code"]) if r["code"] in first else 3, r["code"],
+                                       r["family"] != "24l", order.get(r["precision"], 9)))
+
+
 def notice(src: dict, rev: str) -> str | None:
     if src["official"]:
         return None
@@ -134,8 +165,8 @@ def main(argv=None) -> int:
             except Exception as e:  # noqa: BLE001 - one bad source does not stop the others
                 print("PKG_FAILED", json.dumps({"code": code, "family": fam, "error": f"{type(e).__name__}: {e}"[:300]}),
                       flush=True)
-    if rows:
-        write_card(root, rows)
+    if rows or a.upload_only:
+        write_card(root, rows_from_folder(root))
     if a.upload:
         from huggingface_hub import HfApi
         api = HfApi()
@@ -148,6 +179,8 @@ def main(argv=None) -> int:
 def write_card(root: Path, rows: list) -> None:
     table = "\n".join(f"| {r['code']} | {r['family']} | {r['precision']} | {r['MB']} MB | {r['backbone_rel_err']} | "
                       f"[{r['source']}](https://huggingface.co/{r['source']}) | {r['licence']} |" for r in rows)
+    codes = sorted({r["code"] for r in rows}, key=lambda c: ((["en", "it", "fr"] + [c]).index(c), c))
+    status = "\n".join(f"| {c} | {STATUS.get(c, 'not checked')} |" for c in codes)
     (root / "README.md").write_text(f"""---
 license: other
 license_name: per-package
@@ -172,6 +205,15 @@ transformer weights.
 | code | family | precision | size | backbone_rel_err | source | licence |
 |---|---|---|---|---|---|---|
 {table}
+
+## Status
+
+Checked with the Frankenstein v2 engine (int4, 24-layer when the language has it, else 6-layer). The checks use
+synthetic speech and one short scenario per language; they are not a quality evaluation.
+
+| code | status |
+|---|---|
+{status}
 
 ## Licences and attribution
 
