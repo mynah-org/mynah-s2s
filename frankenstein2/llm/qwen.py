@@ -35,6 +35,23 @@ def tool_pool() -> ThreadPoolExecutor:
 # Reference shapes (VoiceChat engine, mynah_v2.agent.tools): a call still running at the deadline gets this error.
 TIMEOUT_PAYLOAD = json.dumps({"error": "timeout", "message": "I'm sorry, that's taking longer than expected."})
 
+# Said to the caller when every call of a round timed out (timeout_reply="canned", the default).
+TOOL_FAILED = {
+    "it": "Mi dispiace, non sono riuscito a recuperare l'informazione in tempo. Può riprovare tra poco?",
+    "fr": "Je suis désolé, je n'ai pas pu récupérer l'information à temps. Pouvez-vous réessayer dans un instant ?",
+    "en": "I'm sorry, I couldn't retrieve that information in time. Could you try again in a moment?",
+    "de": "Es tut mir leid, ich konnte die Information nicht rechtzeitig abrufen. Versuchen Sie es bitte gleich noch "
+          "einmal.",
+    "es": "Lo siento, no he podido obtener la información a tiempo. ¿Puede volver a intentarlo en un momento?",
+}
+
+
+def _is_timeout(res) -> bool:
+    try:
+        return isinstance(res, str) and json.loads(res).get("error") == "timeout"
+    except (ValueError, AttributeError):
+        return False
+
 TAG = "<tool_call>"
 FN = re.compile(r"<function=([\w.\-]+)>(.*?)</function>", re.S)
 PAR = re.compile(r"<parameter=([\w.\-]+)>\n?(.*?)\n?</parameter>", re.S)
@@ -109,15 +126,17 @@ class QwenLLM:
     "text"}* then {"ev": "end", "ss", "rid"}; {"op": "cancel", "ss", "rid"}.
 
     Tool calls are asynchronous (as in the VoiceChat engine): the calls of a round start together on the tool pool
-    and ``poll()`` never waits for them. While they run the request is parked; a ``waiting`` event goes out every
-    ``reminder_s`` (at most ``max_reminders``) so the controller can keep the caller company and the reply timer
-    alive; at ``tool_timeout_s`` a call still running gets the reference timeout error and the round goes on without
-    it (its later result is counted as late, never used). A cancelled request (barge-in) drops its pending results.
-    The calls' tool messages go back in call order."""
+    (``tool_start`` event, with the call id) and ``poll()`` never waits for them; nothing sleeps. While they run the
+    request is parked: from ``first_wait_s`` a ``waiting`` event goes out every ``wait_tick_s``, and the controller
+    decides whether the silence deserves an on-hold reminder (it also keeps the reply timer alive). At
+    ``tool_timeout_s`` a call still running gets the reference timeout error (its later result is counted as late,
+    never used). If every call of the round timed out, ``timeout_reply="canned"`` (default) ends the reply with
+    ``TOOL_FAILED`` in the session language, without another LLM round; ``"model"`` lets the model answer from the
+    timeout error. A cancelled request (barge-in) drops its pending results. Tool messages go back in call order."""
 
     def __init__(self, proc, ss: str, system: str, tool_schemas: list, bound: dict, lang: str, max_rounds: int = 3,
-                 user_texts=None, tool_timeout_s: float = 10.0, reminder_s: float = 2.5, max_reminders: int = 2,
-                 pool=None, clock=time.monotonic):
+                 user_texts=None, tool_timeout_s: float = 10.0, first_wait_s: float = 1.5, wait_tick_s: float = 1.0,
+                 timeout_reply: str = "canned", pool=None, clock=time.monotonic):
         self.p, self.ss, self.system, self.schemas, self.lang = proc, ss, system, tool_schemas, lang
         self.record: list = []
         self.last_msgs: list = []
@@ -129,7 +148,12 @@ class QwenLLM:
         self.jobs: dict = {}
         self.out: list = []
         self.calls: list = []
-        self.tool_timeout_s, self.reminder_s, self.max_reminders = tool_timeout_s, reminder_s, max_reminders
+        self.tool_timeout_s, self.first_wait_s, self.wait_tick_s = tool_timeout_s, first_wait_s, wait_tick_s
+        if timeout_reply not in ("canned", "model"):
+            raise ValueError(f"timeout_reply must be canned | model, not {timeout_reply!r}")
+        self.timeout_reply = timeout_reply
+        self.n_started = 0
+        self.timeouts = 0                      # requests closed with the canned "could not retrieve" reply
         self.pool, self.clock = pool, clock
         self.ledger = None                     # the session's ToolLedger when bound (open calls cancelled on close)
         self.late = 0                          # results that arrived after their deadline or their request's cancel
@@ -170,28 +194,35 @@ class QwenLLM:
     def _count_late(self):
         self.late += 1
 
-    def _start_tools(self, rid, j, calls):
+    def _start_tools(self, rid, j, calls, out):
         pool = self.pool or tool_pool()
-        w = {"t0": self.clock(), "calls": [], "reminded": 0}
+        w = {"t0": self.clock(), "calls": [], "next_wait": self.first_wait_s}
         for c in calls:
             box: list = []
+            x = {"c": c, "rec": box, "call_id": f"call{self.n_started + 1}", "t_done": None}
+            self.n_started += 1
             if c["name"] in self.tools:
                 fut = pool.submit(self.tools[c["name"]], c["arguments"], box)
             else:
                 fut = pool.submit(lambda n=c["name"]: json.dumps({"error": f"unknown tool {n}"}))
-            w["calls"].append({"c": c, "fut": fut, "rec": box})
+            fut.add_done_callback(lambda f, x=x: x.__setitem__("t_done", self.clock()))
+            x["fut"] = fut
+            w["calls"].append(x)
+            out.append({"ev": "tool_start", "rid": rid, "name": c["name"], "args": c["arguments"],
+                        "call_id": x["call_id"]})
         j["wait"] = w
 
     def _check_tools(self, rid, j, out):
         w = j["wait"]
         el = self.clock() - w["t0"]
         if not all(c["fut"].done() for c in w["calls"]) and el < self.tool_timeout_s:
-            if self.reminder_s and w["reminded"] < self.max_reminders and el >= self.reminder_s * (w["reminded"] + 1):
-                w["reminded"] += 1
+            if self.first_wait_s and el >= w["next_wait"]:          # the controller decides whether to speak
+                w["next_wait"] = el + self.wait_tick_s
                 out.append({"ev": "waiting", "rid": rid, "s": round(el, 2),
                             "names": [c["c"]["name"] for c in w["calls"] if not c["fut"].done()]})
             return
         del j["wait"]
+        statuses = []
         for x in w["calls"]:
             c, fut = x["c"], x["fut"]
             if not fut.done():
@@ -200,14 +231,27 @@ class QwenLLM:
             elif fut.exception() is not None:
                 res, status = json.dumps({"error": str(fut.exception())}), "failed"
             else:
-                res, status = fut.result(), "completed"
+                res = fut.result()
+                status = "timed_out" if _is_timeout(res) else "completed"   # the ledger's own deadline
+            statuses.append(status)
             rec = x["rec"][0] if x["rec"] else {"args": c["arguments"], "fixes": []}
+            t_end = x["t_done"] if (x["t_done"] is not None and status != "timed_out") else self.clock()
             ev = {"ev": "tool", "rid": rid, "name": c["name"], "args": rec["args"], "args_raw": c["arguments"],
-                  "fixes": rec.get("fixes"), "result": res, "status": status, "ms": round(el * 1000, 1),
-                  "call_id": f"call{len(self.calls) + 1}"}
+                  "fixes": rec.get("fixes"), "result": res, "status": status,
+                  "ms": round((t_end - w["t0"]) * 1000, 1), "call_id": x["call_id"]}
             self.calls.append(ev)
             out.append(ev)
             j["msgs"].append({"role": "tool", "content": res})
+        if self.timeout_reply == "canned" and all(st == "timed_out" for st in statuses):
+            # nothing came back in time: say so directly, no extra LLM round (it would only add latency)
+            msg = TOOL_FAILED.get(self.lang, TOOL_FAILED["en"])
+            j["text"] += msg
+            self.timeouts += 1
+            out.append({"ev": "text", "rid": rid, "text": msg})
+            out.append({"ev": "done", "rid": rid, "text": j["text"],
+                        "info": {"rounds": j["round"] + 1, "tool_timeout": True}})
+            self.jobs.pop(rid, None)
+            return
         j["round"] += 1
         j["split"] = SpeechSplitter()
         self._gen(rid, j["msgs"])
@@ -253,7 +297,7 @@ class QwenLLM:
                 if calls and j["round"] < self.max_rounds:
                     j["msgs"].append({"role": "assistant", "content": (j.pop("said_before_call", "") + "\n" + sp.call)
                                       .lstrip("\n")})
-                    self._start_tools(rid, j, calls)
+                    self._start_tools(rid, j, calls, out)
                     self._check_tools(rid, j, out)      # fast backends: the round goes on in this same poll
                 else:
                     rest = sp.flush()

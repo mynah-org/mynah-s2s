@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from frankenstein2.llm.qwen import TIMEOUT_PAYLOAD, QwenLLM, SpeechSplitter, parse_calls  # noqa: E402
+from frankenstein2.llm.qwen import TIMEOUT_PAYLOAD, TOOL_FAILED, QwenLLM, SpeechSplitter, parse_calls  # noqa: E402
 from frankenstein2.text.spoken_numbers import ground_codes  # noqa: E402
 
 CALL = ("<tool_call>\n<function=find_customer>\n<parameter=name>\nMario Rossi\n</parameter>\n"
@@ -119,45 +119,71 @@ class Clock:
         return self.t
 
 
-def test_qwen_slow_tool_never_blocks_poll_and_sends_reminders():
+def test_qwen_slow_tool_never_blocks_poll_and_reports_the_wait():
     gate, clock = threading.Event(), Clock()
     proc = FakeQwenProc([CALL, "Trovato."])
     q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: (gate.wait(5), json.dumps({"ok": 1}))[1]}, "it",
-                reminder_s=4.0, max_reminders=2, tool_timeout_s=10.0, clock=clock)
+                first_wait_s=1.5, wait_tick_s=1.0, tool_timeout_s=10.0, clock=clock)
     q.submit(1, [{"role": "user", "content": "Mario Rossi"}])
     t0 = time.monotonic()
     evs = q.poll()
     assert time.monotonic() - t0 < 0.5                     # the backend is blocked, poll() is not
-    assert [e["ev"] for e in evs] == ["decided"] and len(proc.sent) == 1
+    assert [e["ev"] for e in evs] == ["decided", "tool_start"] and len(proc.sent) == 1
+    assert evs[1]["name"] == "find_customer" and evs[1]["call_id"] == "call1"
     waits = []
-    for t in (3.9, 4.1, 5.0, 8.2, 9.5):
+    for t in (1.0, 1.6, 2.0, 2.7, 3.1, 4.0):
         clock.t = t
         waits += [e for e in q.poll() if e["ev"] == "waiting"]
-    assert [round(w["s"], 1) for w in waits] == [4.1, 8.2] and waits[0]["names"] == ["find_customer"]
+    assert [w["s"] for w in waits] == [1.6, 2.7, 4.0] and waits[0]["names"] == ["find_customer"]
     gate.set()
     evs = drain(q)
     tool = next(e for e in evs if e["ev"] == "tool")
-    assert tool["status"] == "completed" and tool["result"] == '{"ok": 1}'
+    assert tool["status"] == "completed" and tool["result"] == '{"ok": 1}' and tool["call_id"] == "call1"
     assert proc.sent[1]["messages"][-1] == {"role": "tool", "content": '{"ok": 1}'}
 
 
-def test_qwen_tool_past_the_deadline_gets_the_reference_timeout_error():
+def test_qwen_tool_past_the_deadline_is_stopped_and_the_caller_hears_a_fixed_apology():
     gate, clock = threading.Event(), Clock()
-    proc = FakeQwenProc([CALL, "Mi scusi, il sistema è lento."])
+    proc = FakeQwenProc([CALL])
     q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: (gate.wait(5), "late")[1]}, "it",
-                tool_timeout_s=10.0, reminder_s=0, clock=clock)
+                tool_timeout_s=10.0, first_wait_s=0, clock=clock)
     q.submit(1, [{"role": "user", "content": "Mario Rossi"}])
     q.poll()
     clock.t = 10.5
     evs = drain(q)
     tool = next(e for e in evs if e["ev"] == "tool")
     assert tool["status"] == "timed_out" and tool["result"] == TIMEOUT_PAYLOAD
-    assert proc.sent[1]["messages"][-1]["content"] == TIMEOUT_PAYLOAD
+    said = "".join(e["text"] for e in evs if e["ev"] == "text")
+    assert said == TOOL_FAILED["it"] and evs[-1]["info"]["tool_timeout"] and q.timeouts == 1
+    assert len(proc.sent) == 1                             # no extra LLM round
     gate.set()
     t_end = time.monotonic() + 2
     while q.late == 0 and time.monotonic() < t_end:
         time.sleep(0.005)
     assert q.late == 1                                     # the backend's answer arrived later: counted, not used
+
+
+def test_qwen_timeout_reply_model_lets_the_llm_answer_from_the_error():
+    gate, clock = threading.Event(), Clock()
+    proc = FakeQwenProc([CALL, "Il sistema è lento, riprovi."])
+    q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: (gate.wait(5), "late")[1]}, "it",
+                tool_timeout_s=10.0, first_wait_s=0, timeout_reply="model", clock=clock)
+    q.submit(1, [{"role": "user", "content": "Mario Rossi"}])
+    q.poll()
+    clock.t = 10.5
+    evs = drain(q)
+    gate.set()
+    assert proc.sent[1]["messages"][-1]["content"] == TIMEOUT_PAYLOAD
+    assert "".join(e["text"] for e in evs if e["ev"] == "text") == "Il sistema è lento, riprovi."
+
+
+def test_qwen_ledger_timeout_counts_as_timed_out():
+    proc = FakeQwenProc([CALL])
+    q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: TIMEOUT_PAYLOAD}, "en")   # bound handler gave up
+    q.submit(1, [{"role": "user", "content": "Mario Rossi"}])
+    evs = drain(q)
+    assert next(e for e in evs if e["ev"] == "tool")["status"] == "timed_out"
+    assert "".join(e["text"] for e in evs if e["ev"] == "text") == TOOL_FAILED["en"]
 
 
 def test_qwen_runs_the_calls_of_a_round_in_parallel_and_answers_in_call_order():

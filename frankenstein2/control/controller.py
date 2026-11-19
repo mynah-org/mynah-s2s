@@ -21,8 +21,9 @@ Intents                          ->  actions
                                      turn); the user text carries into the next endpoint
   BACKCHANNEL (ears, listen)         BACKCHANNEL (short audio, not in the 2nd ear, not in history)
   LLM_DECIDED (tool step chose a call)  HOLDING_PHRASE once per turn if nothing was spoken yet
-  LLM_WAIT (a tool is still running)  HOLDING_PHRASE(reminder) up to ``max_reminders`` per turn; keeps the reply
-                                     timer alive (tools run asynchronously, the caller can still barge in)
+  LLM_WAIT (a tool is still running)  keeps the reply timer alive; HOLDING_PHRASE(reminder) when the agent has
+                                     been silent ``reminder_silence`` steps, at most ``max_reminders`` per turn,
+                                     ``reminder_gap`` steps apart (tools run asynchronously, the caller can barge in)
   LLM_TOOL                           TOOL_RECORD (history: the call and its result, kept even if later barged)
   LLM_TEXT                           SPEAK(text) (-> chunker -> normaliser -> talker)
   LLM_DONE                           END_TEXT (chunker flush); the turn closes when its audio has played out
@@ -87,6 +88,8 @@ class ControllerConfig:
     merge_unheard: bool = True         # a barge before anything was heard: the user's text carries into the next turn
     continue_window: int = 25          # steps (2 s) after an open in which new user words mean "not finished"
     max_reminders: int = 2             # on-hold reminders per turn while a tool runs
+    reminder_silence: int = 12         # steps (~1 s) of agent silence before a reminder
+    reminder_gap: int = 50             # steps (4 s) between two reminders
 
 
 class Controller:
@@ -106,6 +109,7 @@ class Controller:
         self.spoken = False               # reply text handed to the talker in this turn
         self.holding_done = False
         self.reminders = 0
+        self.last_reminder_k = None
         self.last_activity_k = None
         self.done_k = None
         self.carry = ""                   # user text of a turn cancelled before anything was heard
@@ -165,7 +169,7 @@ class Controller:
         self.state = St.THINKING
         self.opened_k = self.last_activity_k = k
         self.text_done = self.spoken = self.holding_done = False
-        self.reminders = 0
+        self.reminders, self.last_reminder_k = 0, None
         self.done_k = None
         self.user_text = user_text
         self._act("OPEN_TURN", k, reason, user_text=user_text)
@@ -235,8 +239,13 @@ class Controller:
         if why or self.state is St.LISTENING:
             return self._stale(it, k, why or "state_listening")
         self.last_activity_k = k
-        if self.cfg.holding_phrase and self.reminders < self.cfg.max_reminders:
+        p = it.payload or {}
+        silent = p.get("silent_steps", self.cfg.reminder_silence)      # unknown silence: assume silent
+        if self.cfg.holding_phrase and self.reminders < self.cfg.max_reminders and \
+                silent >= self.cfg.reminder_silence and \
+                (self.last_reminder_k is None or k - self.last_reminder_k >= self.cfg.reminder_gap):
             self.reminders += 1
+            self.last_reminder_k = k
             self._act("HOLDING_PHRASE", k, "tool_wait", request_id=it.request_id, reminder=self.reminders,
                       waited_s=(it.payload or {}).get("s"))
 

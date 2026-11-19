@@ -227,10 +227,16 @@ class Pipeline:
         elif kind == "decided":
             self.tr.emit("llm.decided", k, request_id=rid)
             self.ctl.post(Intent("LLM_DECIDED", "llm", k, request_id=rid))
+        elif kind == "tool_start":
+            self.tr.emit("tool.started", k, request_id=rid, name=e["name"], args=e.get("args"),
+                         call_id=e.get("call_id"), turn_id=self.ctl.turn)
         elif kind == "waiting":
-            self.tr.emit("tool.waiting", k, request_id=rid, s=e.get("s"), names=e.get("names"))
-            self.ctl.post(Intent("LLM_WAIT", "llm", k, payload={"s": e.get("s"), "names": e.get("names")},
-                                 request_id=rid))
+            po = self.playout
+            silent = 0 if po.audible() else po.step - (po.last_agent_step() + po.client_delay_steps)
+            self.tr.emit("tool.waiting", k, request_id=rid, s=e.get("s"), names=e.get("names"),
+                         silent_steps=min(silent, 10 ** 4))
+            self.ctl.post(Intent("LLM_WAIT", "llm", k, payload={"s": e.get("s"), "names": e.get("names"),
+                                                                "silent_steps": silent}, request_id=rid))
         elif kind == "tool":
             self.conv.tool(e["name"], e.get("args") or {}, e.get("result", ""),
                            markup=getattr(self.llm, "call_markup", None))

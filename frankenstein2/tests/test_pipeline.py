@@ -78,7 +78,8 @@ def test_tool_turn_holding_phrase_digits_and_history():
 def test_slow_tool_gets_a_spoken_reminder_outside_the_history():
     db = {"XYZ123": {"status": "shipped"}}
     ears = {"s": {2: {"pieces": pieces(4, "dov'è il mio ordine X Y Z uno due tre"), "events": [ev("ENDPOINT", 11)]}}}
-    script = lambda m: [("decided",), ("wait", 30), ("waiting", 4.0, "get_order_status"), ("wait", 5),
+    script = lambda m: [("decided",), ("tool_start", "get_order_status", {"order_id": "X Y Z"}, "call1"),
+                        ("wait", 40), ("waiting", 4.0, "get_order_status"), ("wait", 5),
                         ("tool", "get_order_status", {"order_id": "X Y Z uno due tre"}),
                         ("text", "Il suo ordine è stato spedito.")]
     p, be, llm, talker, tr = make("s", "it", ears, script, tools={"get_order_status": orders_handler(db)})
@@ -87,6 +88,8 @@ def test_slow_tool_gets_a_spoken_reminder_outside_the_history():
     assert talker.said[-1]["text"] == "Il suo ordine è stato spedito."
     assert HOLD_REMINDER["it"] not in json.dumps(p.conv.messages)
     assert [m["role"] for m in p.conv.messages] == ["user", "assistant", "tool", "assistant"]
+    started = tr.of("tool.started")
+    assert started and started[0]["call_id"] == "call1" and tr.of("tool.waiting")[0]["silent_steps"] >= 12
 
 
 def test_barge_in_keeps_only_heard_text_and_flushes():

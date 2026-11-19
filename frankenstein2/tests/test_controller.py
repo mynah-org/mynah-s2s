@@ -131,16 +131,18 @@ def test_order_of_arrival_does_not_matter():
     assert list(seen)[0][0] == ("CANCEL", "barge_in")
 
 
-def test_tool_wait_reminds_twice_and_keeps_the_reply_alive():
+def test_tool_wait_reminds_only_in_silence_at_most_twice_and_keeps_the_reply_alive():
     c = Controller()
     endpoint(c, 1)
     acts = []
     for k in range(2, 260):
-        if k in (50, 100, 150, 200):                       # a slow tool: "waiting" every 4 s
-            c.post(Intent("LLM_WAIT", "llm", k, payload={"s": k * 0.08}, request_id=1))
+        if k >= 20 and k % 12 == 0:                        # a slow tool: "waiting" about every second
+            silent = 0 if k < 40 else 30                   # the holding phrase is still playing until step 40
+            c.post(Intent("LLM_WAIT", "llm", k, payload={"s": k * 0.08, "silent_steps": silent}, request_id=1))
         acts += c.tick(k)
     rem = [a for a in acts if a.kind == "HOLDING_PHRASE"]
     assert [a.reason for a in rem] == ["tool_wait", "tool_wait"] and rem[1].data["reminder"] == 2
+    assert rem[0].k == 48 and rem[1].k - rem[0].k >= 50        # first in silence, then 4 s apart
     assert "CANCEL" not in kinds(acts)        # without the waits the 12 s reply timeout fires at step 152
 
 

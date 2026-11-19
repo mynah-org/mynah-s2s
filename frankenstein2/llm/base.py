@@ -7,6 +7,7 @@ loaded model. Non-blocking:
   cancel(rid)             stop that request as soon as possible (its later events are stale anyway)
   poll() -> [events]      {"ev": "text", "rid", "text"}            reply text delta (spoken)
                           {"ev": "decided", "rid"}                  the tool step chose to call a tool (holding phrase)
+                          {"ev": "tool_start", "rid", "name", "args", "call_id"}   a tool call was launched
                           {"ev": "waiting", "rid", "s", "names"}    a tool is still running after s seconds
                                                                     (the controller may say an on-hold reminder)
                           {"ev": "tool", "rid", "name", "args", "args_raw", "result", "call_id"}   a tool RAN
@@ -52,7 +53,8 @@ def wrap_tools(bound: dict, lang: str, record: list, user_texts=None) -> dict:
 
 class ScriptedLLM:
     """Deterministic fake: ``script(messages) -> list of steps``; a step is ("text", str) | ("decided",) |
-    ("tool", name, args) | ("wait", n_polls) | ("waiting", seconds, *names) (a slow tool). Steps are released one per poll, so tests control the timing."""
+    ("tool", name, args) | ("wait", n_polls) | ("waiting", seconds, *names) (a slow tool)
+    | ("tool_start", name, args, call_id). Steps are released one per poll, so tests control the timing."""
 
     def __init__(self, script, tools: dict | None = None, lang: str = "en"):
         self.script, self.lang = script, lang
@@ -97,6 +99,8 @@ class ScriptedLLM:
             self.calls.append({"name": name, "args": rec["args"], "result": res})
             out.append({"ev": "tool", "rid": rid, "name": name, "args": rec["args"], "args_raw": args,
                         "result": res, "call_id": f"c{len(self.calls)}"})
+        elif st[0] == "tool_start":
+            out.append({"ev": "tool_start", "rid": rid, "name": st[1], "args": st[2], "call_id": st[3]})
         elif st[0] == "waiting":
             out.append({"ev": "waiting", "rid": rid, "s": st[1], "names": list(st[2:])})
         elif st[0] == "wait" and st[1] > 1:
