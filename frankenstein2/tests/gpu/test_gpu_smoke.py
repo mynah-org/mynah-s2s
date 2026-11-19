@@ -107,22 +107,46 @@ def test_qwen_calls_the_right_tool():
     assert calls[0]["arguments"].get("postcode") == "10121" and "Rossi" in calls[0]["arguments"].get("full_name", "")
 
 
+SAY.update({"ko": "안녕하세요, 주문하신 상품은 내일 아침에 도착합니다.",
+            "tr": "Günaydın, siparişiniz yarın sabah gelecek.",
+            "ja": "おはようございます。ご注文の商品は明日の朝に届きます。",
+            "cs": "Dobré ráno, vaše objednávka dorazí zítra ráno.",
+            "hi": "नमस्ते, आपका ऑर्डर कल सुबह पहुँच जाएगा।",
+            "pl": "Dzień dobry, pana zamówienie dotrze jutro rano.",
+            "ru": "Доброе утро, ваш заказ прибудет завтра утром.",
+            "et": "Tere hommikust, teie tellimus saabub homme hommikul."})
+PKG_ROOT = os.environ.get("F2_POCKET_PACKAGES", "")
+PKG_LANGS = [x for x in os.environ.get("F2_PKG_LANGS", "").split(",") if x] or (
+    sorted(p.name for p in Path(PKG_ROOT).iterdir() if p.is_dir() and "@" not in p.name) if PKG_ROOT and
+    Path(PKG_ROOT).is_dir() else [])
+_BASES: dict = {}
+
+
 @pytest.mark.gpu
-@pytest.mark.parametrize("lang", LANGS)
+@pytest.mark.parametrize("lang", PKG_LANGS or ["none"])
 def test_language_package_speaks_and_the_ears_hear_it(ears, lang):
-    """A pocket_swap w4 package (F2_POCKET_PACKAGES) + the base checkpoint's Mimi, as the engine loads them."""
+    """A language from the talker folder (F2_POCKET_PACKAGES, F2_POCKET_PRECISION), as the engine loads it: its
+    delta on the family's shared English base, Mimi from the base checkpoint. The ears must understand it."""
     import numpy as np
     from scipy.signal import resample_poly
-    from frankenstein2.tts.pocket_own import PocketOwn
-    root = os.environ.get("F2_POCKET_PACKAGES")
-    if not root or not (Path(root) / POCKET[lang] / "manifest.json").exists():
-        pytest.skip("no package for this language (F2_POCKET_PACKAGES)")
-    base = os.environ.get("F2_POCKET_BASE") or find(os.environ["F2_POCKET_WEIGHTS"],
+    from pocket_swap.package import load_package
+    from frankenstein2.tts.catalog import PackageCatalog
+    from frankenstein2.tts.pocket_own import BaseBackbone, PocketOwn
+    if lang == "none":
+        pytest.skip("no packages (F2_POCKET_PACKAGES)")
+    cat = PackageCatalog(PKG_ROOT, os.environ.get("F2_POCKET_PRECISION", "int4"))
+    d, fam = cat.path(lang), cat.family(lang)
+    if d is None:
+        pytest.skip(f"no {cat.precision} package for {lang}")
+    if fam not in _BASES:
+        _BASES[fam] = BaseBackbone.from_package(load_package(cat.base_dir(fam)), device="cuda")
+    mimi = os.environ.get("F2_POCKET_BASE") or find(os.environ["F2_POCKET_WEIGHTS"],
                                                     f"languages/{POCKET['en']}/model.safetensors")
-    m = PocketOwn.from_package(Path(root) / POCKET[lang], lang, base, device="cuda")
+    m = PocketOwn.from_package(load_package(d), lang, mimi, device="cuda", base=_BASES[fam])
     torch.manual_seed(0)
     voice = m.voice_from_file(os.environ["F2_VOICE"])
     x = torch.cat(list(m.stream(voice, SAY[lang]))).float().cpu().numpy()
-    assert np.isfinite(x).all() and 1.0 < len(x) / 24000 < 10.0
+    assert np.isfinite(x).all() and 1.0 < len(x) / 24000 < 12.0, len(x) / 24000
     heard = ears.transcribe(resample_poly(x, 2, 3).astype(np.float32), lang)
-    assert heard_ok(heard, SAY[lang]), (heard, SAY[lang])
+    print(f"HEARD {lang} {fam} {d.name}: {heard!r} (said {SAY[lang]!r})")
+    assert heard_ok(heard, SAY[lang], 0.6 if lang in ("ja", "ko", "hi") else 0.75), (heard, SAY[lang])

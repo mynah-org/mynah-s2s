@@ -5,7 +5,8 @@ Layout of a package directory (one per language)::
     <lang>/manifest.json            format, base and target identity (repo, revision, sha256), precision, sizes
     <lang>/delta.safetensors[.zst]  backbone deltas vs the base (absent for the base language itself)
     <lang>/lang.safetensors[.zst]   verbatim FlowLM tensors that are not delta-coded (text embedding, head, ...)
-    <lang>/tokenizer.json           the language's tokenizer (vocabularies differ: embeddings are not diffable)
+    <lang>/tokenizer.json           the language's tokenizer (vocabularies differ: embeddings are not diffable);
+                                    tokenizer.model when the source ships SentencePiece only
     <lang>/config.yaml              the upstream language config (text preprocessing, defaults), weights paths blanked
 
 Precisions of the backbone part:
@@ -131,8 +132,10 @@ class Source:
 
 def build_package(base: Source, target: Source | None, lang: str, out_dir: str | os.PathLike,
                   tokenizer: str | os.PathLike, precision: str = "int8", group: int = 128,
-                  zstd_level: int | None = None, config_yaml: str | os.PathLike | None = None) -> dict:
-    """Write the package for `lang`. target=None builds the base language package (no delta file)."""
+                  zstd_level: int | None = None, config_yaml: str | os.PathLike | None = None,
+                  licence: str = "CC-BY-4.0", notice: str | None = None) -> dict:
+    """Write the package for `lang`. target=None builds the base language package (no delta file).
+    licence / notice: the target's licence and attribution (a community model's own terms; default Kyutai's)."""
     if precision not in PRECISIONS:
         raise ValueError(f"precision must be one of {PRECISIONS}")
     out = Path(out_dir) / lang
@@ -187,8 +190,9 @@ def build_package(base: Source, target: Source | None, lang: str, out_dir: str |
     if delta:
         files["delta"] = _write_st(delta, out / "delta.safetensors", zstd_level)
     files["lang"] = _write_st(verbatim, out / "lang.safetensors", zstd_level)
-    shutil.copyfile(tokenizer, out / "tokenizer.json")
-    files["tokenizer"] = out / "tokenizer.json"
+    tok_name = "tokenizer.model" if str(tokenizer).endswith(".model") else "tokenizer.json"   # SentencePiece or HF
+    shutil.copyfile(tokenizer, out / tok_name)
+    files["tokenizer"] = out / tok_name
     if config_yaml is not None:
         import yaml
 
@@ -209,7 +213,7 @@ def build_package(base: Source, target: Source | None, lang: str, out_dir: str |
         "delta_params": n_delta,
         "backbone_rel_err": (err2 / w2) ** 0.5 if w2 else 0.0,
         "files": {k: {"name": p.name, "bytes": p.stat().st_size, "sha256": sha256_file(p)} for k, p in files.items()},
-        "licence": {"weights": "CC-BY-4.0", "notice": LICENCE_NOTICE},
+        "licence": {"weights": licence, "notice": notice or LICENCE_NOTICE},
     }
     manifest["total_bytes"] = sum(f["bytes"] for f in manifest["files"].values())
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
@@ -251,7 +255,8 @@ def load_package(pkg_dir: str | os.PathLike, check_hashes: bool = False, pin: bo
             got = sha256_file(d / f["name"])
             if got != f["sha256"]:
                 raise ValueError(f"{d.name}/{f['name']}: sha256 mismatch")
-    p = Package(lang=m["language"], manifest=m, tokenizer_path=str(d / "tokenizer.json"),
+    tok = d / "tokenizer.json" if (d / "tokenizer.json").exists() else d / "tokenizer.model"
+    p = Package(lang=m["language"], manifest=m, tokenizer_path=str(tok),
                 config_path=str(d / "config.yaml") if (d / "config.yaml").exists() else None)
     df = _find(d, "delta.safetensors")
     if df is not None:

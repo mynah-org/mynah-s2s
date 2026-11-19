@@ -35,15 +35,11 @@ def tool_pool() -> ThreadPoolExecutor:
 # Reference shapes (VoiceChat engine, mynah_v2.agent.tools): a call still running at the deadline gets this error.
 TIMEOUT_PAYLOAD = json.dumps({"error": "timeout", "message": "I'm sorry, that's taking longer than expected."})
 
-# Said to the caller when every call of a round timed out (timeout_reply="canned", the default).
-TOOL_FAILED = {
-    "it": "Mi dispiace, non sono riuscito a recuperare l'informazione in tempo. Può riprovare tra poco?",
-    "fr": "Je suis désolé, je n'ai pas pu récupérer l'information à temps. Pouvez-vous réessayer dans un instant ?",
-    "en": "I'm sorry, I couldn't retrieve that information in time. Could you try again in a moment?",
-    "de": "Es tut mir leid, ich konnte die Information nicht rechtzeitig abrufen. Versuchen Sie es bitte gleich noch "
-          "einmal.",
-    "es": "Lo siento, no he podido obtener la información a tiempo. ¿Puede volver a intentarlo en un momento?",
-}
+# Said to the caller when every call of a round timed out (timeout_reply="canned", the default): the language's
+# "apology" phrase (langs.py; a package folder's language.json can define it for a new language).
+from .. import langs as _langs  # noqa: E402
+
+TOOL_FAILED = {c: x.phrases["apology"] for c, x in _langs.BUILTIN.items()}
 
 
 def _is_timeout(res) -> bool:
@@ -244,7 +240,7 @@ class QwenLLM:
             j["msgs"].append({"role": "tool", "content": res})
         if self.timeout_reply == "canned" and all(st == "timed_out" for st in statuses):
             # nothing came back in time: say so directly, no extra LLM round (it would only add latency)
-            msg = TOOL_FAILED.get(self.lang, TOOL_FAILED["en"])
+            msg = _langs.phrase(self.lang, "apology")
             j["text"] += msg
             self.timeouts += 1
             out.append({"ev": "text", "rid": rid, "text": msg})

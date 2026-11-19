@@ -68,6 +68,8 @@ def main():  # pragma: no cover - model run
     store = TraceStore(out / "f2_traces.sqlite")
     res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket), voices=B.voices(a),
                     ears_thr=B.thresholds(a), trace_dir=str(out), sinks=[store.sink])
+    if getattr(pocket, "catalog", None) is not None:
+        res.languages = pocket.catalog.languages
     sched = a._single["sched"]
     print("LOADED", json.dumps({"load_s": round(time.monotonic() - t_load, 1), **sched.mem(), "rss_gb": rss_gb(),
                                 "talker": pocket.langs.stats()}, default=str), flush=True)
@@ -83,7 +85,7 @@ def main():  # pragma: no cover - model run
         x, _ = sf.read(Path(a.asr_dir) / f"track_{lang}.wav", dtype="float32")
         x = x[: int(a.cut_s * 16000)]
         tracks[lang] = (x, [u for u in fz["timeline"] if u["end_k"] * 0.08 < a.cut_s])
-    voice = B.voices(a).get(a.session_voice, a.session_voice)
+    voice = a.session_voice                 # the voice NAME the server knows (--voice NAME=wav), not the path
     T0, wave, rows = time.monotonic(), 0, []
     seen = {k: 0 for k in ("ears_ms", "talker_ms", "llm_ms")}
     n_loads = n_wait = 0
@@ -94,10 +96,11 @@ def main():  # pragma: no cover - model run
                             start_delay_s=0.7 * i, reactive=True) for i in range(a.wave_n)]
         tw = time.monotonic()
         r = run_clients(specs, out / f"wave{wave:03d}")
-        rep, fa, miss, under = [], [], 0, 0
+        rep, fa, miss, under, errs = [], [], 0, 0, []
         for name, x in r.items():
             if "error" in x:
                 miss += 4
+                errs.append(f"{name}: {x['error']}"[:200])
                 continue
             u = x.get("utterances", [])
             rep += [y.get("reply_text_s") for y in u if y.get("reply_text_s") is not None]
@@ -122,7 +125,12 @@ def main():  # pragma: no cover - model run
                "loads_host": sum(1 for x in loads if x["tier"] == "host"),
                "load_ms_max": max([x["fetch_ms"] + x["build_ms"] for x in loads], default=None),
                "evictions": st["evictions"], "resident": len(st["resident"]), "failed": len(st["failed"]),
-               "sched_max_ms": comp, "underruns": under, **sched.mem(), "rss_gb": rss_gb()}
+               "sched_max_ms": comp, "underruns": under, **sched.mem(), "rss_gb": rss_gb(),
+               "client_errors": len(errs), "first_error": errs[0] if errs else None}
+        if len(errs) == len(specs) and wave >= 1:
+            print("ABORT every client failed twice:", errs[0], flush=True)
+            rows.append(row)
+            break
         rows.append(row)
         print("WAVE", json.dumps(row), flush=True)
         (out / "waves.json").write_text(json.dumps(rows, indent=1))

@@ -15,8 +15,9 @@ What it fetches:
             kyutai/pocket-tts               languages/english_2026-09_24l/model.safetensors: the base checkpoint, whose
                                             Mimi codec and voice-cloning encoder every language shares (CC-BY-4.0,
                                             gated: accept the terms on the model page and set HF_TOKEN)
-            <packages repo>                 w4/<language>/: each language's 4-bit package (pocket_swap format, built
-                                            from Kyutai's checkpoints by frankenstein2/scripts/build_packages.py)
+            <packages repo>                 <code>/<family>/<precision>/: each language's delta against the English
+                                            base of its family (en/<family>/base), int4 by default
+                                            (frankenstein2/scripts/build_packages.py builds them)
           --talker full:
             kyutai/pocket-tts               languages/<lang>/model.safetensors per language (gated, as above)
             kyutai/pocket-tts-without-voice-cloning   languages/<lang>/tokenizer.* (not gated)
@@ -60,28 +61,52 @@ def llm_repo(llm: str) -> tuple:
     return llm, ("nano" if "nemotron-nano" in llm.lower() else "qwen")
 
 
+def pick_families(files: list, langs: list, families=("24l", "6l"), precision: str = "int4") -> dict:
+    """code -> the first family the packages repo has for it at ``precision`` (English: its base)."""
+    have = set(files)
+    out = {}
+    for c in langs:
+        for fam in families:
+            prec = "base" if c == "en" else precision
+            if f"{c}/{fam}/{prec}/manifest.json" in have:
+                out[c] = fam
+                break
+    return out
+
+
 def plan(langs: list, llm: str, voice: str, talker: str = "packages", packages_repo: str = PACKAGES_REPO,
-         precision: str = "w4") -> list:
-    """[(repo, allow_patterns or None = whole repo, role)]."""
+         precision: str = "int4", families: dict | None = None) -> list:
+    """[(repo, allow_patterns or None = whole repo, role)]. ``families``: code -> family (pick_families); without
+    it every family of each language is fetched."""
     repo, _ = llm_repo(llm)
     steps = [(EARS, None, "ears"),
              (repo, ["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja", "*.py", "LICENSE*"], "llm")]
     if talker == "packages":
-        steps += [(POCKET_CLONE, [f"languages/{BASE}/model.safetensors"], "talker base (gated)"),
-                  (packages_repo, [f"{precision}/{POCKET[x]}/*" for x in langs], "talker language packages")]
+        fams = families or {}
+        pats = [f"{c}/language.json" for c in langs] + ["en/language.json", "README.md", "LICENSE.md"]
+        for c in langs:
+            for fam in ([fams[c]] if c in fams else ["24l", "6l"]):
+                pats.append(f"{c}/{fam}/{'base' if c == 'en' else precision}/*")
+        for fam in sorted(set(fams.values()) if fams else {"24l", "6l"}):
+            pats.append(f"en/{fam}/base/*")                      # the family's shared base backbone
+        steps += [(POCKET_CLONE, [f"languages/{BASE}/model.safetensors"], "talker Mimi + voice cloning (gated)"),
+                  (packages_repo, sorted(set(pats)), "talker language packages")]
     else:
         steps += [(POCKET_CLONE, [f"languages/{POCKET[x]}/model.safetensors" for x in langs], "talker weights (gated)"),
                   (POCKET_TOK, [f"languages/{POCKET[x]}/tokenizer*" for x in langs], "talker tokenizers")]
     return steps + [(VOICES, [voice], "reference voice")]
 
 
-def check_langs(raw: str) -> list:
-    langs = [x.strip().lower() for x in raw.split(",") if x.strip()]
-    bad = [x for x in langs if x not in POCKET]
+def check_langs(raw: str, talker: str = "packages") -> list:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from frankenstein2 import langs as LG
+    codes = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    ok = LG.known() if talker == "packages" else list(POCKET)
+    bad = [x for x in codes if x not in ok]
     if bad:
-        sys.exit(f"no official Pocket TTS model for {bad}; official: {sorted(POCKET)}. Community models for other "
-                 "languages are listed in docs/frankenstein2-languages.md (not wired into this script).")
-    return langs
+        sys.exit(f"no talker language for {bad}; available: {sorted(ok)} (docs/frankenstein2-languages.md: a new "
+                 "language is a folder in the packages layout)")
+    return codes
 
 
 def sizes(api, repo: str, patterns, token) -> int:
@@ -104,22 +129,32 @@ def main(argv=None) -> int:
                     help="packages = base checkpoint + per-language 4-bit packages (default); full = one full "
                          "checkpoint per language")
     ap.add_argument("--packages-repo", default=PACKAGES_REPO, help="Hugging Face repo with the language packages")
+    ap.add_argument("--precision", default="int4", choices=["int4", "int8", "bf16"],
+                    help="which delta of each language to fetch (int4 is the engine's default)")
     ap.add_argument("--voice", default="alba-mackenna/casual.wav", help=f"reference WAV inside {VOICES}")
     ap.add_argument("--env-file", default="", help="where to write the F2_* paths (default <hf-home>/f2.env)")
     ap.add_argument("--dry-run", action="store_true", help="only list what would be downloaded and its size")
     a = ap.parse_args(argv)
-    langs = check_langs(a.langs)
+    langs = check_langs(a.langs, a.talker)
     untested = [x for x in langs if x not in TESTED]
     if untested:
-        print(f"NOTE: {untested} have official models but are not wired / tested in the engine yet "
-              "(docs/frankenstein2-languages.md).")
+        print(f"NOTE: {untested} are not tested end to end yet (docs/frankenstein2-languages.md).")
     try:
         from huggingface_hub import HfApi, snapshot_download
     except ImportError:
         sys.exit("pip install huggingface_hub (or run inside the engine's environment)")
     token = os.environ.get("HF_TOKEN") or None
     cache = Path(a.hf_home) / "hub"
-    steps = plan(langs, a.llm, a.voice, a.talker, a.packages_repo)
+    fams = None
+    if a.talker == "packages":
+        try:
+            fams = pick_families(HfApi().list_repo_files(a.packages_repo, token=token), langs, precision=a.precision)
+            missing = [c for c in langs if c not in fams]
+            if missing:
+                print(f"NOTE: {a.packages_repo} has no {a.precision} package for {missing}")
+        except Exception as e:  # noqa: BLE001 - listing failed: fetch every family
+            print(f"NOTE: could not list {a.packages_repo} ({type(e).__name__}); fetching every family")
+    steps = plan(langs, a.llm, a.voice, a.talker, a.packages_repo, a.precision, fams)
     llm, backend = llm_repo(a.llm)
     if a.dry_run:
         api = HfApi()
@@ -147,7 +182,8 @@ def main(argv=None) -> int:
            "F2_POCKET_WEIGHTS": paths[POCKET_CLONE], "F2_VOICE": str(Path(paths[VOICES]) / a.voice),
            "F2_LANGS": ",".join(langs), "HF_HOME": a.hf_home}
     if a.talker == "packages":
-        env["F2_POCKET_PACKAGES"] = str(Path(paths[a.packages_repo]) / "w4")
+        env["F2_POCKET_PACKAGES"] = str(Path(paths[a.packages_repo]))
+        env["F2_POCKET_PRECISION"] = a.precision
         env["F2_POCKET_BASE"] = str(Path(paths[POCKET_CLONE]) / "languages" / BASE / "model.safetensors")
     else:
         env["F2_POCKET_TOKENIZERS"] = paths[POCKET_TOK]

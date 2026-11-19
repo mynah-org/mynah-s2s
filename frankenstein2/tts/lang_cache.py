@@ -162,6 +162,7 @@ class TalkerLangs:
                 obj = self.build(name, h)
                 t2 = self.clock()
                 info.update(fetch_ms=round((t1 - t0) * 1000, 1), build_ms=round((t2 - t1) * 1000, 1))
+                info.update(getattr(obj, "timing", None) or {})
                 self._done.put((name, obj, info))
             except Exception as e:  # noqa: BLE001 - a broken package fails that language only
                 info["error"] = f"{type(e).__name__}: {e}"

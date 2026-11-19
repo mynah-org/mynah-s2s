@@ -7,17 +7,21 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from frankenstein2.scripts.setup_models import POCKET, TESTED, check_langs, llm_repo, plan  # noqa: E402
+from frankenstein2.scripts.setup_models import POCKET, TESTED, check_langs, llm_repo, pick_families, plan  # noqa: E402
 
 
-def test_plan_packages_default_fetches_the_base_and_one_package_per_language():
-    steps = {role: (repo, pats) for repo, pats, role in plan(["it", "fr"], "qwen4b", "alba-mackenna/casual.wav",
-                                                              packages_repo="u/pocket-tts-deltas")}
-    assert steps["ears"] == ("nineninesix/tyger", None)
+def test_plan_packages_fetches_each_language_in_its_family_and_the_family_bases():
+    files = ["it/24l/int4/manifest.json", "it/6l/int4/manifest.json", "cs/6l/int4/manifest.json",
+             "en/24l/base/manifest.json", "en/6l/base/manifest.json"]
+    fams = pick_families(files, ["it", "cs", "en"])
+    assert fams == {"it": "24l", "cs": "6l", "en": "24l"}
+    steps = {role: (repo, pats) for repo, pats, role in plan(["it", "cs", "en"], "qwen4b", "alba-mackenna/casual.wav",
+                                                              packages_repo="u/pocket-tts-deltas", families=fams)}
+    pats = steps["talker language packages"][1]
+    assert "it/24l/int4/*" in pats and "cs/6l/int4/*" in pats and "en/24l/base/*" in pats and "en/6l/base/*" in pats
+    assert not any(p.startswith("it/6l") for p in pats)
+    assert steps["talker Mimi + voice cloning (gated)"][1] == ["languages/english_2026-09_24l/model.safetensors"]
     assert steps["llm"][0] == "Qwen/Qwen3.5-4B"
-    assert steps["talker base (gated)"][1] == ["languages/english_2026-09_24l/model.safetensors"]
-    assert steps["talker language packages"] == ("u/pocket-tts-deltas", ["w4/italian_24l/*", "w4/french_24l/*"])
-    assert steps["reference voice"] == ("kyutai/tts-voices", ["alba-mackenna/casual.wav"])
 
 
 def test_plan_full_checkpoints_and_llm_choices():
@@ -32,8 +36,11 @@ def test_plan_full_checkpoints_and_llm_choices():
 def test_languages_are_checked_against_the_official_pocket_list():
     assert check_langs(" IT, en ,fr") == ["it", "en", "fr"]
     assert set(TESTED) <= set(POCKET) and len(POCKET) == 7
+    assert check_langs("it,cs,ko") == ["it", "cs", "ko"]               # packages: every registered language
     with pytest.raises(SystemExit):
-        check_langs("it,cs")
+        check_langs("it,cs", talker="full")                         # full checkpoints: official only
+    with pytest.raises(SystemExit):
+        check_langs("xx")
 
 
 def test_engine_language_table_matches_the_setup_script():

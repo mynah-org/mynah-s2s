@@ -35,13 +35,13 @@ from .ears.client import UserText
 from .text.chunker import Chunker, speech_text
 from .tts.base import parse_sid, seg_id
 
-HOLDING = {"it": "Un momento, controllo.", "fr": "Un instant, je vérifie.", "en": "One moment, let me check.",
-           "de": "Einen Moment, ich schaue nach.", "es": "Un momento, lo compruebo."}
-# On-hold reminder while a tool is still running (VoiceChat engine: on-hold messages + reminders during FC).
-HOLD_REMINDER = {"it": "Ci sono quasi, ancora un attimo.", "fr": "J'y suis presque, encore un instant.",
-                 "en": "Almost there, just a moment more.", "de": "Gleich habe ich es, noch einen Moment.",
-                 "es": "Ya casi, un momento más."}
-BACKCHANNEL = {"it": "Mh-mh.", "fr": "Mh-mh.", "en": "Mm-hmm.", "de": "Mh-mh.", "es": "Mh-mh."}
+# Fixed phrases per language live in langs.py (built-in table + language.json of a package folder); these dicts are
+# the built-in values, kept for callers and tests that read them.
+from . import langs as _langs  # noqa: E402
+
+HOLDING = {c: x.phrases["holding"] for c, x in _langs.BUILTIN.items()}
+HOLD_REMINDER = {c: x.phrases["reminder"] for c, x in _langs.BUILTIN.items()}
+BACKCHANNEL = {c: x.phrases["backchannel"] for c, x in _langs.BUILTIN.items()}
 STEP = 1280
 
 
@@ -217,7 +217,7 @@ class Pipeline:
 
     def _canned(self) -> str:
         """Fixed phrases the agent may be saying (the barge check must not take their echo for the user)."""
-        return HOLDING.get(self.lang, "") + " " + HOLD_REMINDER.get(self.lang, "")
+        return _langs.phrase(self.lang, "holding") + " " + _langs.phrase(self.lang, "reminder")
 
     def _on_llm(self, e: dict, k: int) -> None:
         kind, rid = e["ev"], e.get("rid")
@@ -282,8 +282,7 @@ class Pipeline:
             self.tr.emit("llm.request", k, request_id=d["request_id"], turn_id=a.turn,
                          n_messages=len(self.conv.messages))
         elif a.kind == "HOLDING_PHRASE":
-            table = HOLD_REMINDER if a.reason == "tool_wait" else HOLDING
-            txt = table.get(self.lang, table["en"])
+            txt = _langs.phrase(self.lang, "reminder" if a.reason == "tool_wait" else "holding")
             self._say(self._turn_out(), txt, speech_text(txt, self.lang), holding=True)
         elif a.kind == "SPEAK":
             to = self._turn_out()
@@ -297,7 +296,7 @@ class Pipeline:
             if not to.text and d.get("text"):
                 to.text = d["text"]
         elif a.kind == "BACKCHANNEL":
-            txt = BACKCHANNEL.get(self.lang, BACKCHANNEL["en"])
+            txt = _langs.phrase(self.lang, "backchannel")
             self._say(self._turn_out(turn=self.ctl.turn), txt, txt, lane="bc")
         elif a.kind == "CANCEL":
             old_epoch, turn = a.epoch, a.turn

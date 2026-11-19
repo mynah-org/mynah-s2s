@@ -746,11 +746,16 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
     LANGS = {"it": "italian_24l", "fr": "french_24l", "en": "english_2026-09_24l", "es": "spanish_24l",
              "de": "german_24l", "pt": "portuguese_24l", "nl": "dutch_24l"}   # kyutai/pocket-tts official
 
-    CODE = {v: k for k, v in LANGS.items()}
+    from . import langs as LG
     dev_t = torch.device(getattr(a, "talker_device", "cuda"))
     side = torch.cuda.Stream(device=dev_t) if dev_t.type == "cuda" else None
     pk_root = getattr(a, "pocket_packages", "") or ""
-    st = {"mimi": None, "pool": None}
+    catalog = None
+    if pk_root:
+        from .tts.catalog import PackageCatalog
+        catalog = PackageCatalog(pk_root, getattr(a, "pocket_precision", "int4"),
+                                 families=tuple(x for x in getattr(a, "pocket_families", "24l,6l").split(",") if x))
+    st = {"mimi": None, "pool": {}, "base": {}}
 
     def find_ckpt(name):
         root = Path(a.pocket_weights)                    # a snapshot dir, or the repo's snapshots dir (any snapshot)
@@ -761,47 +766,74 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
             raise FileNotFoundError(f"no Pocket checkpoint for {name} under {root}")
         return w
 
+    def base_ckpt():
+        return getattr(a, "pocket_base", "") or find_ckpt(LANGS["en"])
+
     def fetch(name):                                     # loader thread: disk -> host
-        if pk_root:
+        code = name.split("@")[0]
+        if catalog is not None:
+            d = catalog.path(name)
+            if d is None:
+                raise FileNotFoundError(f"no package for {name!r} under {pk_root} ({catalog.precision})")
             from .tts.pocket_own import _pocket_swap
             _pocket_swap()                               # pocket_swap on sys.path
             from pocket_swap.package import load_package
-            return load_package(Path(pk_root) / name, pin=bool(getattr(a, "talker_pin", True)) and side is not None)
-        base = name.split("@")[0]
-        tk = sorted(Path(a.pocket_tokenizers).glob(f"*/languages/{base}/tokenizer.json")) or \
-            sorted(Path(a.pocket_tokenizers).glob(f"languages/{base}/tokenizer.json"))
-        return (find_ckpt(base), tk[0])
+            return load_package(d, pin=bool(getattr(a, "talker_pin", True)) and side is not None)
+        pocket = LG.get(code).pocket or LANGS.get(code)
+        tk = sorted(Path(a.pocket_tokenizers).glob(f"*/languages/{pocket}/tokenizer.json")) or \
+            sorted(Path(a.pocket_tokenizers).glob(f"languages/{pocket}/tokenizer.json"))
+        return (find_ckpt(pocket), tk[0])
 
     def build(name, h):                                  # loader thread: host -> GPU on its own stream
-        from .tts.pocket_own import PocketBatch, PocketOwn, SlotPool
-        code = CODE.get(name.split("@")[0], "en")
+        from .tts.pocket_own import BaseBackbone, PocketBatch, PocketOwn, SlotPool
+        code = name.split("@")[0]
         wq = getattr(a, "pocket_wq", "w4")
         ctx = torch.cuda.stream(side) if side is not None else contextlib.nullcontext()
+        t0 = time.monotonic()
         with torch.no_grad(), ctx:
-            if pk_root:
-                mimi = st["mimi"] or getattr(a, "pocket_base", "") or find_ckpt(LANGS["en"])
-                m = PocketOwn.from_package(h, code, mimi, device=dev_t)
+            if catalog is not None:
+                mimi = st["mimi"] or base_ckpt()
+                base = None
+                fam = catalog.family(name)
+                if h.manifest["precision"] in ("int4", "int8", "bf16", "exact"):
+                    if fam not in st["base"]:            # the family's shared English base backbone, once
+                        bd = catalog.base_dir(fam)
+                        if bd is None:
+                            if h.manifest["precision"] != "exact":
+                                raise FileNotFoundError(f"{name}: no base package {catalog.root}/en/{fam}/base")
+                        else:
+                            from pocket_swap.package import load_package
+                            st["base"][fam] = BaseBackbone.from_package(
+                                load_package(bd), device=dev_t,
+                                precision=getattr(a, "pocket_base_precision", "bf16"))
+                    base = st["base"].get(fam)
+                m = PocketOwn.from_package(h, code, mimi, device=dev_t, base=base)
             else:
                 dt = {"bf16": torch.bfloat16, "fp32": torch.float32}[getattr(a, "pocket_dtype", "bf16")]
                 m = PocketOwn(h[0], h[1], lang=code, device=dev_t, dtype=dt, wq="" if wq in ("", "none") else wq,
                               share_mimi=st["mimi"])
             if st["mimi"] is None:
                 st["mimi"] = m                           # Mimi (codec + voice encoder) loaded once for all languages
-            if st["pool"] is None:
-                st["pool"] = SlotPool(m, slots=slots, max_len=512)
-            if not st["pool"].fits(m):
-                raise ValueError(f"{name}: architecture differs from the slot pool's")
+            arch = (m.n_layers, m.nh, m.d // m.nh, m.mimi_layers)
+            if arch not in st["pool"]:                   # one slot pool per architecture (24-layer today)
+                st["pool"][arch] = SlotPool(m, slots=slots, max_len=512)
+            pool = st["pool"][arch]
+            if side is not None:
+                side.synchronize()
+            t1 = time.monotonic()
             voices = {dv: m.voice_from_file(dv)} if dv else {}
-            batch = PocketBatch(m, pool=st["pool"])
+            batch = PocketBatch(m, pool=pool)
         if side is not None:
             side.synchronize()                           # resident before the scheduler's stream uses it
-        return _Lang(m, batch, voices)
+        L = _Lang(m, batch, voices)
+        L.timing = {"model_ms": round((t1 - t0) * 1000, 1), "voice_ms": round((time.monotonic() - t1) * 1000, 1)}
+        return L
 
     rot = int(getattr(a, "talker_rotate", 0) or 0)
     seq: dict = {}
 
     def names(lang, ss):
-        base = LANGS[lang]
+        base = lang if catalog is not None else LANGS.get(lang, lang)
         if not rot or ss is None:
             return base
         k = seq[lang] = (seq.get(lang, -1) + 1) % rot   # lab: sessions of a language spread over N package copies
@@ -840,4 +872,5 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
         llm.ready = {"ev": "ready", **ready["llm"]}
         sched.llm = llm
     talker.ready = {"ev": "ready", "inproc": True}
-    return {"ears": ears, "talker": talker, "llm": llm, "sched": sched, "ready": ready}
+    talker.catalog = catalog
+    return {"ears": ears, "talker": talker, "llm": llm, "sched": sched, "ready": ready, "catalog": catalog}

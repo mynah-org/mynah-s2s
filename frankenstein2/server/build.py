@@ -89,8 +89,15 @@ def add_args(ap) -> None:
                     help="single: where languages/<lang>/tokenizer.json are (env F2_POCKET_TOKENIZERS)")
     ap.add_argument("--pocket-preload", default="it,en,fr", help="single: talker languages loaded at start")
     ap.add_argument("--pocket-packages", default=env("F2_POCKET_PACKAGES", ""),
-                    help="single: pocket_swap weight-only language packages (w4/w8/wfp8), one dir per language "
-                         "(env F2_POCKET_PACKAGES); without it each language loads from its full checkpoint")
+                    help="single: the talker language folder <root>/<code>/<precision>/ (env F2_POCKET_PACKAGES; "
+                         "docs/frankenstein2-languages.md); without it each language loads from its full checkpoint")
+    ap.add_argument("--pocket-precision", default=env("F2_POCKET_PRECISION", "int4"),
+                    help="which package of each language: int4 / int8 / bf16 (deltas on the English base, default "
+                         "int4) or w4 / w8 (weight-only)")
+    ap.add_argument("--pocket-families", default=env("F2_POCKET_FAMILIES", "24l,6l"),
+                    help="model families in order of preference (24-layer, then 6-layer)")
+    ap.add_argument("--pocket-base-precision", default="bf16", choices=["bf16", "int8", "int4"],
+                    help="the shared base backbone of the delta packages: bf16 (exact) or quantised once")
     ap.add_argument("--pocket-base", default=env("F2_POCKET_BASE", ""),
                     help="single + packages: the checkpoint whose Mimi (codec + voice-cloning encoder) every language "
                          "shares (default: the English checkpoint under --pocket-weights)")
@@ -103,6 +110,18 @@ def add_args(ap) -> None:
     ap.add_argument("--talker-budget-ms", type=float, default=40.0)
     ap.add_argument("--child-env", action="append", default=[],
                     help="KEY=VALUE for the ears and talker processes (their own environments' caches / headers)")
+
+
+def session_lang(code: str):
+    """frankenstein_s2s's SessionLanguage for the LLM prompt; a language it does not list (one added by a package
+    folder's language.json) is built from frankenstein2.langs."""
+    from frankenstein_s2s.lang import SessionLanguage, session_language
+    try:
+        return session_language(code)
+    except ValueError:
+        from frankenstein2 import langs
+        x = langs.get(code)
+        return SessionLanguage(code, x.asr_locale, x.name, x.pocket)
 
 
 def resolve_llm(a) -> None:
@@ -213,7 +232,7 @@ def qwen_factory(a, proc, spec):  # pragma: no cover - process
     policy = {**P1, **POLICY}
 
     def make(sid, lang, system_prompt=None):
-        L = session_language(lang)
+        L = session_lang(lang)
         said: list = []
         backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
         backend._said = said
@@ -254,7 +273,7 @@ def llm_factory(a, shared, spec, on_ledger=None):  # pragma: no cover - GPU
     policy = {**P1, **POLICY}
 
     def make(sid, lang, system_prompt=None):
-        L = session_language(lang)
+        L = session_lang(lang)
         said: list = []
         backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
         backend._said = said

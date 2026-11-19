@@ -63,16 +63,32 @@ def prepare_text(text: str, remove_semicolons: bool) -> tuple[str, int]:
     return text, after
 
 
+def _opts(lang: str) -> dict:
+    """Text options of a language (langs.py: built-in or a package's language.json)."""
+    from .. import langs
+    if lang in LANG_OPTS:
+        return LANG_OPTS[lang]
+    return {"remove_semicolons": langs.get(lang).remove_semicolons}
+
+
 class _Tok:
+    """tokenizer.json (HF tokenizers) or tokenizer.model (SentencePiece, as some community languages ship it)."""
+
     def __init__(self, path):
-        from tokenizers import Tokenizer
-        self.t = Tokenizer.from_file(str(path))
+        if str(path).endswith(".model"):
+            import sentencepiece as spm
+            sp = spm.SentencePieceProcessor(model_file=str(path))
+            self.enc, self.dec = (lambda s: sp.encode(s)), sp.decode
+        else:
+            from tokenizers import Tokenizer
+            t = Tokenizer.from_file(str(path))
+            self.enc, self.dec = (lambda s: t.encode(s).ids), t.decode
 
     def __call__(self, s):
-        return self.t.encode(s).ids
+        return self.enc(s)
 
     def decode(self, ids):
-        return self.t.decode(ids)
+        return self.dec(ids)
 
 
 def _bounds(toks, bset, tok=None, skip_decimal=False):
@@ -229,6 +245,55 @@ class _nullctx:
         return False
 
 
+class BaseBackbone:
+    """The English 24-layer base's FlowLM transformer weights, loaded once and shared by every delta language
+    (``precision``: bf16 = exact, or int8 / int4 quantised once to save memory and bandwidth)."""
+
+    def __init__(self, checkpoint: str, device="cuda", precision: str = "bf16", group: int = 128):
+        from safetensors import safe_open
+        _, quant = _pocket_swap()
+        from pocket_swap.package import backbone_fingerprint_file
+        self.fingerprint = backbone_fingerprint_file(checkpoint)
+        self.source_sha = None
+        self.precision = precision
+        self.terms, self.cols = {}, {}
+        dev = torch.device(device)
+        with safe_open(str(checkpoint), framework="pt", device=str(dev)) as f:
+            for k in f.keys():
+                if k.startswith("flow_lm.transformer.") and len(f.get_slice(k).get_shape()) == 2:
+                    w = f.get_tensor(k).to(torch.bfloat16)
+                    self.cols[k] = w.shape[1]
+                    if precision == "bf16":
+                        self.terms[k] = ("bf16", w, None)
+                    else:
+                        q, sc = quant.quantize_any(w.float(), precision, group)
+                        self.terms[k] = (precision, q, sc)
+
+    @classmethod
+    def from_package(cls, pkg, device="cuda", precision: str = "bf16", group: int = 128) -> "BaseBackbone":
+        """From the base language's ``exact`` package (``<root>/en/<family>/base``): its backbone stored verbatim."""
+        _, quant = _pocket_swap()
+        if pkg.manifest["precision"] != "exact":
+            raise ValueError(f"the base backbone comes from an exact package, not {pkg.manifest['precision']!r}")
+        self = cls.__new__(cls)
+        self.fingerprint = pkg.manifest["base_backbone_bf16_sha256"]
+        self.source_sha = (pkg.manifest.get("target") or {}).get("sha256")
+        self.precision, self.terms, self.cols = precision, {}, {}
+        dev = torch.device(device)
+        for k in pkg.delta_keys():
+            w = pkg.delta[k].to(dev, non_blocking=True).to(torch.bfloat16)
+            self.cols[k] = w.shape[1]
+            if precision == "bf16":
+                self.terms[k] = ("bf16", w, None)
+            else:
+                q, sc = quant.quantize_any(w.float(), precision, group)
+                self.terms[k] = (precision, q, sc)
+        return self
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for term in self.terms.values() for t in term[1:] if t is not None)
+
+
 class PocketOwn:
     def __init__(self, weights: str, tokenizer: str, lang: str = "it", device="cuda", W: dict | None = None,
                  dtype=torch.float32, wq: str = "", share_mimi: "PocketOwn | None" = None):
@@ -245,7 +310,7 @@ class PocketOwn:
             dtype = torch.bfloat16
         self.tdtype = dtype
         self.lang = lang
-        self.opts = LANG_OPTS.get(lang, {"remove_semicolons": False})
+        self.opts = _opts(lang)
         if W is None:
             W = {}
             with safe_open(str(weights), framework="pt", device=str(self.dev)) as f:
@@ -258,6 +323,7 @@ class PocketOwn:
             W = {k: (v.to(dtype) if k.startswith("flow_lm.transformer.") and v.is_floating_point() else v)
                  for k, v in W.items()}
         self.Q: dict = {}                     # key -> (precision, codes, scales, in_features): quantised linears
+        self.QB: dict = {}                    # key -> shared base term (delta packages only)
         self.wq = wq
         if wq:
             _, quant = _pocket_swap()
@@ -279,21 +345,30 @@ class PocketOwn:
                                and k.endswith("norm1.weight"))
 
     @classmethod
-    def from_package(cls, pkg, lang: str, mimi, device="cuda", stream=None) -> "PocketOwn":
-        """A language from a pocket_swap weight-only package (``w4`` / ``w8`` / ``wfp8``): the package's quantised
-        backbone codes become the quantised linears as they are (no dequantise / requantise), its other FlowLM
-        tensors and tokenizer are used verbatim, and Mimi (identical in every language) comes from ``mimi``: a loaded
-        PocketOwn to share, or a checkpoint path (its ``mimi.*`` tensors only).
+    def from_package(cls, pkg, lang: str, mimi, device="cuda", stream=None, base: "BaseBackbone | None" = None
+                     ) -> "PocketOwn":
+        """A language from a pocket_swap package. Weight-only (``w4`` / ``w8`` / ``wfp8``): the package's quantised
+        backbone codes become the quantised linears as they are. Delta (``int4`` / ``int8`` / ``bf16``, built against
+        the English 24-layer base): each linear keeps only the language's delta and computes x @ (W_base + delta)
+        with the shared ``base`` backbone in pocket_swap's fused kernel (the full weight is never written); ``base``
+        = the base language itself. The other FlowLM tensors and the tokenizer are used verbatim; Mimi (identical in
+        every language) comes from ``mimi``: a loaded PocketOwn to share, or a checkpoint path (``mimi.*`` only).
         ``pkg``: a pocket_swap Package (host tensors, possibly pinned) or a package directory."""
         _, quant = _pocket_swap()
         if not hasattr(pkg, "manifest"):
             from pocket_swap.package import load_package
             pkg = load_package(pkg)
         prec = pkg.manifest["precision"]
-        wp = {"w4": "int4", "w8": "int8", "wfp8": "fp8"}.get(prec)
-        if wp is None:
-            raise ValueError(f"{pkg.lang}: package precision {prec!r}; the engine loads weight-only packages "
-                             "(w4 / w8 / wfp8)")
+        wp = {"w4": "int4", "w8": "int8", "wfp8": "fp8", "int4": "int4", "int8": "int8", "bf16": "bf16",
+              "base": None, "exact": "bf16"}.get(prec, "?")
+        if wp == "?":
+            raise ValueError(f"{pkg.lang}: package precision {prec!r} not loadable (w4/w8/wfp8, int4/int8/bf16 "
+                             "deltas, base)")
+        is_delta = prec in ("int4", "int8", "bf16", "base")
+        if is_delta and base is None:
+            raise ValueError(f"{pkg.lang}: a {prec} package needs the base backbone (BaseBackbone)")
+        if is_delta and pkg.manifest.get("base_backbone_bf16_sha256") not in (None, base.fingerprint):
+            raise ValueError(f"{pkg.lang}: built against another base checkpoint than the one loaded")
         if int(pkg.manifest.get("group", 128)) != 128:
             raise ValueError(f"{pkg.lang}: group {pkg.manifest.get('group')} (the fused kernel uses 128)")
         dev = torch.device(device)
@@ -313,20 +388,46 @@ class PocketOwn:
                 v = v.to(dev, non_blocking=True)
                 W[k] = (v.to(torch.bfloat16) if k.startswith("flow_lm.transformer.") else v.float()) \
                     if v.is_floating_point() else v
-            Q = {}
-            for k in pkg.delta_keys():
-                q = pkg.delta[k + ".q"].to(dev, non_blocking=True)
-                sc = pkg.delta[k + ".s"].to(dev, non_blocking=True)
+            Q, QB = {}, {}
+            if prec == "exact" and base is not None and \
+                    (pkg.manifest.get("target") or {}).get("sha256") in (base.source_sha, None) and \
+                    pkg.manifest.get("base_backbone_bf16_sha256") == base.fingerprint and \
+                    getattr(base, "source_sha", None) is not None:
+                prec = "base"                          # the base language itself: reuse the shared backbone
+            keys = list(base.terms) if prec == "base" else pkg.delta_keys()
+            for k in keys:
+                lin = k.endswith(("_proj.weight", "linear1.weight", "linear2.weight"))
+                if prec == "base":                     # the base language: the shared base backbone as is
+                    bt = base.terms[k]
+                    if bt[0] == "bf16":
+                        W[k] = bt[1]
+                    else:
+                        Q[k] = (bt[0], bt[1], bt[2], base.cols[k])
+                    continue
+                if prec == "exact":                    # the language's own weights, verbatim bf16 (no base needed)
+                    W[k] = pkg.delta[k].to(dev, non_blocking=True).to(torch.bfloat16)
+                    continue
+                if wp == "bf16":
+                    q, sc = pkg.delta[k].to(dev, non_blocking=True).to(torch.bfloat16), None
+                else:
+                    q = pkg.delta[k + ".q"].to(dev, non_blocking=True)
+                    sc = pkg.delta[k + ".s"].to(dev, non_blocking=True)
                 cols = q.shape[1] * (2 if wp == "int4" else 1)
-                if k.endswith(("_proj.weight", "linear1.weight", "linear2.weight")):
+                if lin:
                     Q[k] = (wp, q, sc, cols)
+                    if is_delta:
+                        QB[k] = base.terms[k]          # shared: x @ (W_base + delta) in the fused kernel
                 else:                                  # any other 2-D backbone tensor: plain bf16
-                    W[k] = quant.dequant_any(q, sc, wp, cols, torch.bfloat16)
+                    w = quant.dequant_any(q, sc, wp, cols, torch.float32)
+                    if is_delta:
+                        bt = base.terms[k]
+                        w = w + quant.dequant_any(bt[1], bt[2], bt[0], cols, torch.float32)
+                    W[k] = w.to(torch.bfloat16)
             if stream is not None and dev.type == "cuda":
                 stream.synchronize()                   # everything resident before another stream reads it
         self.dev, self.tdtype, self.lang, self.wq = dev, torch.bfloat16, lang, prec
-        self.opts = LANG_OPTS.get(lang, {"remove_semicolons": False})
-        self.Q, self.W = Q, W
+        self.opts = _opts(lang)
+        self.Q, self.QB, self.W = Q, QB, W
         self.tok = _Tok(pkg.tokenizer_path)
         self.n_layers = sum(1 for k in W if k.startswith("flow_lm.transformer.layers.") and k.endswith("norm1.weight"))
         self.d = W["flow_lm.input_linear.weight"].shape[0]
@@ -345,11 +446,16 @@ class PocketOwn:
         if t is None:
             return F.linear(x, self.W[key])
         prec, q, sc, cols = t
+        b = self.QB.get(key) if self.QB else None          # shared base term of a delta package
         fused, quant = _pocket_swap()
         x = x.to(torch.bfloat16)
-        if x.numel() // x.shape[-1] <= 16 and fused.available(x, (prec,)):
-            return fused.fused_linear2(x, q.shape[0], (prec, q, sc), None, 128)
-        return F.linear(x, quant.dequant_any(q, sc, prec, cols, torch.bfloat16))
+        if x.numel() // x.shape[-1] <= 16 and fused.available(x, (prec,) + ((b[0],) if b else ())):
+            return fused.fused_linear2(x, q.shape[0], (prec, q, sc), b, 128)
+        if b is None:
+            return F.linear(x, quant.dequant_any(q, sc, prec, cols, torch.bfloat16))
+        w = quant.dequant_any(q, sc, prec, cols, torch.float32) + quant.dequant_any(b[1], b[2], b[0], cols,
+                                                                                     torch.float32)
+        return F.linear(x, w.to(torch.bfloat16))
 
     def nbytes(self) -> dict:
         own = sum(v.numel() * v.element_size() for k, v in self.W.items() if not k.startswith("mimi."))

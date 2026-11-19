@@ -80,6 +80,9 @@ def main():  # pragma: no cover - GPU
     res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket),
                     voices=B.voices(a), ears_thr=B.thresholds(a), trace_dir=str(td), sinks=sinks,
                     store_text=not a.trace_no_text)
+    cat = getattr(getattr(pocket, "catalog", None), "languages", None)
+    if cat is not None:                          # packages: every language folder is served, found by scanning
+        res.languages = cat
     loads = {"load_s": round(time.monotonic() - t0, 1), "ears": ears.ready, "talker": pocket.ready,
              "llm": llm_info}
     (td / "server_loads.json").write_text(json.dumps(loads, indent=1, default=str))

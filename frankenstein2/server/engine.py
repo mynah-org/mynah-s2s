@@ -37,7 +37,7 @@ class Resources:
     ears: object
     make_llm: object
     make_talker: object
-    languages: tuple = ("it", "en", "fr")
+    languages: object = ("it", "en", "fr")            # a tuple, or a callable -> codes (the talker's package folder)
     voices: dict = field(default_factory=dict)          # name -> reference wav (or stock name)
     ears_thr: dict = field(default_factory=dict)        # language -> threshold overrides
     client_delay_steps: int = 1
@@ -46,14 +46,21 @@ class Resources:
     store_text: bool = True                              # False: user / agent text never reaches a trace or sink
 
 
+def served_languages(res) -> tuple:
+    """The languages a session may ask for: fixed, or what the talker's package folder holds right now (a folder
+    added while the server runs is served from the next session on)."""
+    return tuple(res.languages() if callable(res.languages) else res.languages)
+
+
 def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", system_prompt: str | None = None,
                   sink=None, trace: bool = True):
     """One session's Pipeline on the shared resources (language and voice fixed for the session)."""
     from frankenstein2.core import Pipeline, PipelineConfig
     from frankenstein2.ears.client import EarsLink
     from frankenstein2.tracing import Tracer
-    if language not in res.languages:
-        raise ValueError(f"language {language!r} not served; available {list(res.languages)}")
+    served = served_languages(res)
+    if language not in served:
+        raise ValueError(f"language {language!r} not served; available {list(served)}")
     if voice and res.voices and voice not in res.voices:
         raise ValueError(f"unknown voice {voice!r}; available {sorted(res.voices)}")
     from frankenstein2.obs import fanout
@@ -153,8 +160,9 @@ class Frankenstein2Engine:
         from frankenstein2.ears.client import EarsLink
         from frankenstein2.tracing import Tracer
         opts, self.pending = self.pending, SessionOptions()
-        if opts.language not in self.res.languages:
-            raise ValueError(f"language {opts.language!r} not served; available {list(self.res.languages)}")
+        served = served_languages(self.res)
+        if opts.language not in served:
+            raise ValueError(f"language {opts.language!r} not served; available {list(served)}")
         if opts.voice and self.res.voices and opts.voice not in self.res.voices:
             raise ValueError(f"unknown voice {opts.voice!r}; available {sorted(self.res.voices)}")
         self.n += 1
