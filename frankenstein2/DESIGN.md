@@ -96,6 +96,15 @@ audio has played out, as in Tyger.
 Words the user speaks over the agent are kept only if they are part of a barge, from its onset. Otherwise they are
 dropped and traced as `asr.drop`.
 
+**Second ASR pass** (`control/second_pass.py`, `--asr-second-pass on`, the default). The streaming ASR sometimes drops
+the first words of a turn ("Perfekt, vielen Dank und auf Wiedersehen" heard as "und auf Wiedersehen"): sporadic, in
+any language, and the same audio heard on its own comes out whole. At an endpoint the pipeline checks the turn: voice
+(ears frame energy, listen mode) for 5 frames or more before the first transcribed piece, beyond the ASR's usual
+delay, or voice and no text at all. Such a turn's audio is transcribed again offline by the ears (an asynchronous
+request; other sessions are not held) and the endpoint waits for it, at most 480 ms; the fuller text goes to the LLM.
+Traced as `asr.second_pass` (reason, both texts, which was used, wait). In the end-to-end test over 15 languages it
+fired on 15 of 45 turns, recovered the lost words in 7 and waited 80-160 ms.
+
 ## 3. LLM plugins (`llm/`)
 
 The interface is `submit(rid, messages)`, `cancel(rid)`, `poll()` and `close()`. `poll()` returns events:

@@ -253,6 +253,10 @@ function onJson(m) {
     S.userMsg = say("user", m.text, S.mode === "demo" ? "caller · heard by the ASR" : "you · heard by the ASR");
     act("", "Your turn ended", `"${cut(m.text, 60)}"`);
     if (S.mode === "mic") setOrb("thinking", "Thinking…");
+  } else if (ev === "asr.second_pass") {
+    // an uncertain turn heard again offline before the LLM got it (frankenstein2/control/second_pass.py)
+    act(m.used === "offline" ? "warn" : "", "Turn heard again",
+      m.used === "offline" ? `kept the fuller transcript: "${cut(m.offline || "", 60)}"` : `kept the stream's text${m.timed_out ? " (no answer in time)" : ""}`);
   } else if (ev === "llm.request") {
     setOrb("thinking", "Thinking…", "");
   } else if (ev === "tool.started") {

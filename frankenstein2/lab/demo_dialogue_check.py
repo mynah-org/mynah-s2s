@@ -98,6 +98,11 @@ async def run_lang(url, lang, lines, out, scenario=None, recorded=None):
                         r.setdefault("results", []).append({"name": d.get("name"), "status": d.get("status"),
                                                             "ms": d.get("ms"),
                                                             "result": str(d.get("result"))[:200]})
+                    elif ev == "asr.second_pass":
+                        r.setdefault("second_pass", []).append({"reason": d.get("reason"), "used": d.get("used"),
+                                                                "streaming": d.get("streaming"),
+                                                                "offline": d.get("offline"),
+                                                                "wait_ms": d.get("wait_ms")})
                     elif ev == "tts.segment" and not d.get("holding"):
                         r.setdefault("said", []).append(d.get("text"))
 

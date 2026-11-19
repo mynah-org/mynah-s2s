@@ -17,8 +17,10 @@ class FakeEarsBackend:
     pieces)``; events / pieces carry absolute frames. Replies are delivered on the next poll (or ``delay`` polls
     later). Records every hop it receives."""
 
-    def __init__(self, script, delay: int = 0):
+    def __init__(self, script, delay: int = 0, transcribe=None):
         self.script, self.delay = script, delay
+        self.transcribe = transcribe        # (sid, pcm, lang) -> text | None (no answer): the offline second pass
+        self.transcribed: list = []
         self.boxes: dict = {}
         self.hops: list = []
         self.opened: dict = {}
@@ -30,6 +32,14 @@ class FakeEarsBackend:
             self.opened[sid] = m
         elif m["op"] == "close":
             self.closed.append(sid)
+        elif m["op"] == "transcribe":
+            import base64
+            pcm = np.frombuffer(base64.b64decode(m["pcm"]), "<f4")
+            self.transcribed.append({"sid": sid, "id": m["id"], "lang": m["lang"], "samples": len(pcm)})
+            text = self.transcribe(sid, pcm, m["lang"]) if self.transcribe else None
+            if text is not None:
+                self.boxes.setdefault(sid, []).append([self.delay, {"ev": "transcript", "sid": sid, "id": m["id"],
+                                                                    "text": text}])
         elif m["op"] == "hop":
             import base64
             u = np.frombuffer(base64.b64decode(m["u"]), "<f4")
@@ -37,7 +47,7 @@ class FakeEarsBackend:
             self.hops.append({"sid": sid, "n": m["n"], "mode": m["mode"], "reset": m["reset"],
                               "u_rms": float(np.sqrt((u ** 2).mean())), "a_rms": float(np.sqrt((a ** 2).mean()))})
             r = self.script(sid, m["n"], m["mode"], m["reset"], u, a) or {}
-            msg = {"ev": "hop", "sid": sid, "n": m["n"], "frames": [], "events": r.get("events", []),
+            msg = {"ev": "hop", "sid": sid, "n": m["n"], "frames": r.get("frames", []), "events": r.get("events", []),
                    "pieces": r.get("pieces", []), "ms": 1.0}
             self.boxes.setdefault(sid, []).append([self.delay, msg])
 

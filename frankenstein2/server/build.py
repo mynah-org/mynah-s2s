@@ -45,6 +45,9 @@ def add_args(ap) -> None:
                     help="a snapshot of kyutai/pocket-tts(-without-voice-cloning) with languages/<lang>/embeddings: "
                          "voices named native:<name> (--voice giovanni=native:giovanni) use Kyutai's predefined voice "
                          "of each session's language (community languages fall back to the default voice)")
+    ap.add_argument("--asr-second-pass", default=os.environ.get("F2_ASR_SECOND_PASS", "on"), choices=("on", "off"),
+                    help="an uncertain user turn (voice before the first transcribed word, or voice and no text) is "
+                         "transcribed again offline before the LLM gets it (frankenstein2/control/second_pass.py)")
     ap.add_argument("--ears-thread", default="off", choices=("on", "off"),
                     help="ears on their own thread and CUDA stream (talker stress: fewer audio gaps, but ears, LLM "
                          "and talker all slower from GIL and GPU contention; off: on the scheduler, before the talker)")

@@ -155,7 +155,7 @@ def main():  # pragma: no cover - model process
                 with torch.inference_mode():
                     txt = transcribe_offline(model, proc, b64f32(c["pcm"]),
                                              int(pdict.get(lang, PROMPTS.get(lang, 101))), dev, k=a.lookahead)
-                emit({"ev": "transcript", "id": c.get("id"), "text": txt,
+                emit({"ev": "transcript", "id": c.get("id"), "text": txt, "sid": c.get("sid"),
                       "ms": round((time.monotonic() - t1) * 1e3, 1)})
             elif op == "mem":
                 emit({"ev": "mem", "id": c.get("id"), **mem(), "rss_gb": rss_gb(), "rss_peak_gb": rss_gb("VmHWM")})

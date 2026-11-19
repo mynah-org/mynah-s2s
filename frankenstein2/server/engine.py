@@ -45,6 +45,12 @@ class Resources:
     trace_dir: str | None = None
     sinks: list = field(default_factory=list)            # extra trace listeners (obs.TraceStore.sink, LogSink.sink)
     store_text: bool = True                              # False: user / agent text never reaches a trace or sink
+    second_pass: bool = True                             # uncertain turns heard again offline (control/second_pass)
+
+
+def _sp(res):
+    from frankenstein2.control.second_pass import SecondPassConfig
+    return SecondPassConfig(enabled=bool(getattr(res, "second_pass", True)))
 
 
 def voice_for(res, name: str, language: str) -> str:
@@ -85,7 +91,8 @@ def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", syst
     llm = res.make_llm(sid, language, system_prompt, **({"scenario": scenario} if scenario else {}))
     talker = res.make_talker(sid, language, voice_for(res, voice, language))
     ears = EarsLink(res.ears, sid, language, thr=res.ears_thr.get(language))
-    p = Pipeline(sid, ears, llm, talker, PipelineConfig(lang=language, client_delay_steps=res.client_delay_steps), tr)
+    p = Pipeline(sid, ears, llm, talker, PipelineConfig(lang=language, client_delay_steps=res.client_delay_steps,
+                                                      second_pass=_sp(res)), tr)
     p.open()
     orig = p.close
 
@@ -191,7 +198,8 @@ class Frankenstein2Engine:
         from frankenstein2.audio.playout import Resampler
         self.rs = Resampler(talker.sr, OUT_SR)
         self.p = Pipeline(sid, ears, llm, talker, PipelineConfig(lang=opts.language,
-                                                                 client_delay_steps=self.res.client_delay_steps), tr)
+                                                                 client_delay_steps=self.res.client_delay_steps,
+                                                                 second_pass=_sp(self.res)), tr)
         self.tr, self.turn_open, self.frame = tr, False, 0
         self.p.open()
 

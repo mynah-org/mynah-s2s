@@ -68,7 +68,7 @@ def engine():
     talker = B.start_pocket(a, out)
     qproc = B.start_qwen(a, out)
     res = Resources(ears=ears, make_llm=B.qwen_factory(a, qproc, spec), make_talker=B.talker_factory(a, talker),
-                    voices=B.voices(a), voice_map=B.voice_map(a), ears_thr=B.thresholds(a),
+                    voices=B.voices(a), voice_map=B.voice_map(a), second_pass=getattr(a, "asr_second_pass", "on") == "on", ears_thr=B.thresholds(a),
                     trace_dir=str(out))
     if getattr(talker, "catalog", None) is not None:
         res.languages = talker.catalog.languages
@@ -107,6 +107,7 @@ def results():
         print("E2E", json.dumps({"lang": r["lang"], "pass": r["pass"], "tools": r["tools"],
                                  "lines": [(x.get("ratio"), x.get("answered")) for x in r["lines"]],
                                  "wall_s": r.get("wall_s"), "errors": r["errors"],
+                                 "second_pass": r.get("second_pass", []),
                                  "talker_loads": st.get("loads"), "evictions": st.get("evictions"),
                                  "wait_ms_max": st.get("wait_ms_max")}, ensure_ascii=False), flush=True)
     _RESULTS.update(asyncio.run(run_many(e["url"], jobs, out, PARALLEL, recorded=rec, on_result=report)))

@@ -86,7 +86,7 @@ def main():  # pragma: no cover - GPU
     from frankenstein2.server.engine import Frankenstein2Engine, Resources, make_pipeline, voice_for, voice_names
     sinks, store = observability(a, td)
     res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket),
-                    voices=B.voices(a), voice_map=B.voice_map(a), ears_thr=B.thresholds(a), trace_dir=str(td), sinks=sinks,
+                    voices=B.voices(a), voice_map=B.voice_map(a), second_pass=getattr(a, "asr_second_pass", "on") == "on", ears_thr=B.thresholds(a), trace_dir=str(td), sinks=sinks,
                     store_text=not a.trace_no_text)
     cat = getattr(getattr(pocket, "catalog", None), "languages", None)
     if cat is not None:                          # packages: every language folder is served, found by scanning

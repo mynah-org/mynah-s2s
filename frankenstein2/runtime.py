@@ -126,7 +126,8 @@ class InProcEars:
             import base64
             import numpy as np
             x = np.frombuffer(base64.b64decode(m["pcm"]), "<f4")
-            self.box.put(None, {"ev": "transcript", "id": m.get("id"), "text": self.e.transcribe(x, m.get("lang", "it"))})
+            self.box.put(m.get("sid"), {"ev": "transcript", "id": m.get("id"),       # sid: a session's second pass
+                                        "text": self.e.transcribe(x, m.get("lang", "it"))})
         elif op == "mem":
             self.box.put(None, {"ev": "mem", "id": m.get("id"), **self.s.mem()})
 

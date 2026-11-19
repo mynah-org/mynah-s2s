@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .audio.playout import Playout, SecondEar
+from .control.second_pass import SecondPassConfig, Suspicion, TurnAudio, choose
 from .control.controller import Controller, ControllerConfig, Intent, St
 from .control.history import Conversation
 from .ears.client import UserText
@@ -59,6 +60,7 @@ class PipelineConfig:
     trace_frames: bool = True
     barge_assist: bool = True              # echo-aware energy onset + ASR word confirmation (control/barge.py)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
+    second_pass: SecondPassConfig = field(default_factory=SecondPassConfig)   # uncertain turns re-heard offline
 
 
 @dataclass
@@ -93,6 +95,10 @@ class Pipeline:
         self.barge_cand = None
         self.last_ep_frame = None
         self.continues_posted = False
+        self.sp = Suspicion(cfg.second_pass)
+        self.audio = TurnAudio(cfg.second_pass.keep_s)
+        self.sp_wait = None                    # an endpoint held for its second ASR pass
+        self.sp_n = 0
 
     # ------------------------------------------------------------------ lifecycle
     def open(self) -> None:
@@ -138,12 +144,15 @@ class Pipeline:
         user = np.asarray(user, np.float32)
         asr_delta = []
         heard = self.ear.take()
+        self.audio.push(k, user)
         self.ears.push(user, heard, self.ctl.ears_mode)
         if self.cfg.barge_assist:
             self.barge_cand = self.barge.step(k, user, heard,
                                               self.ctl.state is St.SPEAKING and self.playout.audible())
         for r in self.ears.poll():
             self._on_hop(r, k, asr_delta)
+        if self.sp_wait is not None:
+            self._second_pass_check(k)
         if self.barge_cand is not None:
             on = self.barge_cand["onset"]
             to = self.turns.get((self.ctl.epoch, self.ctl.turn))
@@ -183,12 +192,15 @@ class Pipeline:
         self.stats["ears_ms"].append(r.get("ms"))
         self.tr.emit("ears.hop", k, n=r.get("n"), ms=r.get("ms"), enc_ms=r.get("enc_ms"), win_ms=r.get("win_ms"),
                      lag_steps=k - (4 * r.get("n", 0) + 3))
+        for f in r.get("frames", []):
+            self.sp.frame(f.get("k", 0), f.get("db"), f.get("mode", "listen"))
         if self.cfg.trace_frames:
             for f in r.get("frames", []):
                 self.tr.emit("ears.frame", f.get("k"), **{x: f[x] for x in ("mode", "state", "p_end", "yield_prob",
                                                                           "bc_prob", "hazard", "db") if x in f})
         if r.get("pieces"):
             asr_delta.append(self.user.add(r["pieces"]))
+            self.sp.pieces([p["f"] for p in r["pieces"] if any(ch.isalnum() for ch in p["p"]) and not _tag(p["p"])])
             to = self.turns.get((self.ctl.epoch, self.ctl.turn))
             self.barge.words(r["pieces"], (to.text if to else "") + " " + self._canned())
             self.tr.emit("asr.piece", k, pieces=[[p["f"], p["p"]] for p in r["pieces"]])
@@ -206,7 +218,7 @@ class Pipeline:
             if e["kind"] == "ENDPOINT":
                 self.stats["endpoints"].append({"frame": e["k"], "step": k})
                 self.last_ep_frame, self.continues_posted = e["k"], False
-                self.ctl.post(Intent("ENDPOINT", "ears", k, payload={"text": self.user.pending(), "frame": e["k"]}))
+                self._endpoint(k, e["k"])
             elif e["kind"] == "BARGE":
                 self.stats["barges"].append({"frame": e["k"], "step": k, "onset_s": e.get("onset_s")})
                 self.ctl.post(Intent("BARGE", "ears", k, payload={"onset_s": e.get("onset_s", 0.0),
@@ -214,6 +226,39 @@ class Pipeline:
             elif e["kind"] == "BACKCHANNEL":
                 self.stats["backchannels"].append({"frame": e["k"], "step": k})
                 self.ctl.post(Intent("BACKCHANNEL", "ears", k, payload={"frame": e["k"]}))
+
+    def _endpoint(self, k: int, frame: int) -> None:
+        """The ears ended the user's turn: post it, or first re-hear it offline when it looks uncertain."""
+        text = self.user.pending()
+        c = self.cfg.second_pass
+        if self.sp_wait is not None:                       # already waiting: the later endpoint frame counts
+            self.sp_wait.update(frame=frame, text=text)
+            return
+        why = self.sp.verdict(text) if c.enabled and self.ctl.state is St.LISTENING else None
+        if why is None:
+            self.ctl.post(Intent("ENDPOINT", "ears", k, payload={"text": text, "frame": frame}))
+            return
+        self.sp_n += 1
+        rid = f"{self.sid}:sp{self.sp_n}"
+        on = self.sp.onset()
+        k0 = max((on if on is not None else frame) - c.pre_frames, frame - int(15 / 0.08))   # at most 15 s
+        pcm = self.audio.cut(k0, frame + 2)
+        self.ears.transcribe(rid, pcm, self.lang)
+        self.sp_wait = {"id": rid, "k": k, "frame": frame, "text": text, "why": why}
+        self.tr.emit("asr.second_pass.request", k, reason=why, streaming=text, audio_s=round(len(pcm) / 16000, 2),
+                     onset_frame=on, first_piece_frame=self.sp.first_piece)
+
+    def _second_pass_check(self, k: int) -> None:
+        w = self.sp_wait
+        got = getattr(self.ears, "transcripts", {}).pop(w["id"], None)
+        if got is None and k - w["k"] < self.cfg.second_pass.timeout_steps:
+            return
+        self.sp_wait = None
+        text, which = choose(w["text"], got)
+        self.tr.emit("asr.second_pass", k, reason=w["why"], streaming=w["text"], offline=got, used=which,
+                     wait_ms=round((k - w["k"]) * 80), timed_out=got is None)
+        self.ctl.post(Intent("ENDPOINT", "ears", k, payload={"text": text, "frame": w["frame"],
+                                                             "second_pass": which}))
 
     def _canned(self) -> str:
         """Fixed phrases the agent may be saying (the barge check must not take their echo for the user)."""
@@ -273,6 +318,9 @@ class Pipeline:
     # ------------------------------------------------------------------ actions
     def _do(self, a, k: int) -> None:
         d = a.data
+        if a.kind in ("OPEN_TURN", "HOLD") and (a.kind == "OPEN_TURN" or a.reason == "empty_transcript"):
+            # a turn took the text, or an endpoint found none: the next turn's voice and pieces start here
+            self.sp.reset(self.last_ep_frame + 1 if self.last_ep_frame is not None else k)
         if a.kind == "OPEN_TURN":
             self.user.take()
             self.conv.open_turn(a.turn, d["user_text"])

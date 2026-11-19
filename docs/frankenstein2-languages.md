@@ -17,8 +17,9 @@ is the limit.
   (weather, travel, knowledge, restaurant).
 - The streaming ASR sometimes drops the first word or two of a short turn ("Perfekt, vielen Dank" heard as "vielen
   Dank"): sporadic, in any language, not caused by silence, turn resets or the stream's age (replays in
-  `frankenstein2/lab/asr_onset_replay.py`, `asr_silence_probe.py`). The answer still comes; the lost words are not
-  in the transcript.
+  `frankenstein2/lab/asr_onset_replay.py`, `asr_silence_probe.py`). The engine notices it (voice before the first
+  transcribed word) and hears such a turn again offline before the LLM gets it (`--asr-second-pass`, on by default;
+  `frankenstein2/DESIGN.md`).
 - The language suite (`make f2-lang-suite`) checks the parts one by one: the talker speaks a question and the ears
   must understand it; the LLM alone must call the catalogue tool and answer in the language; one spoken session.
 - **Adding a language is copying a folder**, see "Adding a language" below.

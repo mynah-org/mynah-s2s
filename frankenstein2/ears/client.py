@@ -88,6 +88,7 @@ class EarsLink:
         self.lag_hops_max = 0
         self.errors: list = []
         self.open_error = None
+        self.transcripts: dict = {}        # id -> offline transcript text (second ASR pass, control/second_pass.py)
 
     def open(self) -> None:
         self.b.send({"op": "open", "sid": self.sid, "lang": self.lang, "thr": self.thr,
@@ -99,6 +100,11 @@ class EarsLink:
     def request_reset(self, keep_turn: bool = False) -> None:
         """keep_turn: the user's turn stays open after the reset ("turn"), see RulesState.reset."""
         self.reset_next = "turn" if keep_turn else True
+
+    def transcribe(self, rid: str, pcm, lang: str) -> None:
+        """Ask for an offline transcript of ``pcm`` (16 kHz); the answer comes back through poll() into
+        ``transcripts[rid]`` without blocking the session."""
+        self.b.send({"op": "transcribe", "sid": self.sid, "id": rid, "lang": lang, "pcm": f32b64(pcm)})
 
     def push(self, user_step, agent_step, mode: str) -> None:
         """One 80 ms step of both channels (16 kHz float). ``mode`` is the controller's mode at this step; a hop
@@ -137,6 +143,8 @@ class EarsLink:
                 if m.get("n") == self.in_flight:
                     self.in_flight = None
                 self.results.append(m)
+            elif m.get("ev") == "transcript":
+                self.transcripts[m.get("id")] = m.get("text", "")
             elif m.get("ev") == "error":
                 self.errors.append(m)
                 if m.get("op") is None and "slot" in str(m.get("error", "")):

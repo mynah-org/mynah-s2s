@@ -5,7 +5,8 @@ Families:
   ears.*     ears.hop (per hop: compute ms, in-flight lag), ears.frame (per 80 ms frame: p_end / yield / bc / hazard /
              energy / mode / state), ears.event (ENDPOINT / BARGE / BACKCHANNEL), ears.reset, ears.error
   asr.*      asr.piece (streaming transcript pieces with their frame), asr.turn (the text sent to the LLM),
-             asr.drop (speech heard while the agent spoke, not part of a barge-in)
+             asr.drop (speech heard while the agent spoke, not part of a barge-in), asr.second_pass.request /
+             asr.second_pass (an uncertain turn transcribed again offline: reason, both texts, which one was used)
   ctl.*      every controller intent and action (with epoch, turn_id, request_id)
   llm.*      llm.request, llm.text, llm.decided, llm.tool, llm.done, llm.stale
   tool.*     tool.started (name, raw args, call_id), tool.waiting (s, names, silent_steps),
@@ -26,7 +27,7 @@ from pathlib import Path
 
 EVENTS = frozenset({
     "ears.hop", "ears.frame", "ears.event", "ears.reset", "ears.error",
-    "asr.piece", "asr.turn", "asr.drop",
+    "asr.piece", "asr.turn", "asr.drop", "asr.second_pass.request", "asr.second_pass",
     "ctl.intent", "ctl.action",
     "llm.request", "llm.text", "llm.decided", "llm.tool", "llm.done", "llm.stale",
     "tool.started", "tool.completed", "tool.waiting",
@@ -35,7 +36,7 @@ EVENTS = frozenset({
     "history.agent", "history.drop_user",
     "engine.session", "engine.mem", "engine.teardown",
 })
-TEXT_FIELDS = ("text", "user_text", "speech", "heard", "pieces")
+TEXT_FIELDS = ("text", "user_text", "speech", "heard", "pieces", "streaming", "offline")
 
 
 class Tracer:
