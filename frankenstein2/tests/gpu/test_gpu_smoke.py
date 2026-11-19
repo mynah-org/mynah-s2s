@@ -60,8 +60,11 @@ def test_pocket_speaks_and_the_ears_hear_it(ears, lang):
     from scipy.signal import resample_poly
     from frankenstein2.tts.pocket_own import PocketOwn
     name = POCKET[lang]
-    w = find(os.environ["F2_POCKET_WEIGHTS"], f"languages/{name}/model.safetensors")
-    tk = find(os.environ["F2_POCKET_TOKENIZERS"], f"languages/{name}/tokenizer.json")
+    try:
+        w = find(os.environ["F2_POCKET_WEIGHTS"], f"languages/{name}/model.safetensors")
+        tk = find(os.environ["F2_POCKET_TOKENIZERS"], f"languages/{name}/tokenizer.json")
+    except AssertionError:
+        pytest.skip(f"no full checkpoint for {name} (packages only)")
     m = PocketOwn(w, tk, lang=lang, device="cuda", dtype=torch.bfloat16, wq="w4")
     torch.manual_seed(0)
     voice = m.voice_from_file(os.environ["F2_VOICE"])
@@ -97,3 +100,25 @@ def test_qwen_calls_the_right_tool():
     calls = parse_calls(text)
     assert calls and calls[0]["name"] == "find_customer", text
     assert calls[0]["arguments"].get("postcode") == "10121" and "Rossi" in calls[0]["arguments"].get("full_name", "")
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("lang", LANGS)
+def test_language_package_speaks_and_the_ears_hear_it(ears, lang):
+    """A pocket_swap w4 package (F2_POCKET_PACKAGES) + the base checkpoint's Mimi, as the engine loads them."""
+    import numpy as np
+    from scipy.signal import resample_poly
+    from frankenstein2.tts.pocket_own import PocketOwn
+    root = os.environ.get("F2_POCKET_PACKAGES")
+    if not root or not (Path(root) / POCKET[lang] / "manifest.json").exists():
+        pytest.skip("no package for this language (F2_POCKET_PACKAGES)")
+    base = os.environ.get("F2_POCKET_BASE") or find(os.environ["F2_POCKET_WEIGHTS"],
+                                                    f"languages/{POCKET['en']}/model.safetensors")
+    m = PocketOwn.from_package(Path(root) / POCKET[lang], lang, base, device="cuda")
+    torch.manual_seed(0)
+    voice = m.voice_from_file(os.environ["F2_VOICE"])
+    x = torch.cat(list(m.stream(voice, SAY[lang]))).float().cpu().numpy()
+    assert np.isfinite(x).all() and 1.0 < len(x) / 24000 < 10.0
+    heard = ears.transcribe(resample_poly(x, 2, 3).astype(np.float32), lang)
+    ref = words(SAY[lang])
+    assert sum(1 for t in ref if t in set(words(heard))) >= 0.6 * len(ref), (heard, SAY[lang])

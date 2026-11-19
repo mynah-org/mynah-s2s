@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import queue
 import re
+import contextlib
 import threading
 import time
 from collections import deque
@@ -148,24 +149,42 @@ class InProcEars:
         return True
 
 
-class InProcTalker:
-    """Pocket talker for every session (our runtime, tts/pocket_own.py): one model + one PocketBatch per language,
-    voice states per (lang, voice); each session has at most one row in its language's batch, and every scheduler
-    turn steps, in one batched FlowLM call per language, the rows whose audio is less than ``ahead_s`` ahead."""
+class _Lang:
+    """A resident talker language: its model, its batch (rows of this language, on the shared slot pool) and its
+    voice states. Built on the loader thread (tts/lang_cache.py), published by the scheduler."""
 
-    def __init__(self, sched, make_model, ahead_s: float = 1.2, slots: int = 16, default_voice: str = ""):
-        self.s, self.make_model, self.default_voice = sched, make_model, default_voice
-        self.models: dict = {}
-        self.batches: dict = {}
-        self.voices: dict = {}
+    def __init__(self, model, batch, voices: dict):
+        self.model, self.batch, self.voices = model, batch, voices
+
+    def close(self):
+        self.voices.clear()
+
+
+class InProcTalker:
+    """Pocket talker for every session (our runtime, tts/pocket_own.py). Languages live in a ``TalkerLangs`` cache
+    (VRAM / host / disk LRU tiers): a language that is not resident is loaded on the loader thread while every other
+    session keeps talking; the session's text waits in its queue (``lang_wait_ms`` in its first segment's ``done``).
+    One shared slot pool holds every row's KV, whatever its language. Each session has at most one row; every
+    scheduler turn steps, in one batched FlowLM call per language, the rows whose audio is less than ``ahead_s``
+    ahead.
+
+    ``names(lang, ss) -> package name``: which talker language serves a session (the lab's rotation over copies maps
+    sessions of one language to many distinct packages)."""
+
+    def __init__(self, sched, langs, ahead_s: float = 1.2, default_voice: str = "", names=None):
+        self.s, self.langs, self.default_voice = sched, langs, default_voice
+        self.names = names or (lambda lang, ss: lang)
         self.box = _Boxes()
-        self.jobs: dict = {}            # ss -> deque of pending (sid, epoch, lang, voice, prepared, after, last)
+        self.jobs: dict = {}            # ss -> deque of pending jobs ({"raw": text} until chunked, then segments)
         self.cur: dict = {}             # ss -> row info
         self.floor: dict = {}
-        self.ahead_s, self.slots = ahead_s, slots
-        self.open_lock = threading.Lock()
+        self.name_of: dict = {}         # ss -> talker language name
+        self.ahead_s = ahead_s
         self.ready = {"ev": "ready", "inproc": True}
         self.lock = threading.Lock()
+        self.voice_ms: list = []        # non-default voice states computed on the scheduler (rare)
+        self.waits: list = []           # per raw text: ms from request to its first segment if its language was
+                                        # not resident when requested (load + queue), else 0
 
     # client side (PocketProc interface)
     def send(self, m):
@@ -183,75 +202,112 @@ class InProcTalker:
         return self.box.wait(ev, timeout, pred)
 
     def close(self):
-        pass
+        self.langs.close()
 
     # scheduler side
-    def _model(self, lang):
-        if lang not in self.models:
-            self.models[lang] = self.make_model(lang)
-            from .tts.pocket_own import PocketBatch
-            self.batches[lang] = PocketBatch(self.models[lang], slots=self.slots, max_len=512)
-        return self.models[lang]
+    def _name(self, ss, lang):
+        n = self.name_of.get(ss)
+        if n is None:
+            n = self.name_of[ss] = self.names(lang, ss)
+        return n
 
-    def _voice(self, lang, voice):
+    def _in_use(self, name):
+        return any(c["name"] == name for c in self.cur.values()) or \
+            any(j["name"] == name for q in self.jobs.values() for j in q)
+
+    def preload(self, lang, timeout=600.0):
+        """Server start only: load a language and its default voice before sessions arrive (blocking)."""
+        return self.langs.ensure(self.names(lang, None), timeout, self._in_use)
+
+    def _voice(self, L, voice):
         voice = voice or self.default_voice
-        key = (lang, voice)
-        if key not in self.voices:
-            self.voices[key] = self._model(lang).voice_from_file(voice)
-        return self.voices[key]
+        v = L.voices.get(voice)
+        if v is None:                                      # a session's own reference voice: once per language
+            t0 = time.monotonic()
+            v = L.voices[voice] = L.model.voice_from_file(voice)
+            self.voice_ms.append(round((time.monotonic() - t0) * 1000, 1))
+        return v
 
     def control(self, m):
         op = m.get("op")
-        if op == "voice":
-            t0 = time.monotonic()
-            self._voice(m["lang"], m.get("voice"))
-            self.box.put(None, {"ev": "voice", "id": m.get("id"), "lang": m["lang"],
-                                "load_s": round(time.monotonic() - t0, 2)})
+        if op == "voice":                                  # session open: never waits for the language
+            name = self._name(m["id"], m["lang"])
+            st = self.langs.want(name)
+            self.box.put(None, {"ev": "voice", "id": m.get("id"), "lang": m["lang"], "talker_lang": name,
+                                "status": st})
         elif op == "say":
-            model = self._model(m["lang"])
-            ch = model.chunks(m["text"])
-            q = self.jobs.setdefault(m["ss"], deque())
-            for i, (prep, after) in enumerate(ch):
-                q.append({"sid": m["sid"], "epoch": int(m["epoch"]), "lang": m["lang"], "voice": m.get("voice"),
-                          "text": prep, "after": after, "last": i == len(ch) - 1, "t_req": time.monotonic()})
+            name = self._name(m["ss"], m["lang"])
+            cold = self.langs.want(name) != "ready"
+            self.jobs.setdefault(m["ss"], deque()).append(
+                {"raw": m["text"], "sid": m["sid"], "epoch": int(m["epoch"]), "lang": m["lang"], "name": name,
+                 "voice": m.get("voice"), "t_req": time.monotonic(), "cold": cold})
         elif op == "mem":
-            self.box.put(None, {"ev": "mem", "id": m.get("id"), **self.s.mem(), "langs": sorted(self.models)})
+            self.box.put(None, {"ev": "mem", "id": m.get("id"), **self.s.mem(), "talker_langs": self.langs.stats()})
         elif op == "close":
             self.jobs.pop(m["ss"], None)
             c = self.cur.pop(m["ss"], None)
             if c is not None:
-                self.batches[c["lang"]].stop(m["ss"])
+                c["L"].batch.stop(m["ss"])
+            self.name_of.pop(m["ss"], None)
 
     def _finish(self, ss, c, cancelled=False):
-        self.batches[c["lang"]].stop(ss)
+        c["L"].batch.stop(ss)
         del self.cur[ss]
         if c["last"] or cancelled:
             self.box.put(ss, {"ev": "done", "ss": ss, "sid": c["sid"], "cancelled": cancelled,
-                              "audio_s": round(c["samples"] / 24000, 2), "first_audio_ms": c.get("first_ms")})
+                              "audio_s": round(c["samples"] / 24000, 2), "first_audio_ms": c.get("first_ms"),
+                              "lang_wait_ms": c.get("lang_wait_ms")})
+
+    def _next(self, ss, q, now):
+        """The session's next segment, chunking a raw text once its language is resident; None = not yet."""
+        j = q[0]
+        L = self.langs.get(j["name"])
+        if L is None:
+            st = self.langs.want(j["name"])
+            if st.startswith("failed"):                     # the language cannot load: drop the text, say so
+                q.popleft()
+                self.box.put(ss, {"ev": "error", "ss": ss, "sid": j["sid"], "error": f"talker {j['name']}: {st}"})
+            return None
+        if "raw" in j:
+            q.popleft()
+            ch = L.model.chunks(j["raw"])
+            wait = round((now - j["t_req"]) * 1000, 1) if j.get("cold") else 0.0   # cold: includes the load
+            self.waits.append(wait)
+            base = {k: v for k, v in j.items() if k != "raw"}
+            for i, (prep, after) in reversed(list(enumerate(ch))):
+                q.appendleft(dict(base, text=prep, after=after, last=i == len(ch) - 1,
+                                  lang_wait_ms=wait if i == 0 else None))
+            j = q[0]
+        q.popleft()
+        return L, j
 
     def run(self, budget_ms: float) -> bool:
         did = False
         now = time.monotonic()
         with self.lock:
             floor = dict(self.floor)
-        for ss in list(self.cur):                       # cancelled rows stop at once
+        self.langs.poll(self._in_use)                       # publish finished loads, evict unused ones
+        for ss in list(self.cur):                           # cancelled rows stop at once
             if self.cur[ss]["epoch"] < floor.get(ss, 0):
                 self._finish(ss, self.cur[ss], cancelled=True)
         for ss, q in self.jobs.items():
             while q and q[0]["epoch"] < floor.get(ss, 0):
                 q.popleft()
             if ss not in self.cur and q:
-                j = q.popleft()
-                v = self._voice(j["lang"], j["voice"])
-                self.batches[j["lang"]].start(ss, v, j["text"], j["after"])
-                self.cur[ss] = dict(j, t0=None, samples=0, start=now, first_ms=None)
+                nx = self._next(ss, q, now)
+                if nx is None:
+                    continue
+                L, j = nx
+                L.batch.start(ss, self._voice(L, j["voice"]), j["text"], j["after"])
+                self.cur[ss] = dict(j, L=L, t0=None, samples=0, start=now, first_ms=None)
                 did = True
-        by_lang: dict = {}
+        by_name: dict = {}
         for ss, c in self.cur.items():
             if self._ahead(c, now) <= self.ahead_s:
-                by_lang.setdefault(c["lang"], []).append(ss)
-        for lang, keys in by_lang.items():
-            res = self.batches[lang].step(keys)
+                by_name.setdefault(c["name"], []).append(ss)
+        for name, keys in by_name.items():
+            L = self.cur[keys[0]]["L"]
+            res = L.batch.step(keys)
             did = True
             for ss, audio in res.items():
                 c = self.cur[ss]
@@ -690,28 +746,78 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
     LANGS = {"it": "italian_24l", "fr": "french_24l", "en": "english_2026-09_24l", "es": "spanish_24l",
              "de": "german_24l", "pt": "portuguese_24l", "nl": "dutch_24l"}   # kyutai/pocket-tts official
 
-    def make_pocket(lang):
-        from .tts.pocket_own import PocketOwn
+    CODE = {v: k for k, v in LANGS.items()}
+    dev_t = torch.device(getattr(a, "talker_device", "cuda"))
+    side = torch.cuda.Stream(device=dev_t) if dev_t.type == "cuda" else None
+    pk_root = getattr(a, "pocket_packages", "") or ""
+    st = {"mimi": None, "pool": None}
+
+    def find_ckpt(name):
         root = Path(a.pocket_weights)                    # a snapshot dir, or the repo's snapshots dir (any snapshot)
-        w = next(iter(sorted(root.glob(f"languages/{LANGS[lang]}/model.safetensors"))
-                      or sorted(root.glob(f"*/languages/{LANGS[lang]}/model.safetensors"))
-                      or sorted(root.parent.glob(f"*/languages/{LANGS[lang]}/model.safetensors"))))
-        tk = sorted(Path(a.pocket_tokenizers).glob(f"*/languages/{LANGS[lang]}/tokenizer.json")) or \
-            sorted(Path(a.pocket_tokenizers).glob(f"languages/{LANGS[lang]}/tokenizer.json"))
-        dt = {"bf16": torch.bfloat16, "fp32": torch.float32}[getattr(a, "pocket_dtype", "bf16")]
+        w = next(iter(sorted(root.glob(f"languages/{name}/model.safetensors"))
+                      or sorted(root.glob(f"*/languages/{name}/model.safetensors"))
+                      or sorted(root.parent.glob(f"*/languages/{name}/model.safetensors"))), None)
+        if w is None:
+            raise FileNotFoundError(f"no Pocket checkpoint for {name} under {root}")
+        return w
+
+    def fetch(name):                                     # loader thread: disk -> host
+        if pk_root:
+            from .tts.pocket_own import _pocket_swap
+            _pocket_swap()                               # pocket_swap on sys.path
+            from pocket_swap.package import load_package
+            return load_package(Path(pk_root) / name, pin=bool(getattr(a, "talker_pin", True)) and side is not None)
+        base = name.split("@")[0]
+        tk = sorted(Path(a.pocket_tokenizers).glob(f"*/languages/{base}/tokenizer.json")) or \
+            sorted(Path(a.pocket_tokenizers).glob(f"languages/{base}/tokenizer.json"))
+        return (find_ckpt(base), tk[0])
+
+    def build(name, h):                                  # loader thread: host -> GPU on its own stream
+        from .tts.pocket_own import PocketBatch, PocketOwn, SlotPool
+        code = CODE.get(name.split("@")[0], "en")
         wq = getattr(a, "pocket_wq", "w4")
-        m = PocketOwn(w, tk[0], lang=lang, device=getattr(a, "talker_device", "cuda"), dtype=dt,
-                      wq="" if wq in ("", "none") else wq, share_mimi=pocket_first.get("m"))
-        pocket_first.setdefault("m", m)                  # Mimi (codec + voice encoder) loaded once for all languages
-        return m
-    pocket_first: dict = {}
+        ctx = torch.cuda.stream(side) if side is not None else contextlib.nullcontext()
+        with torch.no_grad(), ctx:
+            if pk_root:
+                mimi = st["mimi"] or getattr(a, "pocket_base", "") or find_ckpt(LANGS["en"])
+                m = PocketOwn.from_package(h, code, mimi, device=dev_t)
+            else:
+                dt = {"bf16": torch.bfloat16, "fp32": torch.float32}[getattr(a, "pocket_dtype", "bf16")]
+                m = PocketOwn(h[0], h[1], lang=code, device=dev_t, dtype=dt, wq="" if wq in ("", "none") else wq,
+                              share_mimi=st["mimi"])
+            if st["mimi"] is None:
+                st["mimi"] = m                           # Mimi (codec + voice encoder) loaded once for all languages
+            if st["pool"] is None:
+                st["pool"] = SlotPool(m, slots=slots, max_len=512)
+            if not st["pool"].fits(m):
+                raise ValueError(f"{name}: architecture differs from the slot pool's")
+            voices = {dv: m.voice_from_file(dv)} if dv else {}
+            batch = PocketBatch(m, pool=st["pool"])
+        if side is not None:
+            side.synchronize()                           # resident before the scheduler's stream uses it
+        return _Lang(m, batch, voices)
+
+    rot = int(getattr(a, "talker_rotate", 0) or 0)
+    seq: dict = {}
+
+    def names(lang, ss):
+        base = LANGS[lang]
+        if not rot or ss is None:
+            return base
+        k = seq[lang] = (seq.get(lang, -1) + 1) % rot   # lab: sessions of a language spread over N package copies
+        return f"{base}@{k:02d}"
+
     from .server.build import voices
+    from .tts.lang_cache import TalkerLangs
     vs = voices(a) if hasattr(a, "voice") else {}
-    talker = InProcTalker(sched, make_pocket, slots=slots, default_voice=next(iter(vs.values()), ""))
+    dv = next(iter(vs.values()), "")
+    langs = TalkerLangs(fetch, build, vram_langs=int(getattr(a, "talker_vram_langs", 4)),
+                        host_langs=int(getattr(a, "talker_host_langs", 8)))
+    talker = InProcTalker(sched, langs, default_voice=dv, names=names)
     sched.talker = talker
     for lang in [x for x in getattr(a, "pocket_preload", "").split(",") if x]:   # models + default voice, now
         t0 = time.monotonic()
-        sched.call(lambda lang=lang: talker._voice(lang, ""))
+        sched.call(lambda lang=lang: talker.preload(lang))
         ready[f"talker_{lang}"] = {"load_s": round(time.monotonic() - t0, 1), **sched.mem(), "rss_peak_gb": rss()}
     llm = None
     if getattr(a, "qwen_model", ""):

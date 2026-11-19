@@ -221,6 +221,14 @@ class _KV:
             self.c = c
 
 
+class _nullctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 class PocketOwn:
     def __init__(self, weights: str, tokenizer: str, lang: str = "it", device="cuda", W: dict | None = None,
                  dtype=torch.float32, wq: str = "", share_mimi: "PocketOwn | None" = None):
@@ -269,6 +277,65 @@ class PocketOwn:
         self.n_res = sum(1 for k in W if k.startswith("flow_lm.flow_net.res_blocks.") and k.endswith("in_ln.weight"))
         self.mimi_layers = sum(1 for k in W if k.startswith("mimi.decoder_transformer.transformer.layers.")
                                and k.endswith("norm1.weight"))
+
+    @classmethod
+    def from_package(cls, pkg, lang: str, mimi, device="cuda", stream=None) -> "PocketOwn":
+        """A language from a pocket_swap weight-only package (``w4`` / ``w8`` / ``wfp8``): the package's quantised
+        backbone codes become the quantised linears as they are (no dequantise / requantise), its other FlowLM
+        tensors and tokenizer are used verbatim, and Mimi (identical in every language) comes from ``mimi``: a loaded
+        PocketOwn to share, or a checkpoint path (its ``mimi.*`` tensors only).
+        ``pkg``: a pocket_swap Package (host tensors, possibly pinned) or a package directory."""
+        _, quant = _pocket_swap()
+        if not hasattr(pkg, "manifest"):
+            from pocket_swap.package import load_package
+            pkg = load_package(pkg)
+        prec = pkg.manifest["precision"]
+        wp = {"w4": "int4", "w8": "int8", "wfp8": "fp8"}.get(prec)
+        if wp is None:
+            raise ValueError(f"{pkg.lang}: package precision {prec!r}; the engine loads weight-only packages "
+                             "(w4 / w8 / wfp8)")
+        if int(pkg.manifest.get("group", 128)) != 128:
+            raise ValueError(f"{pkg.lang}: group {pkg.manifest.get('group')} (the fused kernel uses 128)")
+        dev = torch.device(device)
+        cm = torch.cuda.stream(stream) if (stream is not None and dev.type == "cuda") else _nullctx()
+        self = cls.__new__(cls)
+        with cm:
+            W = {}
+            if isinstance(mimi, PocketOwn):
+                W.update({k: v for k, v in mimi.W.items() if k.startswith("mimi.")})
+            else:
+                from safetensors import safe_open
+                with safe_open(str(mimi), framework="pt", device=str(dev)) as f:
+                    for k in f.keys():
+                        if k.startswith("mimi."):
+                            W[k] = f.get_tensor(k).float()
+            for k, v in pkg.verbatim.items():
+                v = v.to(dev, non_blocking=True)
+                W[k] = (v.to(torch.bfloat16) if k.startswith("flow_lm.transformer.") else v.float()) \
+                    if v.is_floating_point() else v
+            Q = {}
+            for k in pkg.delta_keys():
+                q = pkg.delta[k + ".q"].to(dev, non_blocking=True)
+                sc = pkg.delta[k + ".s"].to(dev, non_blocking=True)
+                cols = q.shape[1] * (2 if wp == "int4" else 1)
+                if k.endswith(("_proj.weight", "linear1.weight", "linear2.weight")):
+                    Q[k] = (wp, q, sc, cols)
+                else:                                  # any other 2-D backbone tensor: plain bf16
+                    W[k] = quant.dequant_any(q, sc, wp, cols, torch.bfloat16)
+            if stream is not None and dev.type == "cuda":
+                stream.synchronize()                   # everything resident before another stream reads it
+        self.dev, self.tdtype, self.lang, self.wq = dev, torch.bfloat16, lang, prec
+        self.opts = LANG_OPTS.get(lang, {"remove_semicolons": False})
+        self.Q, self.W = Q, W
+        self.tok = _Tok(pkg.tokenizer_path)
+        self.n_layers = sum(1 for k in W if k.startswith("flow_lm.transformer.layers.") and k.endswith("norm1.weight"))
+        self.d = W["flow_lm.input_linear.weight"].shape[0]
+        self.nh = 16
+        self.ldim = W["flow_lm.bos_emb"].shape[0]
+        self.n_res = sum(1 for k in W if k.startswith("flow_lm.flow_net.res_blocks.") and k.endswith("in_ln.weight"))
+        self.mimi_layers = sum(1 for k in W if k.startswith("mimi.decoder_transformer.transformer.layers.")
+                               and k.endswith("norm1.weight"))
+        return self
 
     # ------------------------------------------------------------------ FlowLM
     def _lin(self, x, key):
@@ -606,23 +673,45 @@ class _PoolState:
             p[slot].zero_()
 
 
+class SlotPool:
+    """The per-row state of the talker: FlowLM KV slots, Mimi decoder KV rings and streaming conv state. The layout
+    depends only on the architecture (24-layer FlowLM, Mimi), so every language's PocketBatch can share one pool:
+    memory is paid once for ``slots`` concurrent rows, not once per resident language. The free list is shared."""
+
+    def __init__(self, model: "PocketOwn", slots: int = 16, max_len: int = 1024):
+        L, H, D = model.n_layers, model.nh, model.d // model.nh
+        self.shape = (L, H, D, model.mimi_layers)
+        self.kv = torch.zeros(L, 2, slots, max_len, H, D, device=model.dev, dtype=model.tdtype)
+        self.max_len = max_len
+        self.free = list(range(slots))
+        ml, md = model.mimi_layers, 512
+        self.mkv = torch.zeros(ml, 2, slots, MIMI_RING, 8, md // 8, device=model.dev)      # Mimi decoder KV rings
+        self.mpos = torch.full((slots, MIMI_RING), -10 ** 9, dtype=torch.long, device=model.dev)
+        self.mst = _PoolState(slots)
+
+    def fits(self, model: "PocketOwn") -> bool:
+        return self.shape == (model.n_layers, model.nh, model.d // model.nh, model.mimi_layers) and \
+            self.kv.dtype == model.tdtype
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (self.kv, self.mkv, self.mpos))
+
+
 class PocketBatch:
     """Many sessions of ONE language model stepped together (mynah-tts design: fixed KV slots, one batched step per
     latent frame for all active rows, one host sync per frame). A row = one segment being generated: its FlowLM KV
     lives in a slot of a pool (voice prefix + text + latents so far, per-row length), its Mimi decoder state in the
     row's own tensors. ``step()`` advances every active row by one latent frame and returns its audio (80 ms)."""
 
-    def __init__(self, model: PocketOwn, slots: int = 16, max_len: int = 1024):
+    def __init__(self, model: PocketOwn, slots: int = 16, max_len: int = 1024, pool: "SlotPool | None" = None):
+        """pool: a SlotPool shared with the other languages' batches (one KV pool for the whole talker: the layout is
+        the same in every language); None = this batch's own pool."""
         self.m = model
-        L, H, D = model.n_layers, model.nh, model.d // model.nh
-        self.kv = torch.zeros(L, 2, slots, max_len, H, D, device=model.dev, dtype=model.tdtype)
-        self.max_len = max_len
-        self.free = list(range(slots))
+        self.pool = pool or SlotPool(model, slots, max_len)
+        p = self.pool
+        self.kv, self.max_len, self.free = p.kv, p.max_len, p.free
+        self.mkv, self.mpos, self.mst = p.mkv, p.mpos, p.mst
         self.rows: dict = {}                  # key -> row dict
-        ml, md = model.mimi_layers, 512
-        self.mkv = torch.zeros(ml, 2, slots, MIMI_RING, 8, md // 8, device=model.dev)      # Mimi decoder KV rings
-        self.mpos = torch.full((slots, MIMI_RING), -10 ** 9, dtype=torch.long, device=model.dev)
-        self.mst = _PoolState(slots)
 
     def start(self, key, voice: _KV, text: str, after: int, gen=None):
         """A new row for one prepared text chunk (PocketOwn.chunks gives them with their frames-after-EOS)."""

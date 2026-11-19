@@ -82,6 +82,18 @@ def add_args(ap) -> None:
     ap.add_argument("--pocket-tokenizers", default=env("F2_POCKET_TOKENIZERS", ""),
                     help="single: where languages/<lang>/tokenizer.json are (env F2_POCKET_TOKENIZERS)")
     ap.add_argument("--pocket-preload", default="it,en,fr", help="single: talker languages loaded at start")
+    ap.add_argument("--pocket-packages", default=env("F2_POCKET_PACKAGES", ""),
+                    help="single: pocket_swap weight-only language packages (w4/w8/wfp8), one dir per language "
+                         "(env F2_POCKET_PACKAGES); without it each language loads from its full checkpoint")
+    ap.add_argument("--pocket-base", default=env("F2_POCKET_BASE", ""),
+                    help="single + packages: the checkpoint whose Mimi (codec + voice-cloning encoder) every language "
+                         "shares (default: the English checkpoint under --pocket-weights)")
+    ap.add_argument("--talker-vram-langs", type=int, default=4,
+                    help="talker languages kept resident on the GPU (LRU; a language in use is never evicted)")
+    ap.add_argument("--talker-host-langs", type=int, default=8, help="language packages kept in host RAM (LRU)")
+    ap.add_argument("--talker-rotate", type=int, default=0,
+                    help="lab: spread the sessions of a language over N package copies NAME@00..NAME@N-1 "
+                         "(a stress test of the language cache)")
     ap.add_argument("--talker-budget-ms", type=float, default=40.0)
     ap.add_argument("--child-env", action="append", default=[],
                     help="KEY=VALUE for the ears and talker processes (their own environments' caches / headers)")

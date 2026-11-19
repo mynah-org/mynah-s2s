@@ -340,18 +340,23 @@ def write_repo_card(root: str | os.PathLike, languages: list[dict]) -> Path:
         f"| {m['language']} | {m['precision']} | {m['total_bytes'] / 1e6:.1f} MB | "
         f"{(m['target'] or m['base'])['repo']}@{(m['target'] or m['base'])['revision'][:8]} |" for m in languages)
     base = languages[0]["base"]
+    weight_only = all(m["precision"] in WEIGHT_PRECISIONS for m in languages)
+    how = ("its transformer backbone as the language's own weights quantised to "
+           + "/".join(sorted({m['precision'] for m in languages})) + " (per-group scales); no base backbone is "
+           "needed at run time" if weight_only else
+           "its transformer backbone as a difference from the base")
     text = f"""---
 license: cc-by-4.0
 library_name: pocket-tts
-tags: [text-to-speech, pocket-tts, weight-delta]
+tags: [text-to-speech, pocket-tts, {'quantized' if weight_only else 'weight-delta'}]
 ---
-# Pocket TTS language deltas
+# Pocket TTS language packages
 
-Per-language packages for [Kyutai Pocket TTS](https://huggingface.co/kyutai/pocket-tts), expressed against one base
+Per-language packages for [Kyutai Pocket TTS](https://huggingface.co/kyutai/pocket-tts), built against one base
 checkpoint: `{base['repo']}` @ `{base['revision']}` (`{base['file']}`, sha256 `{base['sha256'][:16]}…`).
-Each package holds the language's tokenizer, text embedding and non-backbone tensors verbatim, and its transformer
-backbone as a difference from the base. Download the base from Kyutai (accepting their terms); the Mimi codec is
-not included here.
+Each package holds the language's tokenizer, text embedding and non-backbone tensors verbatim, and {how}.
+The Mimi codec (and its voice-cloning encoder) is not included: it comes from Kyutai's base checkpoint, which you
+download from Kyutai (accepting their terms).
 
 | language | precision | size | derived from |
 |---|---|---|---|
