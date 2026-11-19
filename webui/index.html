@@ -9,6 +9,7 @@
   <style>
     .status-item{display:flex;align-items:center;gap:8px}.layout-grid{max-width:1000px;margin:0 auto;grid-template-columns:minmax(0,1fr) 290px}.conversation{box-shadow:none;background:linear-gradient(145deg,#191e27cc,#151920cc)}.transcript{max-width:760px;margin:0 auto}.message{max-width:680px}.message.user{margin-left:auto;flex-direction:row-reverse}.message.user .message-body{text-align:right;border-radius:10px 3px 10px 10px}.message-body{font-size:13px}.inspector{min-height:560px}.activity-list{height:446px}.workspace{padding-top:30px}.hero{max-width:1000px;margin:0 auto;padding-bottom:28px}.hero h1{font-size:clamp(32px,3.5vw,50px)}.hero-orbit{width:142px;height:142px;margin-right:3%}.control-strip{max-width:1000px;margin-left:auto;margin-right:auto;display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.95fr) minmax(0,1.1fr) auto;align-items:end;gap:16px}.connection-actions{grid-column:1/-1;min-width:0;margin-left:0;display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:16px}.action-buttons{display:flex;justify-content:flex-start;gap:9px}.mic-note{margin:0;color:var(--subtle);font-size:11px;line-height:1.35;text-align:right}.button.quiet{background:transparent;color:var(--muted);border:1px solid var(--line)}
     .profile-card{display:flex;align-items:center;gap:10px;min-width:154px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:#10141b}.profile-card .profile-dot{width:7px;height:7px;border-radius:50%;background:#f0b45d;box-shadow:0 0 0 4px #f0b45d18}.profile-card.online .profile-dot{background:var(--accent);box-shadow:0 0 0 4px #d8f36b18}.profile-card strong{display:block;font-size:12px}.profile-card small{display:block;color:var(--subtle);font-size:9px;margin-top:1px}.source-field select{min-width:220px}.sample-note{margin:14px 22px 0;padding:10px 12px;border:1px solid #303845;border-radius:9px;background:#141920;color:var(--muted);font-size:11px}.sample-note b{color:var(--ink)}
+    .debug-head{display:flex;align-items:center;gap:10px;margin-top:10px;color:var(--subtle);font-size:10px}.debug-log{max-height:260px;overflow:auto;margin:8px 0 0;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:#0c0f14;color:#b9c3d1;font:10px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
     .session-ids{display:flex;gap:7px;margin-top:7px;color:var(--subtle);font:9px ui-monospace,SFMono-Regular,Menlo,monospace}.session-ids span{padding:3px 6px;border:1px solid #2a303b;border-radius:5px;background:#11151b}
     @media(max-width:900px){.control-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.connection-actions{min-width:0;width:100%;grid-template-columns:1fr}.mic-note{text-align:left}.action-buttons{justify-content:stretch}.action-buttons .button{flex:1}.profile-card{min-width:0}}
     @media(max-width:560px){.control-strip{grid-template-columns:1fr}.action-buttons{flex-wrap:wrap}.action-buttons .button{min-width:calc(50% - 5px)}}
@@ -58,6 +59,8 @@
           <div class="panel-heading"><div><p class="eyebrow">OBSERVABILITY</p><h2>Activity stream</h2></div><span class="live-pill"><span></span> LIVE</span></div>
           <div class="activity-list" id="activityList"><div class="empty-state compact"><span class="empty-icon">⌁</span><p>No events yet</p><small>Tool calls and model phases will appear here.</small></div></div>
           <div class="inspector-footer"><span>EVENTS</span><b id="eventCount">0</b><span class="footer-spacer"></span><span>LATENCY</span><b id="latencyValue">—</b></div>
+          <div class="debug-head"><label class="toggle"><input type="checkbox" id="debugToggle"><span></span><b>Debug log</b></label><small>short engine lines (Frankenstein v2): asr, llm, tools, tts, with turn / call ids</small></div>
+          <pre class="debug-log" id="debugLog" hidden></pre>
         </aside>
       </div>
 
@@ -68,6 +71,6 @@
     </main>
     <footer class="footer"><span>Mynah S2S · local prototype</span><span>PCM16 audio · event-driven controller</span></footer>
   </div>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

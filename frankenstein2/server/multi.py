@@ -121,9 +121,14 @@ class MultiServer:
             voice = start.get("voice") or qs.get("voice", [""])[0]
             in_rate = int(start.get("input_rate", 16000))
 
+            from frankenstein2.obs import LineFormatter
+            fmt = LineFormatter()
+
             def sink(name, d):
+                line = fmt(name, d)                    # the short debug line (the web UI's debug switch shows it)
                 if verbose or name not in QUIET:
-                    send_threadsafe(json.dumps({"type": "event", **d}, default=str))
+                    send_threadsafe(json.dumps({"type": "event", **d, **({"log": line} if line else {})},
+                                               default=str))
             p = await loop.run_in_executor(None, self.make_pipeline, sid, lang, voice, start.get("system_prompt"),
                                            sink)
             from frankenstein2.audio.playout import Resampler

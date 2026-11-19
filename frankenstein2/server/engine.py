@@ -42,6 +42,8 @@ class Resources:
     ears_thr: dict = field(default_factory=dict)        # language -> threshold overrides
     client_delay_steps: int = 1
     trace_dir: str | None = None
+    sinks: list = field(default_factory=list)            # extra trace listeners (obs.TraceStore.sink, LogSink.sink)
+    store_text: bool = True                              # False: user / agent text never reaches a trace or sink
 
 
 def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", system_prompt: str | None = None,
@@ -54,8 +56,9 @@ def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", syst
         raise ValueError(f"language {language!r} not served; available {list(res.languages)}")
     if voice and res.voices and voice not in res.voices:
         raise ValueError(f"unknown voice {voice!r}; available {sorted(res.voices)}")
+    from frankenstein2.obs import fanout
     tr = Tracer(f"{res.trace_dir}/{sid}.f2.jsonl" if (res.trace_dir and trace) else None, session_id=sid, keep=False,
-                sink=sink)
+                sink=fanout(sink, *res.sinks), store_text=res.store_text)
     llm = res.make_llm(sid, language, system_prompt)
     talker = res.make_talker(sid, language, res.voices.get(voice, voice))
     ears = EarsLink(res.ears, sid, language, thr=res.ears_thr.get(language))

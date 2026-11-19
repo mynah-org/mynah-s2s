@@ -449,8 +449,12 @@ def main():  # pragma: no cover - model run
     save()
     print("LOADS", json.dumps(res_mem, default=str)[:3000], flush=True)
     from frankenstein2.server.engine import Frankenstein2Engine, Resources
+    from frankenstein2.obs import TraceStore
+    store = TraceStore(Path(out) / "f2_traces.sqlite")          # the same store the server keeps (frankenstein2/obs.py)
     res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket), voices=B.voices(a),
-                    ears_thr=B.thresholds(a), trace_dir=str(out))
+                    ears_thr=B.thresholds(a), trace_dir=str(out), sinks=[store.sink])
+    import atexit
+    atexit.register(store.close)
     res.talker_proc = pocket
     eng = Frankenstein2Engine(res)
     frozen, track = load_track(Path(a.asr_dir), a.cut_s)

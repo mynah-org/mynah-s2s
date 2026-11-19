@@ -111,8 +111,26 @@ function handleJson(msg) {
   if (ev === "text.generated") { addMessage("agent", msg.text, "AGENT"); speakDemo(msg.text); setSession("Agent speaking", true); }
   if (ev === "thinker.step" || ev === "function.started") setSession("Agent thinking", true);
   if (ev.startsWith("tool.")) setSession(ev === "tool.completed" ? "Tool completed" : "Tool call running", true);
+  if (msg.log) addDebugLine(msg.log);
   addActivity(msg);
 }
+
+// Debug switch: the engine's short per-event lines (Frankenstein v2 sends them as msg.log); kept per browser.
+const DEBUG_MAX_LINES = 400;
+function debugOn() { return $("debugToggle")?.checked; }
+function addDebugLine(line) {
+  const box = $("debugLog"); if (!box) return;
+  box.textContent += line + "\n";
+  const lines = box.textContent.split("\n"); if (lines.length > DEBUG_MAX_LINES) box.textContent = lines.slice(-DEBUG_MAX_LINES).join("\n");
+  if (debugOn()) box.scrollTop = box.scrollHeight;
+}
+function initDebugToggle() {
+  const t = $("debugToggle"); if (!t) return;
+  try { t.checked = localStorage.getItem("mynah.debugLog") === "1"; } catch (e) { /* storage unavailable */ }
+  const apply = () => { $("debugLog").hidden = !t.checked; try { localStorage.setItem("mynah.debugLog", t.checked ? "1" : "0"); } catch (e) { /* ignore */ } };
+  t.addEventListener("change", apply); apply();
+}
+initDebugToggle();
 
 function addMessage(role, text, meta) {
   const box = $("transcript"); box.querySelector(".empty-state")?.remove();
@@ -189,6 +207,6 @@ function flushPlayback() { (state.sources || []).forEach((src) => { try { src.st
 function fillVoices(list) { const sel = $("voiceSelect"); if (!sel || !Array.isArray(list)) return; const keep = sel.value; sel.innerHTML = '<option value="">Default</option>'; list.forEach((v) => { const o = document.createElement("option"); o.value = v; o.textContent = v; sel.append(o); }); sel.value = keep; }
 function speakDemo(text) { if (state.transport !== "demo" || !window.speechSynthesis || !text) return; window.speechSynthesis.cancel(); const voices = window.speechSynthesis.getVoices(); const voice = voices.find((v) => /^en-US$/i.test(v.lang) && /Samantha|Alex|Google US English/i.test(v.name)) || voices.find((v) => /^en(-|_)/i.test(v.lang)); const utterance = new SpeechSynthesisUtterance(text); utterance.lang = "en-US"; if (voice) utterance.voice = voice; utterance.rate = .96; utterance.pitch = 1; window.speechSynthesis.speak(utterance); }
 function trySuggestion() { if (!state.ws || state.ws.readyState !== 1) { setMicNote("Connect first, then run the guided example."); setSession("Connect first"); return; } if (state.transport !== "demo") { if (selectedSample()) playSample(); else setMicNote("Choose a guided sample in INPUT, or start the microphone."); return; } state.ws.send(JSON.stringify({type:"demo.request", scenario:currentScenario().id})); setMicNote("Running guided example — watch the activity stream."); setSession("Agent working", true); }
-function resetSession() { if (state.ws) requestSocketClose("reset"); stopMic(); stopSample(); stopAudioOutput(); state.sessionId = null; state.callId = null; setIds(); state.events = 0; $("eventCount").textContent = "0"; $("latencyValue").textContent = "—"; $("activityList").innerHTML = '<div class="empty-state compact"><span class="empty-icon">⌁</span><p>No events yet</p><small>Tool calls and model phases will appear here.</small></div>'; $("transcript").innerHTML = '<div class="empty-state"><span class="empty-icon">◌</span><p>Your conversation will appear here.</p><small>Connect, then start the microphone or run a guided sample.</small></div>'; setConnection("idle", state.transport === "gpu" ? "V2 GPU bridge offline" : "Local demo offline"); setAgent("idle", "Voice agent offline"); updateProfile(state.transport === "gpu" ? state.profile : "demo", false); $("connectButton").textContent = "Connect"; $("micButton").disabled = true; setSession("Ready"); updateMicNote(); }
+function resetSession() { if (state.ws) requestSocketClose("reset"); stopMic(); stopSample(); stopAudioOutput(); state.sessionId = null; state.callId = null; setIds(); state.events = 0; $("eventCount").textContent = "0"; if ($("debugLog")) $("debugLog").textContent = ""; $("latencyValue").textContent = "—"; $("activityList").innerHTML = '<div class="empty-state compact"><span class="empty-icon">⌁</span><p>No events yet</p><small>Tool calls and model phases will appear here.</small></div>'; $("transcript").innerHTML = '<div class="empty-state"><span class="empty-icon">◌</span><p>Your conversation will appear here.</p><small>Connect, then start the microphone or run a guided sample.</small></div>'; setConnection("idle", state.transport === "gpu" ? "V2 GPU bridge offline" : "Local demo offline"); setAgent("idle", "Voice agent offline"); updateProfile(state.transport === "gpu" ? state.profile : "demo", false); $("connectButton").textContent = "Connect"; $("micButton").disabled = true; setSession("Ready"); updateMicNote(); }
 setIds();
 boot();

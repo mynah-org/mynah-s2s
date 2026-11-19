@@ -20,6 +20,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "frankenstein"))
 
 
+def observability(a, td: Path):
+    """The server's trace listeners: the SQLite store and the short event log (frankenstein2/obs.py)."""
+    import logging
+    from frankenstein2.obs import LogSink, TraceStore
+    sinks, store = [], None
+    if a.trace_db != "off":
+        import atexit
+        store = TraceStore(a.trace_db or td / "f2_traces.sqlite", level=a.trace_db_level)
+        atexit.register(store.close)                 # flush the last batch on exit
+        sinks.append(store.sink)
+    if a.log_events != "off":
+        lg = logging.getLogger("frankenstein2.trace")
+        lg.setLevel(logging.INFO)
+        lg.propagate = False
+        h = logging.StreamHandler(sys.stdout) if a.log_events == "stdout" else logging.FileHandler(td / "events.log")
+        h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        lg.addHandler(h)
+        sinks.append(LogSink(lg).sink)
+    return sinks, store
+
+
 def main():  # pragma: no cover - GPU
     from frankenstein2.server import build as B
     ap = argparse.ArgumentParser()
@@ -28,6 +49,13 @@ def main():  # pragma: no cover - GPU
     ap.add_argument("--trace-dir", required=True)
     ap.add_argument("--idle-timeout", type=float, default=60.0)
     ap.add_argument("--max-sessions", type=int, default=4, help="concurrent sessions (each with its own language)")
+    ap.add_argument("--trace-db", default="", help="SQLite trace store (default: TRACE_DIR/f2_traces.sqlite); "
+                    "'off' disables it. View it with: python -m frankenstein2.obs DB")
+    ap.add_argument("--trace-db-level", default="normal", choices=["normal", "all"],
+                    help="all = also per-frame / per-hop events (large)")
+    ap.add_argument("--trace-no-text", action="store_true", help="drop user / agent text from every trace")
+    ap.add_argument("--log-events", default="file", choices=["file", "stdout", "off"],
+                    help="short per-event lines to TRACE_DIR/events.log (file), the console, or nowhere")
     ap.add_argument("--v2-server", action="store_true",
                     help="V2's single-session VoiceServer instead of the multi-session server")
     B.add_args(ap)
@@ -47,8 +75,10 @@ def main():  # pragma: no cover - GPU
         shared = NanoShared(a.nano_dir, str(Path(a.lab_scripts) / "multilingual"), a.nano_precision, a.nano_graph)
         make_llm, llm_info = B.llm_factory(a, shared, spec), shared.mem
     from frankenstein2.server.engine import Frankenstein2Engine, Resources, make_pipeline
+    sinks, store = observability(a, td)
     res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket),
-                    voices=B.voices(a), ears_thr=B.thresholds(a), trace_dir=str(td))
+                    voices=B.voices(a), ears_thr=B.thresholds(a), trace_dir=str(td), sinks=sinks,
+                    store_text=not a.trace_no_text)
     loads = {"load_s": round(time.monotonic() - t0, 1), "ears": ears.ready, "talker": pocket.ready,
              "llm": llm_info}
     (td / "server_loads.json").write_text(json.dumps(loads, indent=1, default=str))
