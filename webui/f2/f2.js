@@ -18,7 +18,11 @@ async function boot() {
   $("logToggle").addEventListener("change", () => { $("log").hidden = !$("logToggle").checked; remember("f2.log", $("logToggle").checked); });
   $("logToggle").checked = recall("f2.log") === "true"; $("log").hidden = !$("logToggle").checked;
   $("refresh").addEventListener("click", loadSessions);
-  $("lang").addEventListener("change", () => remember("f2.lang", $("lang").value));
+  $("langsBtn").addEventListener("click", () => $("langsDlg").showModal());
+  $("speakers").checked = recall("f2.speakers") !== "false";
+  $("speakers").addEventListener("change", () => remember("f2.speakers", $("speakers").checked));
+  $("lang").addEventListener("change", () => { remember("f2.lang", $("lang").value); showScenario(); });
+  $("scenario").addEventListener("change", () => { remember("f2.scenario", $("scenario").value); showScenario(true); });
   $("voice").addEventListener("change", () => remember("f2.voice", $("voice").value));
   if (location.hash === "#traces") showTab("traces");
   await refreshConfig();
@@ -39,11 +43,19 @@ async function refreshConfig() {
     S.cfg = c;
     const ok = c.gpu_configured && c.v2_reachable;
     $("engine").className = "engine " + (ok ? "ok" : "bad");
-    $("engineLabel").textContent = ok ? `engine online · ${c.languages.length} languages` : (c.gpu_configured ? "engine offline" : "no engine configured");
+    $("engineLabel").textContent = ok ? "engine online" : (c.gpu_configured ? "engine offline" : "no engine configured");
     fill($("lang"), c.languages.slice().sort((a, b) => (b.tested - a.tested) || a.name.localeCompare(b.name))
-      .map((l) => [l.code, `${l.name}${l.tested ? "" : " · preview"}`]), recall("f2.lang") || "it");
-    fill($("voice"), (c.voices || []).map((v) => [v, v]), recall("f2.voice"));
+      .map((l) => [l.code, `${FLAG[l.code] || ""} ${l.name}${l.tested ? "" : " · preview"}`.trim()]), recall("f2.lang") || "it");
+    showLanguages(c.languages);
+    const vs = (c.voices || []).slice().sort((a, b) => (a === "caller") - (b === "caller") || (b === "default") - (a === "default") || a.localeCompare(b));
+    const keepVoice = recall("f2.voice");
+    fill($("voice"), vs.map((v) => [v, v === "caller" ? "caller (the demo's caller voice)" : v]), keepVoice && keepVoice !== "caller" ? keepVoice : vs[0]);
     $("voice").closest("label").hidden = (c.voices || []).length < 2;
+    S.scenarios = c.scenarios || [];
+    try { S.samples = await fetch("/f2/samples/manifest.json").then((r) => (r.ok ? r.json() : null)); } catch (_) { S.samples = null; }
+    fill($("scenario"), S.scenarios.length ? S.scenarios.map((x) => [x.id, x.title.en || x.id]) : [["store", "Furniture store"]],
+      recall("f2.scenario") || "store");
+    showScenario(true);
     $("demoBtn").disabled = !ok || !c.demo_dialogue; $("orb").disabled = !ok;
     if (!c.demo_dialogue) $("demoNote").textContent = "The demo dialogue needs an engine with a talker.";
     if (!ok) setOrb("idle", "Engine offline", "Start it with: make f2-webui");
@@ -57,22 +69,83 @@ function fill(sel, items, keep) {
   if (keep && items.some(([v]) => v === keep)) sel.value = keep;
 }
 
+// ------------------------------------------------------------------ languages popup
+const FLAG = { it: "🇮🇹", en: "🇬🇧", fr: "🇫🇷", de: "🇩🇪", es: "🇪🇸", pt: "🇵🇹", nl: "🇳🇱", ko: "🇰🇷", tr: "🇹🇷", ja: "🇯🇵",
+  cs: "🇨🇿", hi: "🇮🇳", pl: "🇵🇱", ru: "🇷🇺", et: "🇪🇪", sv: "🇸🇪", uk: "🇺🇦", ar: "🇸🇦", zh: "🇨🇳", vi: "🇻🇳" };
+// an engine that does not send "status" yet: the same table as frankenstein2/langs.py STATUS
+const STATUS_FALLBACK = { it: "e2e", en: "e2e", fr: "e2e" };
+// a language whose recorded demo dialogue passed the end-to-end test (webui/f2/samples) counts as tested end to end
+const sampleVerified = (code) => !!(S.samples && S.samples.verified && Object.values(S.samples.verified[code] || {}).some(Boolean));
+const statusOf = (l) => (sampleVerified(l.code) ? "e2e" : l.status || STATUS_FALLBACK[l.code] || (l.tested ? "e2e" : "suite"));
+const STATUS_LABEL = { e2e: "tested end to end", suite: "suite passed", "weak-voice": "weak voice", unchecked: "not checked yet" };
+let sampleAudio = null;
+function playSample(file, el) {
+  if (sampleAudio) { sampleAudio.pause(); document.querySelectorAll(".listen.on").forEach((x) => { x.classList.remove("on"); x.textContent = "▶ listen"; }); if (sampleAudio.dataset.f === file) { sampleAudio = null; return; } }
+  sampleAudio = new Audio(`/f2/samples/${file}`); sampleAudio.dataset.f = file; sampleAudio.play();
+  el.classList.add("on"); el.textContent = "■ stop"; sampleAudio.onended = () => { el.classList.remove("on"); el.textContent = "▶ listen"; sampleAudio = null; };
+}
+function showLanguages(list) {
+  const ok = Array.isArray(list) && list.length; $("langsBtn").hidden = !ok; if (!ok) return;
+  $("langCount").textContent = list.length;
+  $("langE2e").textContent = list.filter((l) => statusOf(l) === "e2e").length;
+  const order = { e2e: 0, suite: 1, "weak-voice": 2, unchecked: 3 };
+  const grid = $("langGrid"); grid.innerHTML = "";
+  list.slice().sort((a, b) => (order[statusOf(a)] ?? 3) - (order[statusOf(b)] ?? 3) || a.name.localeCompare(b.name)).forEach((l) => {
+    const st = statusOf(l);
+    const b = document.createElement("button"); b.type = "button"; b.className = "lang-card";
+    b.innerHTML = '<span class="flag"></span><span><b></b><small></small> <span class="st"></span></span>';
+    b.querySelector(".flag").textContent = FLAG[l.code] || "🌐"; b.querySelector("b").textContent = l.name;
+    b.querySelector("small").textContent = l.code; const t = b.querySelector(".st"); t.className = `st ${st}`; t.textContent = STATUS_LABEL[st] || st;
+    const dl = S.samples && S.samples.dialogues && S.samples.dialogues[l.code];
+    if (dl) {                                           // a recorded demo dialogue: listen without a GPU
+      const f = dl.store || Object.values(dl)[0];
+      const p = document.createElement("span"); p.className = "listen"; p.textContent = "▶ listen"; p.title = "a recorded demo dialogue (caller left, agent right)";
+      p.addEventListener("click", (e) => { e.stopPropagation(); playSample(f, p); });
+      b.append(p);
+    }
+    b.addEventListener("click", () => { $("lang").value = l.code; remember("f2.lang", l.code); showScenario(); $("langsDlg").close(); });
+    grid.append(b);
+  });
+}
+
+// ------------------------------------------------------------------ scenarios
+function scenario() { return (S.scenarios || []).find((x) => x.id === $("scenario").value) || null; }
+function loc(d, lang) { return d ? (d[lang] ?? d.en ?? Object.values(d)[0]) : undefined; }
+function showScenario(resetPrompt) {
+  const sc = scenario(), lang = $("lang").value;
+  $("blurb").textContent = sc ? loc(sc.blurb, "en") : "";
+  if (resetPrompt) $("prompt").value = sc && sc.system_prompt ? sc.system_prompt : "";
+  $("prompt").placeholder = sc && !sc.system_prompt ? "The store's own instructions (leave empty to keep them)" : "";
+  $("toolsHint").textContent = sc && sc.tools.length ? `Tools: ${sc.tools.join(", ")}` : "Tools: the store's catalogue, customers, returns, escalation.";
+  const box = $("tries"); box.innerHTML = "";
+  const ex = sc ? (sc.examples[lang] || null) : null;
+  if (!ex) { if (sc && sc.examples.en) box.innerHTML = '<span class="lbl">examples in Italian, English and French</span>'; return; }
+  const l = document.createElement("span"); l.className = "lbl"; l.textContent = "try saying (tap: the simulated caller says it)"; box.append(l);
+  ex.forEach((t) => { const b = document.createElement("button"); b.className = "try"; b.textContent = t; b.addEventListener("click", () => tryLine(t)); box.append(b); });
+}
+function tryLine(text) {
+  if (!S.ws) return start("demo", [text]);
+  if (S.mode === "demo" && S.demo) { S.demo.extra.push(text); act("", "Queued", `the caller will say: "${cut(text, 50)}"`); return; }
+  act("", "Say it", `"${text}"`);
+}
+
 // ------------------------------------------------------------------ session
 function setOrb(state, title, sub) {
   $("orb").dataset.s = state; $("orbState").textContent = title; if (sub !== undefined) $("orbSub").textContent = sub;
   $("orbIcon").textContent = S.ws ? "■" : "●";
 }
 
-async function start(mode) {
+async function start(mode, lines) {
   if (S.ws) return;
+  S.lines = lines || null;
   resetView();
   S.mode = mode; S.closing = false;
   setOrb("connecting", "Connecting…", mode === "demo" ? "Preparing the demo dialogue." : "Allow the microphone when asked.");
-  try {
-    S.inCtx = new AudioContext({ sampleRate: IN_RATE });
-  } catch (_) { S.inCtx = new AudioContext(); }
+  // microphone: a context at the device's own rate (the engine resamples; a MediaStream into a context of another
+  // rate came out silent in Chrome); the demo dialogue streams 16 kHz itself and needs no capture context
+  S.inCtx = mode === "mic" ? new AudioContext() : null;
   S.outCtx = new AudioContext({ sampleRate: OUT_RATE });
-  await S.outCtx.resume();
+  await Promise.all([S.outCtx.resume(), S.inCtx ? S.inCtx.resume() : null]);
   if (mode === "mic") {
     if (!window.isSecureContext) { fail("The microphone needs localhost or HTTPS (see webui/README.md)."); return; }
     try {
@@ -83,9 +156,16 @@ async function start(mode) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.hostname}:${S.cfg.ws_port}/ws`);
   ws.binaryType = "arraybuffer"; S.ws = ws;
+  // a scenario whose demo lines are not written in this language: the demo dialogue is the store's (its lines exist
+  // in every language), with the store's own instructions
+  const sc = scenario(), lang = $("lang").value;
+  S.storeDemo = mode === "demo" && !lines && sc && sc.id !== "store" && !(sc.demo && sc.demo[lang]);
+  if (S.storeDemo) act("", "Demo dialogue", `“${loc(sc.title, "en")}” has demo lines in ${(sc.languages || []).join(", ")}; this demo is the store's`);
   ws.onopen = () => ws.send(JSON.stringify({
-    type: "session.start", transport: "gpu", language: $("lang").value, voice: $("voice").value || undefined,
-    system_prompt: $("prompt").value.trim() || undefined, input_rate: mode === "demo" ? IN_RATE : S.inCtx.sampleRate,
+    type: "session.start", transport: "gpu", language: lang, voice: $("voice").value || undefined,
+    system_prompt: S.storeDemo ? undefined : ($("prompt").value.trim() || undefined),
+    input_rate: mode === "demo" ? IN_RATE : S.inCtx.sampleRate,
+    scenario: S.storeDemo ? "store" : ($("scenario").value || undefined),
   }));
   ws.onmessage = (e) => (typeof e.data === "string" ? onJson(JSON.parse(e.data)) : onAudio(e.data));
   ws.onerror = () => { if (S.ws === ws) fail("Connection error: is the engine running?"); };
@@ -102,12 +182,30 @@ function onSessionCreated(m) {
 
 function startMic() {
   const ctx = S.inCtx, src = ctx.createMediaStreamSource(S.mic.stream);
+  if (ctx.state !== "running") ctx.resume();
   const proc = ctx.createScriptProcessor(2048, 1, 1), mute = ctx.createGain(); mute.gain.value = 0;
-  proc.onaudioprocess = (e) => sendPcm(e.inputBuffer.getChannelData(0));
+  S.mic.peak = 0; S.mic.t0 = performance.now(); S.mic.warned = false;
+  proc.onaudioprocess = (e) => {
+    const x = e.inputBuffer.getChannelData(0); let pk = 0;
+    for (let i = 0; i < x.length; i += 8) pk = Math.max(pk, Math.abs(x[i]));
+    S.mic.peak = Math.max(pk, S.mic.peak * 0.9); meter(S.mic.peak);
+    if (!S.mic.warned && performance.now() - S.mic.t0 > 4000 && S.mic.max < 0.003) {
+      S.mic.warned = true;
+      act("bad", "No microphone signal", "check the input device in the browser (site settings) and the system");
+    }
+    S.mic.max = Math.max(S.mic.max || 0, pk);
+    // speakers: the microphone hears the agent and the engine would take it for a barge-in; while the agent is
+    // audible (and 600 ms after), send silence instead (no spoken interruptions then; headphones keep them)
+    const agentAudible = S.outCtx && (S.nextPlay > S.outCtx.currentTime || performance.now() - S.agentLoud < 600);
+    sendPcm($("speakers").checked && agentAudible ? new Float32Array(x.length) : x);
+  };
   src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
   S.mic.proc = proc; S.mic.src = src;
+  const track = S.mic.stream.getAudioTracks()[0];
+  act("", "Microphone", `${track ? track.label || "default input" : "?"} · ${ctx.sampleRate} Hz`);
   setOrb("listening", "Listening", "Speak naturally; interrupt the agent whenever you like. Tap to end.");
 }
+function meter(v) { const el = $("micLevel"); if (el) el.style.transform = `scaleX(${Math.min(1, v * 4).toFixed(3)})`; }
 
 function sendPcm(f32) {
   if (!S.ws || S.ws.readyState !== 1) return;
@@ -130,7 +228,7 @@ function teardown(label) {
   if (S.mic) { S.mic.stream.getTracks().forEach((t) => t.stop()); S.mic = null; }
   if (S.pump) { clearInterval(S.pump); S.pump = null; }
   clearInterval(S.timer); S.timer = null;
-  [S.inCtx, S.outCtx].forEach((c) => c && c.close().catch(() => {}));
+  [S.inCtx, S.outCtx].forEach((c) => c && c.close().catch(() => {})); meter(0);
   S.inCtx = S.outCtx = null; S.ws = null; S.sources = []; S.nextPlay = 0;
   $("demoBtn").textContent = "▶ Play a demo dialogue"; $("demoBtn").disabled = !(S.cfg && S.cfg.demo_dialogue);
   setOrb("idle", "Tap to talk", label === "Session ended" ? "Session ended. Its trace is in the Traces tab." : label);
@@ -147,8 +245,12 @@ function onJson(m) {
   if (m.log) log(m.log);
   const ev = m.ev;
   if (ev === "asr.turn") {
+    if (m.reason === "endpoint_merged" && S.userMsg && S.userMsg.isConnected && !S.agentMsg) {
+      // the engine cancelled the previous turn (the speaker went on) and heard it whole: same bubble
+      S.userMsg.querySelector(".text").textContent = m.text || ""; return;
+    }
     S.turns++; $("mTurns").textContent = S.turns; S.tTurn = performance.now(); S.lastAsr = S.turns; S.tAsr = S.tTurn; S.agentMsg = null;
-    say("user", m.text, S.mode === "demo" ? "caller · heard by the ASR" : "you · heard by the ASR");
+    S.userMsg = say("user", m.text, S.mode === "demo" ? "caller · heard by the ASR" : "you · heard by the ASR");
     act("", "Your turn ended", `"${cut(m.text, 60)}"`);
     if (S.mode === "mic") setOrb("thinking", "Thinking…");
   } else if (ev === "llm.request") {
@@ -203,9 +305,12 @@ function flushAudio() { S.sources.forEach((s) => { try { s.stop(); } catch (_) {
 // plays each line and streams it, resampled to 16 kHz, as the session's input; between lines it streams silence, so
 // the engine hears exactly what a microphone would send. The next line waits until the agent has answered.
 async function startDemo() {
-  const lang = $("lang").value;
-  const script = await fetch(`/api/demo-script?lang=${encodeURIComponent(lang)}`).then((r) => r.json());
-  const d = S.demo = { cancelled: false, queue: [], lines: {}, onLine: null };
+  const lang = $("lang").value, sc = scenario();
+  let script;
+  if (S.lines) script = { lines: S.lines, fallback: false };
+  else if (!S.storeDemo && sc && sc.demo && sc.demo[lang]) script = { lines: sc.demo[lang], fallback: false };
+  else script = await fetch(`/api/demo-script?lang=${encodeURIComponent(lang)}`).then((r) => r.json());
+  const d = S.demo = { cancelled: false, queue: [], lines: {}, onLine: null, extra: [] };
   d.onLine = (m) => {
     const L = d.lines[m.id] || (d.lines[m.id] = { chunks: [], done: false });
     if (m.type === "demo.audio") L.chunks.push({ sr: m.sr, pcm: b64pcm(m.pcm) }); else { L.done = true; L.resolve && L.resolve(); }
@@ -214,13 +319,24 @@ async function startDemo() {
   setOrb("listening", "Demo dialogue", "A simulated caller is talking to the engine.");
   act("ok", "Demo dialogue", `${script.lines.length} caller lines${script.fallback ? " (English: no script for this language)" : ""}`);
   await sleep(1200);
-  for (let i = 0; i < script.lines.length && !d.cancelled; i++) {
-    const text = script.lines[i], before = S.lastAsr;
-    S.ws.send(JSON.stringify({ type: "demo.say", id: i, text }));
-    const L = d.lines[i] || (d.lines[i] = { chunks: [], done: false });
-    if (!L.done) await new Promise((r) => { L.resolve = r; setTimeout(r, 30000); });
+  const all = script.lines.slice();
+  let announced = false;
+  for (let i = 0; !d.cancelled; i++) {
+    while (i >= all.length && !d.cancelled) {           // the script is done: wait for a tapped example
+      if (d.extra.length) { all.push(d.extra.shift()); break; }
+      if (!announced) { announced = true; act("ok", "Demo finished", "tap an example to have the caller say it, talk, or End"); }
+      await sleep(300);
+    }
     if (d.cancelled) break;
-    const pcm24 = concat(L.chunks.map((c) => c.pcm)), sr = L.chunks[0]?.sr || 24000;
+    const text = all[i], before = S.lastAsr;
+    let pcm24 = await recordedLine(text), sr = 24000;      // a recorded caller line (webui/f2/samples), if any
+    if (!pcm24) {                                          // else the engine speaks it with the caller voice
+      S.ws.send(JSON.stringify({ type: "demo.say", id: i, text }));
+      const L = d.lines[i] || (d.lines[i] = { chunks: [], done: false });
+      if (!L.done) await new Promise((r) => { L.resolve = r; setTimeout(r, 30000); });
+      if (d.cancelled) break;
+      pcm24 = concat(L.chunks.map((c) => c.pcm)); sr = L.chunks[0]?.sr || 24000;
+    }
     if (!pcm24.length) { act("bad", "Demo", "the caller line came back empty"); continue; }
     callerLine(text);
     const pcm16 = await resample(pcm24, sr, IN_RATE);
@@ -229,7 +345,17 @@ async function startDemo() {
     await sleep((pcm16.length / IN_RATE) * 1000 + 300);
     await waitAgent(d, before, 25000);
   }
-  if (!d.cancelled) { await sleep(1500); act("ok", "Demo finished", "the session stays open: tap End, or talk"); }
+}
+// webui/f2/samples/manifest.json: {"lines": {text: file}, "dialogues": {lang: {scenario: file}}}
+async function recordedLine(text) {
+  const f = S.samples && S.samples.lines && S.samples.lines[text];
+  if (!f) return null;
+  try {
+    const buf = await fetch(`/f2/samples/${f}`).then((r) => r.arrayBuffer());
+    const ctx = new OfflineAudioContext(1, 1, 24000);
+    const dec = await ctx.decodeAudioData(buf);
+    return dec.sampleRate === 24000 ? dec.getChannelData(0) : await resample(dec.getChannelData(0), dec.sampleRate, 24000);
+  } catch (_) { return null; }
 }
 function pump() {
   const d = S.demo; if (!d || !S.ws || S.ws.readyState !== 1) return;
