@@ -1,0 +1,22 @@
+# Frankenstein v2 unit tests: pure Python + numpy (no torch, no GPU, no weights). The torch and GPU tiers are
+# opt-in (`make test-f2-torch`, `make test-f2-gpu`) and run on a GPU machine, not here.
+name: frankenstein2-tests
+on:
+  push:
+    paths: ["frankenstein2/**", "frankenstein/frankenstein_s2s/**", "frankenstein/e1/tools_bench.py",
+            "labs/multilingual/scripts/agentbench/**", "v2/src/mynah_v2/agent/**", ".github/workflows/frankenstein2-tests.yml"]
+  pull_request:
+    paths: ["frankenstein2/**", ".github/workflows/frankenstein2-tests.yml"]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r frankenstein2/requirements-test.txt
+      - run: python -m pytest -q frankenstein2/tests

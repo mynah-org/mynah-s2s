@@ -1,0 +1,4 @@
+# Unit tests only (`make test-f2`): no torch, no GPU, no weights.
+pytest>=8,<9.2      # 9.2.0 fails at session start on some Python 3.10 builds (seen on 3.10.0)
+numpy>=1.26
+websockets>=12

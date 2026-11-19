@@ -688,7 +688,7 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
     sched.ears = ears
 
     LANGS = {"it": "italian_24l", "fr": "french_24l", "en": "english_2026-09_24l", "es": "spanish_24l",
-             "de": "german_24l", "pt": "portuguese_24l"}
+             "de": "german_24l", "pt": "portuguese_24l", "nl": "dutch_24l"}   # kyutai/pocket-tts official
 
     def make_pocket(lang):
         from .tts.pocket_own import PocketOwn
@@ -705,7 +705,8 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
         pocket_first.setdefault("m", m)                  # Mimi (codec + voice encoder) loaded once for all languages
         return m
     pocket_first: dict = {}
-    vs = dict(x.split("=", 1) for x in getattr(a, "voice", []) or [])
+    from .server.build import voices
+    vs = voices(a) if hasattr(a, "voice") else {}
     talker = InProcTalker(sched, make_pocket, slots=slots, default_voice=next(iter(vs.values()), ""))
     sched.talker = talker
     for lang in [x for x in getattr(a, "pocket_preload", "").split(",") if x]:   # models + default voice, now

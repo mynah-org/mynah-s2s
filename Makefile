@@ -9,11 +9,13 @@ GROUP ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-all setup-tts setup-asr doctor ws-check corpus test-cpu test-gpu demo e2e-fc e2e-corpus multi multi-notools \
-        multi-mixed custom serve int4-pack w8-pack client webui webui-gpu asr score reproduce
+        multi-mixed custom serve int4-pack w8-pack client webui webui-gpu asr score reproduce \
+        f2-setup f2-serve f2-webui f2-traces test-f2 test-f2-torch test-f2-gpu
 
 help: ## show this list
-	@echo "mynah-s2s V2 (work in progress)"
-	@echo "  core runtime only: make setup -> make doctor -> make serve (your own audio / client)"
+	@echo "mynah-s2s (work in progress)"
+	@echo "  Frankenstein v2 (recommended): make f2-setup -> source the env file -> make f2-serve / make f2-webui"
+	@echo "  VoiceChat engine core runtime: make setup -> make doctor -> make serve (your own audio / client)"
 	@echo "  test suites:       make setup-all -> make doctor -> make corpus -> make demo -> e2e-fc / multi / custom"
 	@grep -E '^[a-z][a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-14s %s\n", $$1, $$2}'
 
@@ -34,6 +36,33 @@ test-cpu: ## unit tests, no GPU or weights needed
 	$(M) test-cpu
 test-gpu: ## GPU tests (weights needed)
 	$(M) test-gpu
+
+# ---- Frankenstein v2: the recommended engine (multilingual, ~15 GB of weights, one GPU process) ----------------
+# F2_PYTHON: a Python with frankenstein2/requirements.txt installed (torch with CUDA for serving; only pytest +
+# numpy for test-f2). F2_ENV: the paths written by f2-setup.
+F2_PYTHON ?= python3
+F2_LANGS ?= it,en,fr
+F2_HF_HOME ?= $(HOME)/mynah-s2s/hf
+F2_ENV ?= $(F2_HF_HOME)/f2.env
+F2_TRACE_DIR ?= $(CURDIR)/.f2-traces
+F2_ARGS ?=
+f2-setup: ## Frankenstein v2: download ears + Qwen3.5-4B + Pocket TTS for F2_LANGS (default it,en,fr)
+	$(F2_PYTHON) frankenstein2/scripts/setup_models.py --langs $(F2_LANGS) --hf-home $(F2_HF_HOME)
+f2-serve: ## Frankenstein v2 WebSocket server on :8772 (paths from F2_ENV, extra flags in F2_ARGS)
+	set -a; . "$(F2_ENV)"; set +a; PYTHONPATH="$(CURDIR)/v2/src" HF_HUB_OFFLINE=1 $(F2_PYTHON) \
+		frankenstein2/server/serve.py --port 8772 --trace-dir "$(F2_TRACE_DIR)" --pocket-preload "$$F2_LANGS" $(F2_ARGS)
+f2-webui: ## Frankenstein v2 server + web UI (http://127.0.0.1:8787); the Debug log switch shows engine lines
+	set -a; . "$(F2_ENV)"; set +a; $(MAKE) webui-gpu ENGINE=frankenstein2 WEBUI_PYTHON="$(F2_PYTHON)" \
+		FRANK2_SERVE_ARGS="--pocket-preload $$F2_LANGS $(F2_ARGS)"
+f2-traces: ## Frankenstein v2 trace store: sessions; SESSION=<id suffix> for a timeline, SPANS=1 for durations
+	$(F2_PYTHON) -m frankenstein2.obs "$(F2_TRACE_DIR)/f2_traces.sqlite" $(if $(SESSION),--session $(SESSION)) \
+		$(if $(SPANS),--spans)
+test-f2: ## Frankenstein v2 unit tests: pure Python + numpy, no torch / GPU / weights (what CI runs)
+	$(F2_PYTHON) -m pytest -q frankenstein2/tests
+test-f2-torch: ## Frankenstein v2 unit tests + the torch CPU tests on tiny random weights
+	$(F2_PYTHON) -m pytest -q frankenstein2/tests --torch
+test-f2-gpu: ## Frankenstein v2 unit tests + GPU smoke tests on the real models (after f2-setup)
+	set -a; . "$(F2_ENV)"; set +a; $(F2_PYTHON) -m pytest -q frankenstein2/tests --gpu
 
 demo: ## one session, one item (ITEM=t02 order lookup; try q03, t13, s05): agent text, tool calls, ASR, combined.wav
 	$(M) demo $(ITEM)

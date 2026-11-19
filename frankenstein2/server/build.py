@@ -22,7 +22,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def add_args(ap) -> None:
-    ap.add_argument("--lab-scripts", required=True, help="agentbench + multilingual lab scripts (tenant tools)")
+    env = os.environ.get
+    ap.add_argument("--lab-scripts", default=str(ROOT / "labs" / "multilingual" / "scripts"),
+                    help="agentbench + multilingual lab scripts (tenant tools; default: this repository's copy)")
     ap.add_argument("--tenant", default="tenant_furniture.json")
     ap.add_argument("--nano-dir", default="")
     ap.add_argument("--llm-backend", default="qwen", choices=["nano", "qwen"],
@@ -30,13 +32,14 @@ def add_args(ap) -> None:
                          "if --qwen-src points at it, else HF generate)")
     ap.add_argument("--qwen-python", default="")
     ap.add_argument("--qwen-src", default="", help="root that contains frankenstein2.llm.qwen_own (own engine)")
-    ap.add_argument("--qwen-model", default="")
+    ap.add_argument("--qwen-model", default=env("F2_QWEN_MODEL", ""), help="Qwen3.5 snapshot dir (env F2_QWEN_MODEL)")
     ap.add_argument("--qwen-mode", default="int8", help="own engine weights: int8 (default) | bf16 | MoE AWQ 4-bit")
     ap.add_argument("--qwen-slots", type=int, default=8)
     ap.add_argument("--nano-precision", default="int4-decode", choices=["bf16", "int4-decode"])
     ap.add_argument("--nano-graph", action="store_true", help="decode CUDA graph for the spoken reply (v1 G8)")
-    ap.add_argument("--ears-python", required=True)
-    ap.add_argument("--ears-bundle", required=True)
+    ap.add_argument("--ears-python", default=sys.executable, help="procs runtime: the ears process's Python")
+    ap.add_argument("--ears-bundle", default=env("F2_EARS_BUNDLE", ""),
+                    help="nineninesix/tyger snapshot dir (env F2_EARS_BUNDLE)")
     ap.add_argument("--ears-device", default="cuda")
     ap.add_argument("--ears-procs", type=int, default=1, help="ears processes; sessions are spread across them")
     ap.add_argument("--talker", default="swap", choices=["pocket", "swap", "flash"],
@@ -58,20 +61,26 @@ def add_args(ap) -> None:
     ap.add_argument("--chunking", default="", help="talker chunking override: sentence | whole | progressive")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--ep-thr", action="append", default=[], help="LANG=threshold for the endpoint head")
-    ap.add_argument("--tool-timeout", type=float, default=8.0,
-                    help="seconds a tool may run; then the model gets the reference timeout error (late results are "
-                         "recorded in the ledger, never used)")
-    ap.add_argument("--tool-reminder-s", type=float, default=2.5,
-                    help="an on-hold reminder every N seconds while a tool runs (0 = none); the tool starts ~2 s after "
-                         "the holding phrase (call generation), so 4 s left 4-5 s of silence and callers spoke over it")
+    ap.add_argument("--tool-timeout", type=float, default=10.0,
+                    help="seconds a tool call may run (e.g. 10 or 30); then it is stopped: its later result is "
+                         "recorded in the ledger as late and never used")
+    ap.add_argument("--tool-timeout-reply", default="canned", choices=["canned", "model"],
+                    help="when every call of a round timed out: canned = say a fixed 'sorry, I could not retrieve "
+                         "it' line in the session language (no extra LLM round); model = the LLM answers from the "
+                         "timeout error")
+    ap.add_argument("--tool-first-wait-s", type=float, default=1.5,
+                    help="from this many seconds into a tool call the engine checks every second whether the agent "
+                         "is silent and says an on-hold reminder (0 = never)")
     ap.add_argument("--tool-delay-s", type=float, default=0.0, help="lab: every tool backend sleeps N seconds first")
     ap.add_argument("--no-tool-rule", dest="tool_rule", action="store_false",
                     help="v2b: without the tool rule in the system prompt and the localized decision question")
-    ap.add_argument("--runtime", default="procs", choices=["procs", "single"],
+    ap.add_argument("--runtime", default="single", choices=["procs", "single"],
                     help="single = ONE process owns the GPU: our own ears, Qwen and Pocket runtimes under one scheduler "
                          "(frankenstein2/runtime.py); procs = the ears / talker / Qwen processes")
-    ap.add_argument("--pocket-weights", default="", help="single: the Pocket cloning snapshot (languages/<lang>/model.safetensors)")
-    ap.add_argument("--pocket-tokenizers", default="", help="single: where languages/<lang>/tokenizer.json are")
+    ap.add_argument("--pocket-weights", default=env("F2_POCKET_WEIGHTS", ""),
+                    help="single: the Pocket cloning snapshot (languages/<lang>/model.safetensors; env F2_POCKET_WEIGHTS)")
+    ap.add_argument("--pocket-tokenizers", default=env("F2_POCKET_TOKENIZERS", ""),
+                    help="single: where languages/<lang>/tokenizer.json are (env F2_POCKET_TOKENIZERS)")
     ap.add_argument("--pocket-preload", default="it,en,fr", help="single: talker languages loaded at start")
     ap.add_argument("--talker-budget-ms", type=float, default=40.0)
     ap.add_argument("--child-env", action="append", default=[],
@@ -184,13 +193,14 @@ def qwen_factory(a, proc, spec):  # pragma: no cover - process
         for t in spec["tools"]:
             reg.register(t["name"], hs[t["name"]], t["description"], t["parameters"])
         led = ToolLedger(sid, None)
-        tmo = getattr(a, "tool_timeout", 8.0)
+        tmo = getattr(a, "tool_timeout", 10.0)
         bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=tmo)   # backend in its own thread, ledger timeout
         rule = ("\n" + TOOL_RULE.get(lang, TOOL_RULE["en"])) if a.tool_rule else ""
         system = (with_language(system_prompt or spec["system_prompt"], L) + "\n" + policy.get(lang, policy["en"])
                   + "\n" + BRIEF.get(lang, BRIEF["en"]) + rule)
-        llm = QwenLLM(proc, sid, system, tool_schemas(reg), bound, lang, tool_timeout_s=tmo + 1.0,
-                      reminder_s=getattr(a, "tool_reminder_s", 2.5))
+        llm = QwenLLM(proc, sid, system, tool_schemas(reg), bound, lang, tool_timeout_s=tmo + 0.5,
+                      first_wait_s=getattr(a, "tool_first_wait_s", 1.5),
+                      timeout_reply=getattr(a, "tool_timeout_reply", "canned"))
         llm.backend, llm.ledger = backend, led
         return llm
     return make
@@ -257,4 +267,8 @@ def thresholds(a) -> dict:
 
 
 def voices(a) -> dict:
-    return dict(x.split("=", 1) for x in a.voice)
+    """--voice NAME=wav (repeatable); without any, the reference WAV of setup_models.py (env F2_VOICE) as "default"."""
+    vs = dict(x.split("=", 1) for x in a.voice)
+    if not vs and os.environ.get("F2_VOICE"):
+        vs["default"] = os.environ["F2_VOICE"]
+    return vs

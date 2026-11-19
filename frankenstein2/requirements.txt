@@ -1,0 +1,12 @@
+# Frankenstein v2 runtime (one GPU process: ears + Qwen3.5 + Pocket TTS). Install torch first, with the CUDA build for
+# your driver (https://pytorch.org/get-started/locally/); triton comes with it on Linux.
+torch>=2.6
+triton>=3.2
+safetensors>=0.4
+tokenizers>=0.20
+jinja2>=3.1
+numpy>=1.26
+scipy>=1.11
+websockets>=12
+soxr>=0.3            # optional: better resampling of the output audio
+huggingface_hub>=0.25 # model download (frankenstein2/scripts/setup_models.py)
