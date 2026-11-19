@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .audio.playout import Playout, SecondEar
+from .control.continuation import wants_more
 from .control.second_pass import SecondPassConfig, Suspicion, TurnAudio, choose
 from .control.controller import Controller, ControllerConfig, Intent, St
 from .control.history import Conversation
@@ -61,6 +62,8 @@ class PipelineConfig:
     barge_assist: bool = True              # echo-aware energy onset + ASR word confirmation (control/barge.py)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     second_pass: SecondPassConfig = field(default_factory=SecondPassConfig)   # uncertain turns re-heard offline
+    continuation_hold_steps: int = 10      # an endpoint on a text that wants more (control/continuation.py) waits
+                                           # this many steps for more words (0 = off)
 
 
 @dataclass
@@ -98,6 +101,7 @@ class Pipeline:
         self.sp = Suspicion(cfg.second_pass)
         self.audio = TurnAudio(cfg.second_pass.keep_s)
         self.sp_wait = None                    # an endpoint held for its second ASR pass
+        self.ep_hold = None                    # an endpoint held because the text wants a continuation
         self.sp_n = 0
 
     # ------------------------------------------------------------------ lifecycle
@@ -151,6 +155,8 @@ class Pipeline:
                                               self.ctl.state is St.SPEAKING and self.playout.audible())
         for r in self.ears.poll():
             self._on_hop(r, k, asr_delta)
+        if self.ep_hold is not None:
+            self._hold_check(k)
         if self.sp_wait is not None:
             self._second_pass_check(k)
         if self.barge_cand is not None:
@@ -228,7 +234,31 @@ class Pipeline:
                 self.ctl.post(Intent("BACKCHANNEL", "ears", k, payload={"frame": e["k"]}))
 
     def _endpoint(self, k: int, frame: int) -> None:
-        """The ears ended the user's turn: post it, or first re-hear it offline when it looks uncertain."""
+        """The ears ended the user's turn. A text that wants a continuation ("...e", "...und", a final comma) waits a
+        little for more words first: they mean the GRU ended the turn inside a pause, and the ears will end it
+        again later; none, and the turn ends as it was."""
+        text = self.user.pending()
+        n = self.cfg.continuation_hold_steps
+        if n and self.ctl.state is St.LISTENING and self.sp_wait is None and wants_more(text, self.lang):
+            if self.ep_hold is None:
+                self.tr.emit("asr.hold", k, text=text, frame=frame, steps=n)
+            self.ep_hold = {"k": k, "frame": frame, "pieces": len(self.user.pieces), "text": text}
+            return
+        self.ep_hold = None
+        self._endpoint_now(k, frame)
+
+    def _hold_check(self, k: int) -> None:
+        h = self.ep_hold
+        if len(self.user.pieces) > h["pieces"]:            # the user went on: the turn stays open
+            self.ep_hold = None
+            self.tr.emit("asr.hold_done", k, resumed=True, waited_ms=(k - h["k"]) * 80)
+        elif k - h["k"] >= self.cfg.continuation_hold_steps:
+            self.ep_hold = None
+            self.tr.emit("asr.hold_done", k, resumed=False, waited_ms=(k - h["k"]) * 80)
+            self._endpoint_now(k, h["frame"])
+
+    def _endpoint_now(self, k: int, frame: int) -> None:
+        """Post the endpoint, or first re-hear the turn offline when it looks uncertain (control/second_pass.py)."""
         text = self.user.pending()
         c = self.cfg.second_pass
         if self.sp_wait is not None:                       # already waiting: the later endpoint frame counts

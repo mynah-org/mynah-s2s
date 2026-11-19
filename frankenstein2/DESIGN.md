@@ -48,9 +48,14 @@ environment. Each session has its own language, encoder caches, GRU state and ru
   - BARGE: `yield ≥ 0.4` for 2 frames, with `onset_s`.
   - BACKCHANNEL: `bc ≥ 0.4` for 2 frames, then a 1.2 s refractory period.
   - 6 warm-up frames after each reset or mode switch.
-  - Thresholds can be set per language (`--ep-thr it=0.85`). On the Italian session, 0.85 roughly halves the
-    endpoint latency; the extra early fires fall in inner pauses and are recovered by the continuation guard and
-    the unheard-barge merge.
+  - Thresholds are set per language (`frankenstein2/langs.py` EP_THR, `--ep-thr LANG=x` on top). On the Italian
+    session, 0.85 roughly halves the endpoint latency; the extra early fires fall in inner pauses and are recovered
+    by the continuation guard and the unheard-barge merge. German, Spanish, Dutch, Korean, Polish, Russian and
+    Turkish use 0.95 and Estonian 0.975: `lab/endpoint_bench.py` (a 0.3-0.9 s pause cut into the middle of each
+    recorded caller line) showed about 40 % fewer turns ended inside the pause, for 100-320 ms more latency.
+  - Continuation hold (`control/continuation.py`): an endpoint on a text that ends with a comma or with a word that
+    cannot end a sentence ("e", "und", "and", "de"...) waits up to 0.8 s for more words; they keep the turn open and
+    the ears end it again later. Japanese and Korean are not judged.
   - Silence fallback: after the user has spoken, 15 unvoiced frames (1.2 s) end the turn even if `p_end` stays
     under the threshold. This is the bundle's own default policy (Tyger's live config leaves it off). We turned it on
     because `p_end` sat at 0.89–0.90 for 8 s after an Italian turn and between 0.83 and 0.90 after English turns.

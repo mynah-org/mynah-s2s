@@ -37,8 +37,12 @@ session language and never auto-detects.
 | adaptation-ready (needs fine-tuning) | el-GR, lt-LT, lv-LV, mt-MT, sl-SI, he-IL, th-TH, nn-NO |
 
 The turn-taking GRU in the same bundle was trained and evaluated on English (Tyger model card). In our tests it also
-ends turns in the other 14 languages (the end-to-end test above), Italian with its own threshold (`--ep-thr it=0.85`);
-measuring its early and late endpoints per language is still to do.
+ends turns in the other 14 languages (the end-to-end test above). `frankenstein2/lab/endpoint_bench.py` measures it
+per language on the recorded caller lines: no missed endpoint, a median latency after the speech ends of 300-640 ms
+(English and Portuguese slower, about 1 s: there the GRU rarely reaches its threshold and the 1.2 s silence rule ends
+the turn), and a pause of 0.6-0.9 s inside a sentence often ends the turn too early. Per-language thresholds
+(`frankenstein2/langs.py` EP_THR) cut those early ends by about 40 % in the languages they apply to; when the user goes
+on speaking within 2 s the engine cancels the reply and merges the two parts of the turn.
 
 **Brain: Qwen3.5-4B (201 languages and dialects).** Source: [model card](https://huggingface.co/Qwen/Qwen3.5-4B).
 We measured tool-call quality in Italian, English and French only.

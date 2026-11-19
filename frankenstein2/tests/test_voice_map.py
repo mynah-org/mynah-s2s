@@ -80,3 +80,11 @@ def test_samples_sources_name_every_voice_and_licence():
     assert "| et | agent | a published voice prompt | https://huggingface.co/a/b | CC-BY-SA-4.0 |" in md
     assert "sobak" not in md
     assert "| et | https://huggingface.co/c/d | CC-BY-SA-4.0 |" in md
+
+
+def test_endpoint_thresholds_per_language_and_the_cli_override():
+    t = B.thresholds(argparse.Namespace(ep_thr=[]))
+    assert t["it"] == {"ep_thr": 0.85} and t["de"] == {"ep_thr": 0.95} and t["et"] == {"ep_thr": 0.975}
+    assert "en" not in t and "fr" not in t                          # the gated languages keep the default
+    t2 = B.thresholds(argparse.Namespace(ep_thr=["de=0.9", "sv=0.88"]))
+    assert t2["de"] == {"ep_thr": 0.9} and t2["sv"] == {"ep_thr": 0.88} and t2["it"] == {"ep_thr": 0.85}

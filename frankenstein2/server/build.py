@@ -331,7 +331,9 @@ def talker_factory(a, proc):  # pragma: no cover - process
 
 
 def thresholds(a) -> dict:
-    out = {}
+    """Per language: the endpoint thresholds of frankenstein2/langs.py EP_THR, then --ep-thr LANG=x on top."""
+    from frankenstein2 import langs as LG
+    out = {lang: {"ep_thr": v} for lang, v in LG.EP_THR.items()}
     for x in a.ep_thr:
         lang, _, v = x.partition("=")
         out[lang] = {"ep_thr": float(v)}

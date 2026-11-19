@@ -6,7 +6,8 @@ Families:
              energy / mode / state), ears.event (ENDPOINT / BARGE / BACKCHANNEL), ears.reset, ears.error
   asr.*      asr.piece (streaming transcript pieces with their frame), asr.turn (the text sent to the LLM),
              asr.drop (speech heard while the agent spoke, not part of a barge-in), asr.second_pass.request /
-             asr.second_pass (an uncertain turn transcribed again offline: reason, both texts, which one was used)
+             asr.second_pass (an uncertain turn transcribed again offline: reason, both texts, which one was used),
+             asr.hold / asr.hold_done (an endpoint on a text that wants a continuation waits for more words)
   ctl.*      every controller intent and action (with epoch, turn_id, request_id)
   llm.*      llm.request, llm.text, llm.decided, llm.tool, llm.done, llm.stale
   tool.*     tool.started (name, raw args, call_id), tool.waiting (s, names, silent_steps),
@@ -27,7 +28,7 @@ from pathlib import Path
 
 EVENTS = frozenset({
     "ears.hop", "ears.frame", "ears.event", "ears.reset", "ears.error",
-    "asr.piece", "asr.turn", "asr.drop", "asr.second_pass.request", "asr.second_pass",
+    "asr.piece", "asr.turn", "asr.drop", "asr.second_pass.request", "asr.second_pass", "asr.hold", "asr.hold_done",
     "ctl.intent", "ctl.action",
     "llm.request", "llm.text", "llm.decided", "llm.tool", "llm.done", "llm.stale",
     "tool.started", "tool.completed", "tool.waiting",

@@ -99,6 +99,16 @@ _REG: dict = dict(BUILTIN)
 STATUS = {c: "e2e" for c in ("it", "en", "fr", "de", "es", "pt", "nl", "ko", "tr", "ja", "cs", "hi", "pl", "ru", "et")}
 
 
+# The turn-taking GRU's endpoint threshold per language (ears/rules.py Thresholds.ep_thr, default 0.915), from
+# frankenstein2/lab/endpoint_bench.py on the recorded caller lines (f2c-070): raising it for these languages cut the
+# turns ended inside a 0.3-0.9 s pause in the middle of a sentence by about 40 %, for 100-320 ms more end-of-turn
+# latency. Italian keeps 0.85 (half the latency; its early endpoints are recovered by the continuation guard), English
+# and French keep the default: those three have the tool-call suites and multi-session gates, measured with these
+# values. --ep-thr LANG=x overrides.
+EP_THR = {"it": 0.85, "de": 0.95, "es": 0.95, "nl": 0.95, "ko": 0.95, "pl": 0.95, "ru": 0.95, "tr": 0.95,
+          "et": 0.975}
+
+
 def status(code: str) -> str:
     return STATUS.get(code, "unchecked")
 
