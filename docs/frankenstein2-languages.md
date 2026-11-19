@@ -14,7 +14,9 @@ is the limit.
   (`--voice-map`): Kyutai's predefined voices for the official seven, the community models' published voices
   otherwise, picked by how well the ASR understands them (`frankenstein2/lab/voice_audition.py`).
 - **Italian, English and French** also have tool-call suites and multi-session gates, and the other demo scenarios
-  (weather, travel, knowledge, restaurant).
+  (weather, travel, knowledge, restaurant; `frankenstein2/scenarios.py`). Known LLM limits there, with Qwen3.5-4B: in
+  French the restaurant agent sometimes books with a name the caller never said; a booking repeated with the same
+  details keeps one table, and a date in the past is refused by the tool.
 - The streaming ASR sometimes drops the first word or two of a short turn ("Perfekt, vielen Dank" heard as "vielen
   Dank"): sporadic, in any language, not caused by silence, turn resets or the stream's age (replays in
   `frankenstein2/lab/asr_onset_replay.py`, `asr_silence_probe.py`). The engine notices it (voice before the first

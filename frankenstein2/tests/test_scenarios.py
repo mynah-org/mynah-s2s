@@ -36,6 +36,10 @@ def test_restaurant_books_and_cancels():
     t = av["free_times"][0]
     r = json.loads(b.book({"name": "Rossi", "date": "tomorrow", "time": t, "people": 4}))
     assert r["booked"] and r["code"].startswith("MH-")
+    again = json.loads(b.book({"name": "Rossi", "date": "tomorrow", "time": t, "people": 4}))
+    assert again["code"] == r["code"] and again["already_booked"] and len(b.by_code) == 1   # one table, not two
+    assert "past" in json.loads(b.book({"name": "Rossi", "date": "2023-10-25", "time": t, "people": 4}))["error"]
+    assert "past" in json.loads(b.availability({"date": "2023-10-25", "people": 4}))["error"]
     assert json.loads(b.cancel({"code": r["code"].lower()}))["cancelled"]
     assert "error" in json.loads(b.cancel({"code": r["code"]}))
 

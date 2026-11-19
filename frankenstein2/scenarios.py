@@ -216,6 +216,8 @@ class Bookings:
         d = self._date(args.get("date"))
         if d is None:
             return _out({"error": "date as YYYY-MM-DD, or today / tomorrow"})
+        if d < datetime.now().date():
+            return _out({"error": f"{d.isoformat()} is in the past; use today, tomorrow or a later date"})
         people = int(args.get("people") or 2)
         if people > 8:
             return _out({"available": False, "reason": "tables for up to 8 people; larger groups call the manager"})
@@ -228,11 +230,18 @@ class Bookings:
         name, t = str(args.get("name", "")).strip(), str(args.get("time", "")).strip()
         if d is None or not name or not t:
             return _out({"error": "name, date and time are needed"})
+        if d < datetime.now().date():                   # a made-up date: let the model ask or say "tomorrow"
+            return _out({"error": f"{d.isoformat()} is in the past; use today, tomorrow or a date from "
+                                  f"{datetime.now().date().isoformat()} on"})
         if t == "20:00" and d.weekday() in (4, 5):
             return _out({"error": "20:00 is full that day", "free_times": ["19:00", "19:30", "20:30", "21:00"]})
-        code = f"MH-{random.randint(1000, 9999)}"
-        with self.lock:
-            self.by_code[code] = {"name": name, "date": d.isoformat(), "time": t, "people": int(args.get("people") or 2)}
+        row = {"name": name, "date": d.isoformat(), "time": t, "people": int(args.get("people") or 2)}
+        with self.lock:                                   # the same booking twice = one table, the first code
+            same = next((c for c, r in self.by_code.items() if r == row), None)
+            if same:
+                return _out({"booked": True, "code": same, "already_booked": True, **row})
+            code = f"MH-{random.randint(1000, 9999)}"
+            self.by_code[code] = row
         return _out({"booked": True, "code": code, **self.by_code[code]})
 
     def cancel(self, args: dict) -> str:
@@ -335,10 +344,13 @@ SCENARIOS = {
         {"en": "Books a table in several turns, confirms before booking, gives a booking code; can cancel.",
          "it": "Prenota un tavolo in più turni, chiede conferma prima di prenotare, dà un codice; può annullare.",
          "fr": "Réserve une table en plusieurs tours, confirme avant de réserver, donne un code ; peut annuler."},
-        ("You are the voice assistant of Trattoria Mynah, a restaurant. To book, you need the date, the time, the "
-         "number of people and a name: ask for what is missing, one thing at a time. Check availability first; "
-         "before booking, repeat the details and ask for confirmation; then book and give the booking code. To "
-         "cancel, ask for the code. Dates for the tools: YYYY-MM-DD, or today / tomorrow."),
+        ("You are the voice assistant of Trattoria Mynah, a restaurant open for dinner from 19:00 to 21:30: a time "
+         "said without morning or evening is in the evening (eight thirty = 20:30). To book, you need the date, the "
+         "time, the number of people and the caller's name: ask for what is missing, one thing at a time, and "
+         "never make up a name the caller did not say. Check availability "
+         "first. When you have all four, repeat them and ask for confirmation; book only after the caller says yes, "
+         "exactly once, then give the booking code. To cancel, ask for the code. Dates for the tools: YYYY-MM-DD, "
+         "or today / tomorrow; times as HH:MM."),
         [Tool("check_availability", "Free times for a table on a date for a number of people.",
               {"type": "object", "properties": {"date": S, "people": {"type": "integer"}},
                "required": ["date", "people"]}, _BOOK.availability),

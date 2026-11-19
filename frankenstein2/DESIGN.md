@@ -108,7 +108,7 @@ any language, and the same audio heard on its own comes out whole. At an endpoin
 delay, or voice and no text at all. Such a turn's audio is transcribed again offline by the ears (an asynchronous
 request; other sessions are not held) and the endpoint waits for it, at most 480 ms; the fuller text goes to the LLM.
 Traced as `asr.second_pass` (reason, both texts, which was used, wait). In the end-to-end test over 15 languages it
-fired on 15 of 45 turns, recovered the lost words in 7 and waited 80-160 ms.
+fired on 15 of 45 turns and recovered the lost words in 7, each time well within the wait limit.
 
 ## 3. LLM plugins (`llm/`)
 
