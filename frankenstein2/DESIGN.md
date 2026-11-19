@@ -134,7 +134,8 @@ The interface is `submit(rid, messages)`, `cancel(rid)`, `poll()` and `close()`.
 - **Asynchronous tool calls** (`qwen.py`, controller `LLM_WAIT`). The calls of a round run together on a thread
   pool, never on the scheduler thread, and `poll()` never waits for them.
   - While they run, the request is parked. The plugin reports `waiting` every second; the controller says an
-    on-hold reminder only after about a second of agent silence (at most two per turn, 4 s apart). The waits keep
+    on-hold reminder after about a second of agent silence or 2.5 s into the call (at most two per turn, 4 s
+    apart). The waits keep
     the reply timer alive.
   - At `--tool-timeout` (default 10 s) a running call is stopped and its late result is never used. When every
     call of the round timed out, a fixed apology in the session language ends the reply without another LLM round.

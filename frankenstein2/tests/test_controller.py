@@ -131,14 +131,15 @@ def test_order_of_arrival_does_not_matter():
     assert list(seen)[0][0] == ("CANCEL", "barge_in")
 
 
-def test_tool_wait_reminds_only_in_silence_at_most_twice_and_keeps_the_reply_alive():
+def test_tool_wait_reminds_in_silence_at_most_twice_and_keeps_the_reply_alive():
     c = Controller()
     endpoint(c, 1)
     acts = []
     for k in range(2, 260):
         if k >= 20 and k % 12 == 0:                        # a slow tool: "waiting" about every second
             silent = 0 if k < 40 else 30                   # the holding phrase is still playing until step 40
-            c.post(Intent("LLM_WAIT", "llm", k, payload={"s": k * 0.08, "silent_steps": silent}, request_id=1))
+            c.post(Intent("LLM_WAIT", "llm", k, payload={"s": (k - 20) * 0.05, "silent_steps": silent},
+                          request_id=1))
         acts += c.tick(k)
     rem = [a for a in acts if a.kind == "HOLDING_PHRASE"]
     assert [a.reason for a in rem] == ["tool_wait", "tool_wait"] and rem[1].data["reminder"] == 2
@@ -153,3 +154,15 @@ def test_tool_wait_after_a_barge_is_stale():
     c.tick(2)
     c.post(Intent("LLM_WAIT", "llm", 3, payload={"s": 4.0}, request_id=1))
     assert "HOLDING_PHRASE" not in kinds(c.tick(3))
+
+
+def test_tool_wait_reminds_after_a_while_even_if_the_talker_still_trickles():
+    c = Controller()
+    endpoint(c, 1)
+    acts = []
+    for k in range(2, 120):
+        if k >= 20 and k % 12 == 8:
+            c.post(Intent("LLM_WAIT", "llm", k, payload={"s": (k - 20) * 0.08, "silent_steps": 0}, request_id=1))
+        acts += c.tick(k)
+    rem = [a for a in acts if a.kind == "HOLDING_PHRASE"]
+    assert rem and rem[0].data["waited_s"] >= 2.5           # never "silent", reminded at 2.5 s into the call

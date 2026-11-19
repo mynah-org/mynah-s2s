@@ -22,7 +22,8 @@ Intents                          ->  actions
   BACKCHANNEL (ears, listen)         BACKCHANNEL (short audio, not in the 2nd ear, not in history)
   LLM_DECIDED (tool step chose a call)  HOLDING_PHRASE once per turn if nothing was spoken yet
   LLM_WAIT (a tool is still running)  keeps the reply timer alive; HOLDING_PHRASE(reminder) when the agent has
-                                     been silent ``reminder_silence`` steps, at most ``max_reminders`` per turn,
+                                     been silent ``reminder_silence`` steps or the call has run ``reminder_after_s``
+                                     (x2 for the 2nd), at most ``max_reminders`` per turn,
                                      ``reminder_gap`` steps apart (tools run asynchronously, the caller can barge in)
   LLM_TOOL                           TOOL_RECORD (history: the call and its result, kept even if later barged)
   LLM_TEXT                           SPEAK(text) (-> chunker -> normaliser -> talker)
@@ -90,6 +91,7 @@ class ControllerConfig:
     max_reminders: int = 2             # on-hold reminders per turn while a tool runs
     reminder_silence: int = 12         # steps (~1 s) of agent silence before a reminder
     reminder_gap: int = 50             # steps (4 s) between two reminders
+    reminder_after_s: float = 2.5      # ... or this long into the tool call (x2 for the second), silent or not
 
 
 class Controller:
@@ -241,8 +243,12 @@ class Controller:
         self.last_activity_k = k
         p = it.payload or {}
         silent = p.get("silent_steps", self.cfg.reminder_silence)      # unknown silence: assume silent
-        if self.cfg.holding_phrase and self.reminders < self.cfg.max_reminders and \
-                silent >= self.cfg.reminder_silence and \
+        # Silence as the playout sees it, or simply long enough into the call: under load the talker's trailing
+        # frames keep the holding phrase's segment "audible" in bursts long after its words, and a reminder that
+        # waits for clean silence then comes too late (callers spoke over it).
+        due = silent >= self.cfg.reminder_silence or (p.get("s") or 0) >= self.cfg.reminder_after_s * \
+            (self.reminders + 1)
+        if self.cfg.holding_phrase and self.reminders < self.cfg.max_reminders and due and \
                 (self.last_reminder_k is None or k - self.last_reminder_k >= self.cfg.reminder_gap):
             self.reminders += 1
             self.last_reminder_k = k

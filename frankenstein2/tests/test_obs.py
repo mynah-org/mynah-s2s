@@ -21,7 +21,7 @@ def test_summaries_are_short_and_skip_noise():
     line = summarize("tool.completed", {"name": "find_customer", "status": "timed_out", "ms": 10012.5,
                                         "result": json.dumps({"error": "timeout", "message": "x" * 300})})
     assert line.startswith("tool: find_customer -> timed_out in 10012.5 ms") and len(line) < 150
-    for ev in ("ears.frame", "ears.hop", "audio.release", "tts.first_audio"):
+    for ev in ("ears.frame", "ears.hop", "audio.release", "tts.first_audio", "audio.underrun"):
         assert summarize(ev, {}) is None
 
 

@@ -59,8 +59,10 @@ caller hears:
    results of an interrupted request are dropped. Arguments are normalised first (spoken numbers to digits; codes
    such as postcodes checked against what the caller said).
 3. **A reminder if it takes long.** When a call is still running and the agent has been silent for about a second,
-   it says a reminder ("Ci sono quasi, ancora un attimo." / "Almost there, just a moment more."). That is at most
-   twice per turn, 4 s apart, and only in silence.
+   or the call has run 2.5 s, it says a reminder ("Ci sono quasi, ancora un attimo." / "Almost there, just a moment
+   more."). That is at most twice per turn and 4 s apart. The 2.5 s rule exists because under load the talker's
+   last frames trickle out after the holding phrase, and waiting for clean silence made the reminder late enough
+   for callers to talk over it.
 4. **A timeout.** A call still running after `--tool-timeout` seconds (default 10; 30 for slow back ends) is
    stopped. If every call of the round timed out, the caller hears a fixed apology in the session language ("Mi
    dispiace, non sono riuscito a recuperare l'informazione in tempo...") without another LLM round. A late result

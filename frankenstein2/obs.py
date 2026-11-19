@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 
 NOISY = frozenset({"ears.frame", "ears.hop", "audio.release", "asr.piece", "ctl.intent"})
+# audio.underrun (the talker fell behind real time) is stored but gets no log line: under load it repeats every few
+# hundred ms; count it with SQL instead.
 CTL_SHOWN = frozenset({"CANCEL", "CLOSE_TURN", "HOLDING_PHRASE", "BACKCHANNEL"})
 log = logging.getLogger("frankenstein2.trace")
 
@@ -92,8 +94,6 @@ def summarize(ev: str, d: dict, max_chars: int = 90) -> str | None:
         return f"{ev.split('.')[0]}: ERROR {_cut(d.get('error', ''), max_chars)}"
     if ev == "audio.flush":
         return f"audio: flushed ({d.get('reason', '')})"
-    if ev == "audio.underrun":
-        return "audio: underrun"
     if ev == "ctl.action" and d.get("kind") in CTL_SHOWN:
         return f"ctl: {d.get('kind')} ({d.get('reason', '')})"
     if ev == "history.agent" and d.get("cut"):
@@ -223,6 +223,10 @@ class TraceStore:
             self._begin(sid, "first_audio", d.get("turn_id"), wall, turn_id=d.get("turn_id"))
         elif ev == "tts.first_audio":
             self._end(db, sid, "first_audio", self.fmt.turn.get(str(sid)), wall, name="first_audio")
+        elif ev == "ctl.action" and d.get("kind") == "CANCEL" and d.get("cancelled_request") is not None:
+            self._end(db, sid, "llm", d.get("cancelled_request"), wall, status=f"cancelled:{d.get('reason')}")
+            self._end(db, sid, "turn", d.get("turn_id"), wall, name="turn", status=f"cancelled:{d.get('reason')}")
+            self._end(db, sid, "first_audio", d.get("turn_id"), wall, status="no_audio")
         elif ev == "ctl.action" and d.get("kind") in ("CLOSE_TURN", "CANCEL"):
             self._end(db, sid, "turn", d.get("turn_id"), wall, name="turn",
                       status="ok" if d.get("kind") == "CLOSE_TURN" else f"cancelled:{d.get('reason')}")
