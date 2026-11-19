@@ -10,7 +10,7 @@ GROUP ?=
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-all setup-tts setup-asr doctor ws-check corpus test-cpu test-gpu demo e2e-fc e2e-corpus multi multi-notools \
         multi-mixed custom serve int4-pack w8-pack client webui webui-gpu asr score reproduce \
-        f2-setup f2-plan f2-serve f2-webui f2-traces f2-lang-suite test-f2 test-f2-torch test-f2-gpu
+        f2-setup f2-plan f2-serve f2-webui f2-traces f2-lang-suite test-f2 test-f2-torch test-f2-gpu test-f2-e2e
 
 help: ## show this list
 	@echo "mynah-s2s (work in progress)"
@@ -72,6 +72,8 @@ f2-lang-suite: ## Frankenstein v2 language suite (opt-in, GPU): talker, LLM and 
 		--langs "$(F2_LANGS)" --out "$(F2_TRACE_DIR)/lang-suite-$$(date +%Y%m%d-%H%M%S)" $(F2_ARGS)
 test-f2-gpu: ## Frankenstein v2 unit tests + GPU smoke tests on the real models (after f2-setup)
 	set -a; . "$(F2_ENV)"; set +a; $(F2_PYTHON) -m pytest -q frankenstein2/tests --gpu
+test-f2-e2e: ## Frankenstein v2 end-to-end per language from the recorded demo samples (GPU, real models, minutes; F2_E2E_LANGS=it,de to pick)
+	set -a; . "$(F2_ENV)"; set +a; F2_E2E=1 $(F2_PYTHON) -m pytest -q -s frankenstein2/tests/gpu/test_e2e_samples.py --gpu
 
 demo: ## one session, one item (ITEM=t02 order lookup; try q03, t13, s05): agent text, tool calls, ASR, combined.wav
 	$(M) demo $(ITEM)
