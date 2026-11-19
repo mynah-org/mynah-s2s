@@ -41,6 +41,9 @@ def add_args(ap) -> None:
     ap.add_argument("--qwen-mode", default="", help="own engine weights: int8 | bf16 (quantised checkpoints such as "
                     "NVFP4 / AWQ are detected); default from --llm-preset")
     ap.add_argument("--qwen-slots", type=int, default=8)
+    ap.add_argument("--ears-thread", default="off", choices=("on", "off"),
+                    help="ears on their own thread and CUDA stream (talker stress: fewer audio gaps, but ears, LLM "
+                         "and talker all slower from GIL and GPU contention; off: on the scheduler, before the talker)")
     ap.add_argument("--nano-precision", default="int4-decode", choices=["bf16", "int4-decode"])
     ap.add_argument("--nano-graph", action="store_true", help="decode CUDA graph for the spoken reply (v1 G8)")
     ap.add_argument("--ears-python", default=sys.executable, help="procs runtime: the ears process's Python")
@@ -319,4 +322,6 @@ def voices(a) -> dict:
     vs = dict(x.split("=", 1) for x in a.voice)
     if not vs and os.environ.get("F2_VOICE"):
         vs["default"] = os.environ["F2_VOICE"]
+        if os.environ.get("F2_CALLER_VOICE"):             # setup's second voice: the demo dialogue's caller
+            vs["caller"] = os.environ["F2_CALLER_VOICE"]
     return vs

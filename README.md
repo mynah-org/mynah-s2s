@@ -30,13 +30,15 @@ as one GPU process that several sessions share, each in its own language. A larg
 - **Tools:** calls run asynchronously and the agent keeps the caller informed: a holding phrase, a reminder when a
   call is slow, and an apology when a call times out (10 s by default).
 - **Tracing:** short per-event log lines, a per-server SQLite store of events and spans with durations, and a
-  Debug log switch in the web UI.
+  Traces tab in the web UI.
+- **Web UI:** tap to talk in any served language, or play a demo dialogue: a simulated caller, spoken by the engine,
+  talks to the agent while you listen.
 
 ```bash
 pip install -r frankenstein2/requirements.txt     # torch with CUDA first
 export HF_TOKEN=...                               # kyutai/pocket-tts is gated: accept its terms first
 make f2-setup                                     # downloads it/en/fr (F2_LANGS=it,en,fr,de for more)
-make f2-webui                                     # server + web UI on http://127.0.0.1:8787
+make f2-webui                                     # server + web UI on http://127.0.0.1:8787 (talk / demo)
 make test-f2                                      # unit tests, no GPU or weights (test-f2-gpu: on the real models)
 ```
 

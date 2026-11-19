@@ -21,8 +21,9 @@ What it fetches:
           --talker full:
             kyutai/pocket-tts               languages/<lang>/model.safetensors per language (gated, as above)
             kyutai/pocket-tts-without-voice-cloning   languages/<lang>/tokenizer.* (not gated)
-  voice   kyutai/tts-voices                 one reference WAV for cloning (default alba-mackenna/casual.wav,
-                                            CC-BY-4.0; other folders there have other licences)
+  voice   kyutai/tts-voices                 reference WAVs for cloning: the agent (default alba-mackenna/casual.wav)
+                                            and the web UI's demo caller (voice-donations/Selfie.wav): CC-BY-4.0
+                                            and CC0; other folders there have other licences (some non-commercial)
 
 Languages with an official Pocket TTS model: it, en, fr, de, es, pt, nl (the 24-layer variants are used). it/en/fr
 are the ones wired and tested end to end; the others download and load, but the engine's per-language pieces
@@ -75,7 +76,7 @@ def pick_families(files: list, langs: list, families=("24l", "6l"), precision: s
 
 
 def plan(langs: list, llm: str, voice: str, talker: str = "packages", packages_repo: str = PACKAGES_REPO,
-         precision: str = "int4", families: dict | None = None) -> list:
+         precision: str = "int4", families: dict | None = None, caller_voice: str = "") -> list:
     """[(repo, allow_patterns or None = whole repo, role)]. ``families``: code -> family (pick_families); without
     it every family of each language is fetched."""
     repo, _ = llm_repo(llm)
@@ -94,7 +95,8 @@ def plan(langs: list, llm: str, voice: str, talker: str = "packages", packages_r
     else:
         steps += [(POCKET_CLONE, [f"languages/{POCKET[x]}/model.safetensors" for x in langs], "talker weights (gated)"),
                   (POCKET_TOK, [f"languages/{POCKET[x]}/tokenizer*" for x in langs], "talker tokenizers")]
-    return steps + [(VOICES, [voice], "reference voice")]
+    return steps + [(VOICES, [voice] + ([caller_voice] if caller_voice and caller_voice != voice else []),
+                     "reference voices (agent, demo caller)")]
 
 
 def check_langs(raw: str, talker: str = "packages") -> list:
@@ -132,6 +134,8 @@ def main(argv=None) -> int:
     ap.add_argument("--precision", default="int4", choices=["int4", "int8", "bf16"],
                     help="which delta of each language to fetch (int4 is the engine's default)")
     ap.add_argument("--voice", default="alba-mackenna/casual.wav", help=f"reference WAV inside {VOICES}")
+    ap.add_argument("--caller-voice", default="voice-donations/Selfie.wav",
+                    help=f"second reference WAV inside {VOICES}: the web UI's demo-dialogue caller ('' = none)")
     ap.add_argument("--env-file", default="", help="where to write the F2_* paths (default <hf-home>/f2.env)")
     ap.add_argument("--dry-run", action="store_true", help="only list what would be downloaded and its size")
     a = ap.parse_args(argv)
@@ -154,7 +158,7 @@ def main(argv=None) -> int:
                 print(f"NOTE: {a.packages_repo} has no {a.precision} package for {missing}")
         except Exception as e:  # noqa: BLE001 - listing failed: fetch every family
             print(f"NOTE: could not list {a.packages_repo} ({type(e).__name__}); fetching every family")
-    steps = plan(langs, a.llm, a.voice, a.talker, a.packages_repo, a.precision, fams)
+    steps = plan(langs, a.llm, a.voice, a.talker, a.packages_repo, a.precision, fams, a.caller_voice)
     llm, backend = llm_repo(a.llm)
     if a.dry_run:
         api = HfApi()
@@ -181,6 +185,8 @@ def main(argv=None) -> int:
            ("F2_NANO_DIR" if backend == "nano" else "F2_QWEN_MODEL"): paths[llm],
            "F2_POCKET_WEIGHTS": paths[POCKET_CLONE], "F2_VOICE": str(Path(paths[VOICES]) / a.voice),
            "F2_LANGS": ",".join(langs), "HF_HOME": a.hf_home}
+    if a.caller_voice:
+        env["F2_CALLER_VOICE"] = str(Path(paths[VOICES]) / a.caller_voice)
     if a.talker == "packages":
         env["F2_POCKET_PACKAGES"] = str(Path(paths[a.packages_repo]))
         env["F2_POCKET_PRECISION"] = a.precision

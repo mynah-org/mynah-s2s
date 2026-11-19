@@ -68,6 +68,84 @@ SCENARIOS = {
 }
 
 
+# Frankenstein v2 demo dialogue: what the simulated caller says, per language (the engine speaks it with a caller
+# voice; the page plays it and streams it in as the session's input). The store is the fictional "Mynah Home".
+# One sentence per line where possible: a full stop makes the talker pause, and the turn-taking model may end the
+# caller's turn there (seen in French: "Parfait." heard alone).
+DEMO_SCRIPT = {
+    "it": ["Buongiorno, avete un divano a tre posti? Quanto costa?", "Perfetto, e la consegna a domicilio è possibile?",
+           "Va benissimo, grazie mille. Arrivederci!"],
+    "en": ["Hello, do you have a three-seat sofa? How much is it?", "Great, and can you deliver it to my home?",
+           "Perfect, thank you very much. Goodbye!"],
+    "fr": ["Bonjour, avez-vous un canapé trois places ? Combien coûte-t-il ?",
+           "Parfait, et la livraison à domicile est possible ?", "Très bien, merci beaucoup. Au revoir !"],
+    "de": ["Guten Tag, haben Sie ein dreisitziges Sofa? Was kostet es?", "Super, und liefern Sie auch nach Hause?",
+           "Perfekt, vielen Dank. Auf Wiedersehen!"],
+    "es": ["Hola, ¿tienen un sofá de tres plazas? ¿Cuánto cuesta?", "Genial, ¿y lo pueden entregar a domicilio?",
+           "Perfecto, muchas gracias. ¡Adiós!"],
+    "pt": ["Olá, têm um sofá de três lugares? Quanto custa?", "Ótimo, e fazem entrega ao domicílio?",
+           "Perfeito, muito obrigado. Adeus!"],
+    "nl": ["Hallo, hebben jullie een driezitsbank? Wat kost die?", "Mooi, kunnen jullie hem ook thuis bezorgen?",
+           "Perfect, hartelijk dank. Tot ziens!"],
+    "ko": ["안녕하세요, 3인용 소파 있나요? 가격이 얼마예요?", "감사합니다. 안녕히 계세요!"],
+    "tr": ["Merhaba, üç kişilik kanepeniz var mı? Fiyatı ne kadar?", "Çok teşekkürler. Hoşça kalın!"],
+    "ja": ["こんにちは、三人掛けのソファはありますか？おいくらですか？", "ありがとうございました。失礼します。"],
+    "cs": ["Dobrý den, máte trojmístnou pohovku? Kolik stojí?", "Děkuji mockrát. Na shledanou!"],
+    "hi": ["नमस्ते, क्या आपके पास तीन सीटों वाला सोफ़ा है? इसकी कीमत क्या है?", "बहुत धन्यवाद। नमस्ते!"],
+    "pl": ["Dzień dobry, czy macie trzyosobową sofę? Ile kosztuje?", "Dziękuję bardzo. Do widzenia!"],
+    "ru": ["Здравствуйте, у вас есть трёхместный диван? Сколько он стоит?", "Большое спасибо. До свидания!"],
+    "et": ["Tere, kas teil on kolmekohaline diivan? Kui palju see maksab?", "Suur aitäh. Head aega!"],
+}
+
+
+def trace_db(path: str | None):
+    """Read-only connection to the engine's SQLite trace store (frankenstein2/obs.py), or None."""
+    import sqlite3
+    if not path or not Path(path).is_file():
+        return None
+    db = sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro", uri=True, timeout=2.0)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def trace_sessions(path: str | None, limit: int = 50) -> list:
+    """Past sessions, newest first, with their turn / tool / error counts."""
+    db = trace_db(path)
+    if db is None:
+        return []
+    try:
+        rows = db.execute(
+            "SELECT s.session_id, s.started_wall, s.ended_wall, s.language, s.voice, "
+            "(SELECT COUNT(*) FROM spans p WHERE p.session_id=s.session_id AND p.kind='turn') AS turns, "
+            "(SELECT COUNT(*) FROM spans p WHERE p.session_id=s.session_id AND p.kind='tool') AS tools, "
+            "(SELECT COUNT(*) FROM events e WHERE e.session_id=s.session_id AND e.ev LIKE '%error%') AS errors, "
+            "(SELECT AVG(dur_ms) FROM spans p WHERE p.session_id=s.session_id AND p.kind='first_audio') AS first_ms "
+            "FROM sessions s ORDER BY s.started_wall DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        db.close()
+
+
+def trace_session(path: str | None, session_id: str, max_data: int = 1500) -> dict | None:
+    """One session: its row, its events (time, name, short line, ids, data cut to ``max_data``) and its spans."""
+    db = trace_db(path)
+    if db is None:
+        return None
+    try:
+        s = db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        if s is None:
+            return None
+        events = [dict(r, data=(r["data"] or "")[:max_data]) for r in db.execute(
+            "SELECT wall, ev, turn_id, request_id, call_id, line, data FROM events WHERE session_id=? ORDER BY t_ns, id",
+            (session_id,))]
+        spans = [dict(r) for r in db.execute(
+            "SELECT kind, name, turn_id, request_id, call_id, start_wall, end_wall, dur_ms, status, attrs FROM spans "
+            "WHERE session_id=? ORDER BY start_wall", (session_id,))]
+        return {"session": dict(s), "events": events, "spans": spans}
+    finally:
+        db.close()
+
+
 def json_line(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -98,6 +176,9 @@ class StaticHandler(SimpleHTTPRequestHandler):
                 "gpu_configured": configured,
                 "v2_reachable": reachable,
                 "languages": ready.get("languages") or [],
+                "voices": ready.get("voices") or [],
+                "demo_dialogue": bool(ready.get("demo_dialogue")),
+                "traces": bool(getattr(self.server, "trace_db", None)),
                 "profile": self.server.profile,
                 "engine": self.server.engine,
                 "profile_label": profile_label(self.server.profile),
@@ -123,7 +204,29 @@ class StaticHandler(SimpleHTTPRequestHandler):
                     return
             self.send_error(404, "sample unavailable")
             return
+        if path == "/api/demo-script":
+            lang = dict(parse_qsl(urlparse(self.path).query)).get("lang", "en")
+            self._json({"lang": lang, "lines": DEMO_SCRIPT.get(lang) or DEMO_SCRIPT["en"],
+                        "fallback": lang not in DEMO_SCRIPT})
+            return
+        if path == "/api/traces/sessions":
+            self._json({"sessions": trace_sessions(getattr(self.server, "trace_db", None))})
+            return
+        if path.startswith("/api/traces/session/"):
+            sid = path.rsplit("/", 1)[1]
+            if not sid.replace("-", "").replace("_", "").isalnum():
+                self.send_error(400, "bad session id")
+                return
+            found = trace_session(getattr(self.server, "trace_db", None), sid)
+            if found is None:
+                self.send_error(404, "no such session")
+                return
+            self._json(found)
+            return
         if path == "/" or path == "":
+            # Frankenstein v2: its own page (talk + demo dialogue, traces); the original lab page stays at /lab
+            self.path = "/f2/index.html" if getattr(self.server, "engine", "") == "frankenstein2" else "/index.html"
+        elif path == "/lab":
             self.path = "/index.html"
         super().do_GET()
 
@@ -461,6 +564,8 @@ def main():
     parser.add_argument("--v2-ws", default=None, help="GPU server URL, e.g. ws://127.0.0.1:8765/v1/session")
     parser.add_argument("--profile", choices=["int4", "q8", "bf16", "demo"], default=None,
                         help="runtime profile label shown in the UI; it must match the V2 server flags")
+    parser.add_argument("--trace-db", default=os.environ.get("F2_TRACE_DB", ""),
+                        help="Frankenstein v2 SQLite trace store, for the Traces tab (the engine's TRACE_DIR/f2_traces.sqlite)")
     parser.add_argument("--audio-root", default=os.environ.get("MYNAH_AUDIO_ROOT", str(Path.home() / "mynah-s2s" / "data" / "agent")),
                         help="directory containing corpus_v1/ WAVs for guided real-audio input")
     args = parser.parse_args()
@@ -472,6 +577,7 @@ def main():
                             v2_ws=args.v2_ws, profile=args.profile, audio_root=audio_root)
     httpd.engine = args.engine                   # reported by /api/config: the page shows LANGUAGE/VOICE only for frankenstein
     httpd.ws_port = args.ws_port                 # reported by /api/config: the page connects to it (any UI port)
+    httpd.trace_db = args.trace_db or None       # Frankenstein v2 Traces tab (read-only)
     http_thread = threading.Thread(target=httpd.serve_forever, name="webui-http", daemon=True)
     http_thread.start()
     browser_host = args.advertise_host or ("127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host)

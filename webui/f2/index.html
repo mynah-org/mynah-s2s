@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0e1116">
+  <title>Frankenstein v2 · voice agent</title>
+  <link rel="stylesheet" href="/f2/f2.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div><b>Frankenstein v2</b><small>full-duplex voice agent · open models</small></div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="talk" role="tab" aria-selected="true">Talk</button>
+      <button class="tab" data-tab="traces" role="tab" aria-selected="false">Traces</button>
+    </nav>
+    <div class="engine" id="engine"><span class="dot"></span><span id="engineLabel">checking engine…</span></div>
+  </header>
+
+  <main>
+    <!-- TALK -->
+    <section class="view" id="view-talk">
+      <div class="stage">
+        <div class="pickers">
+          <label>Language <select id="lang"></select></label>
+          <label>Voice <select id="voice"></select></label>
+          <details class="persona">
+            <summary>Assistant: <b>Mynah Home</b> · furniture store</summary>
+            <p class="hint">The assistant can search the catalogue, look up customers and orders. Edit its instructions
+              for this session (optional):</p>
+            <textarea id="prompt" rows="6" placeholder="Default instructions of the engine"></textarea>
+          </details>
+        </div>
+
+        <div class="orb-wrap">
+          <button class="orb" id="orb" aria-label="Start talking">
+            <span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span>
+            <span class="orb-core"><span class="orb-icon" id="orbIcon">●</span></span>
+          </button>
+          <div class="orb-state" id="orbState">Tap to talk</div>
+          <div class="orb-sub" id="orbSub">Speak naturally; you can interrupt the agent at any time.</div>
+          <button class="ghost" id="demoBtn">▶ Play a demo dialogue</button>
+          <div class="orb-sub small" id="demoNote">A simulated caller talks to the engine; you listen to both.</div>
+        </div>
+
+        <div class="metrics">
+          <div><small>first audio</small><b id="mFirst">—</b></div>
+          <div><small>turns</small><b id="mTurns">0</b></div>
+          <div><small>tool calls</small><b id="mTools">0</b></div>
+          <div><small>session</small><b id="mTime">—</b></div>
+        </div>
+      </div>
+
+      <div class="panes">
+        <div class="pane chat">
+          <div class="pane-head">Conversation</div>
+          <div class="chat-list" id="chat">
+            <div class="empty">Your conversation appears here.</div>
+          </div>
+        </div>
+        <div class="pane activity">
+          <div class="pane-head">What's happening</div>
+          <ol class="act-list" id="act"><li class="empty">Turns, tool calls and the agent's state appear here.</li></ol>
+          <label class="logswitch"><input type="checkbox" id="logToggle"> engine log</label>
+          <pre class="log" id="log" hidden></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- TRACES -->
+    <section class="view" id="view-traces" hidden>
+      <div class="traces">
+        <div class="pane">
+          <div class="pane-head">Sessions <button class="ghost tiny" id="refresh">refresh</button></div>
+          <div class="sess-list" id="sessions"><div class="empty">Loading…</div></div>
+        </div>
+        <div class="pane detail" id="detail">
+          <div class="empty">Choose a session to see its timeline: turns, LLM requests, tool calls and the time to the
+            first audio of each reply.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/f2/f2.js"></script>
+</body>
+</html>

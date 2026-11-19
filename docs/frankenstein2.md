@@ -26,7 +26,7 @@ the repository unchanged. Frankenstein v2 lives in `frankenstein2/`. Its design 
 - **Tools are first-class.** Calls are parsed from the LLM's own format and run asynchronously. Arguments are checked
   against what the caller said. Every call is traced (see below).
 - **Inspectable.** Every decision is an event with a session, turn and call id. The events go to a short log, a
-  SQLite store and the web UI's debug view.
+  SQLite store and the web UI's Traces tab.
 
 ## Choosing the brain
 
@@ -86,7 +86,7 @@ export HF_TOKEN=...            # a Hugging Face read token
 make f2-setup                  # = python frankenstein2/scripts/setup_models.py --langs it,en,fr
 #    other languages: make f2-setup F2_LANGS=it,en,fr,de   (dry run: add --dry-run to the script)
 # 3. run
-make f2-webui                  # server + web UI on http://127.0.0.1:8787 (pick GPU backend, a language, Connect)
+make f2-webui                  # server + web UI on http://127.0.0.1:8787: pick a language, tap to talk
 make f2-serve                  # or only the WebSocket server on :8772
 ```
 
@@ -159,10 +159,28 @@ requests, tool calls, talker segments and audio. Three listeners are on by defau
   sqlite3 .f2-traces/f2_traces.sqlite "select name, dur_ms, status from spans where kind='tool'"
   ```
 
-- **The web UI.** The Activity stream shows the events. The **Debug log** switch under it shows the short lines
-  live; it is off by default and the browser remembers it.
+- **The web UI.** "What's happening" shows the system events of the live session: turns, tool calls with their
+  arguments and results, holding phrases, barge-ins, the time to the first audio. The **engine log** switch under it
+  shows the short lines live (off by default). The **Traces** tab lists past sessions from the SQLite store; a
+  session opens as a timeline of turns, LLM requests, tool calls and first audio, with its events.
 
 The per-session JSONL trace (`TRACE_DIR/<session>.f2.jsonl`, every event) is still written, for offline analysis.
+
+## The web UI
+
+`make f2-webui` starts the engine and the page (http://127.0.0.1:8787). The page is the engine's demo:
+
+- **Talk.** Pick a language (and a voice when the server has several), tap the button and speak. The agent answers
+  with audio; you can interrupt it. The conversation shows what the ASR heard, what the agent said (holding phrases
+  in italics) and each tool call with its result. The assistant's instructions can be edited for the session.
+- **Play a demo dialogue.** A simulated caller talks to the engine: the engine speaks the caller's lines with another
+  voice (`demo.say` on the session socket), the page plays them and streams them in as the session's input, exactly
+  as a microphone would, and waits for each answer before the next line. You listen to both sides; it is an
+  end-to-end run (ASR, turn-taking, LLM, tools, talker) without speaking. Lines exist for the 15 languages
+  (`DEMO_SCRIPT` in `webui/server.py`). A second voice for the caller: add one with `--voice NAME=wav`.
+- **Traces.** Past sessions from the trace store, newest first; each opens as a timeline.
+
+The original lab page (with the browser-only simulation used for the VoiceChat engine) is still at `/lab`.
 
 ## Tests
 

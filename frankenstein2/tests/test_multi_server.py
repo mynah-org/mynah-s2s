@@ -102,3 +102,52 @@ def test_health_probe_lists_the_served_languages():
         return msg
     msg = asyncio.run(main())
     assert msg["type"] == "server.ready" and msg["languages"] == langs
+
+
+def test_demo_dialogue_caller_lines_come_back_as_audio():
+    """demo.say: the server speaks the caller's line with the caller talker and returns it (demo.audio ... demo.done);
+    the probe says the demo dialogue is available and lists the voices."""
+    import base64
+    make, made = build()
+    callers = []
+
+    def make_caller(sid, lang, voice):
+        t = FakeTalker(lang=lang)
+        callers.append((sid, lang, voice, t))
+        return t
+    srv = MultiServer(make, max_sessions=2, voices=lambda: ["agent", "caller"], make_caller=make_caller)
+
+    async def main():
+        import websockets as W
+        async with W.serve(srv.handler, "127.0.0.1", 0) as s:
+            port = s.sockets[0].getsockname()[1]
+            async with W.connect(f"ws://127.0.0.1:{port}/v1/session?probe=1") as ws:
+                probe = json.loads(await ws.recv())
+            got = []
+            async with W.connect(f"ws://127.0.0.1:{port}/v1/session") as ws:
+                await ws.send(json.dumps({"type": "session.start", "language": "it", "voice": "agent"}))
+                await ws.send(json.dumps({"type": "demo.say", "id": 7, "text": "Buongiorno, avete un divano?"}))
+                while True:
+                    await ws.send(np.zeros(1280, "<i2").tobytes())
+                    try:
+                        m = await asyncio.wait_for(ws.recv(), 0.05)
+                    except asyncio.TimeoutError:
+                        continue
+                    if isinstance(m, str):
+                        d = json.loads(m)
+                        if d.get("type", "").startswith("demo."):
+                            got.append(d)
+                            if d["type"] == "demo.done":
+                                break
+                await ws.send(json.dumps({"type": "session.end"}))
+                async for m in ws:                      # drain until the server closes the session
+                    if isinstance(m, str) and json.loads(m).get("type") == "session.closed":
+                        break
+            return probe, got
+    probe, got = asyncio.run(main())
+    assert probe["demo_dialogue"] is True and probe["voices"] == ["agent", "caller"]
+    assert callers and callers[0][1:3] == ("it", "caller")          # another voice than the agent's
+    audio = [d for d in got if d["type"] == "demo.audio"]
+    assert audio and all(d["id"] == 7 and d["sr"] == 24000 for d in audio)
+    assert sum(len(base64.b64decode(d["pcm"])) for d in audio) > 0
+    assert got[-1] == {"type": "demo.done", "id": 7, "audio_s": got[-1]["audio_s"], "complete": True}

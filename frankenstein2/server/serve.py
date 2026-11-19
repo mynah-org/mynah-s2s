@@ -98,7 +98,9 @@ def main():  # pragma: no cover - GPU
         from frankenstein2.server.multi import MultiServer
         srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
                           max_sessions=a.max_sessions, idle_timeout_s=a.idle_timeout,
-                          profile=f"frankenstein2-{a.llm_backend}", languages=lambda: language_list(res))
+                          profile=f"frankenstein2-{a.llm_backend}", languages=lambda: language_list(res),
+                          voices=lambda: sorted(res.voices),
+                          make_caller=lambda sid, lang, voice: res.make_talker(sid, lang, res.voices.get(voice, voice)))
         try:
             asyncio.run(srv.serve(a.host, a.port, ready=lambda: print(
                 f"READY port={a.port} " + json.dumps(loads, default=str), flush=True)))

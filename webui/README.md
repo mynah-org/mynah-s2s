@@ -40,6 +40,7 @@ One start serves one engine; loading takes minutes, so the choice is made with
 | Engine | Start | Languages | Browser |
 |---|---|---|---|
 | Official VoiceChat (default) | `make webui-gpu` | English only | no language or voice selector |
+| Frankenstein v2 (recommended, `frankenstein2/`) | `make f2-webui` | the served languages (15 with the standard setup) | its own page: tap to talk, demo dialogue, Traces tab (see `docs/frankenstein2.md`, "The web UI"); the lab page stays at `/lab` |
 | Frankenstein (experimental, `frankenstein/`) | `make webui-gpu ENGINE=frankenstein FRANK_SERVE_ARGS="…"` | the text-to-speech languages (Italian, English, French, German, Spanish, Portuguese, Russian, Chinese, Japanese, Korean) | LANGUAGE and VOICE selectors |
 
 The bridge reports the engine in `/api/config`, and the page shows the LANGUAGE

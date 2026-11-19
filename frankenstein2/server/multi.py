@@ -3,11 +3,15 @@ own language, on one set of shared resources (ears process, LLM model, talker pr
 
 Wire (as mynah_v2.transport.ws_server, optional fields added):
   client -> server   {"type": "session.start", "language": "it"|"en"|"fr", "voice"?, "system_prompt"?,
-                      "input_rate"?: 16000}  then binary PCM16 mono; {"type": "session.end"} | {"type": "session.cancel"}
+                      "input_rate"?: 16000, "caller_voice"?}  then binary PCM16 mono; {"type": "session.end"} |
+                     {"type": "session.cancel"} | {"type": "demo.say", "id", "text"} (demo dialogue: the engine
+                     speaks ``text`` with a caller voice and returns it, see below; the client plays it and streams it
+                     back as the session's input, like a microphone)
                      URL ?probe=1: {"type": "server.ready", "sessions", "max_sessions"} and close (health probe)
   server -> client   {"type": "session.created", "session_id", "language", "voice", "input_rate", "output_rate": 22050,
                       "backend_profile"} | binary PCM16 22.05 kHz | {"type": "event", "ev", ...} (ears.frame and
                       audio.release only with ?verbose=1) | {"type": "session.closed", ...} | {"type": "error", ...}
+                     | {"type": "demo.audio", "id", "sr": 24000, "pcm": base64 PCM16} ... {"type": "demo.done", "id"}
 One thread per session steps its Pipeline as its 80 ms input chunks arrive (the client streams in real time). Shared
 process links are thread-safe; the LLM serialises requests across sessions; nothing session-specific is global.
 """
@@ -70,13 +74,67 @@ class SessionRunner(threading.Thread):
             self.p.close()
 
 
+class CallerVoice(threading.Thread):
+    """Demo dialogue: speaks the caller's lines with the engine's own talker (another voice than the agent's) and
+    sends them to the client as ``demo.audio`` events. One line at a time, in order."""
+
+    def __init__(self, talker, send, timeout_s: float = 30.0):
+        super().__init__(daemon=True, name="f2-caller")
+        self.t, self.send, self.timeout_s = talker, send, timeout_s
+        self.q: queue.Queue = queue.Queue()
+
+    def say(self, line_id, text):
+        self.q.put((line_id, text))
+
+    def stop(self):
+        self.q.put(None)
+
+    def run(self):
+        import base64
+        n = 0
+        try:
+            while True:
+                item = self.q.get()
+                if item is None:
+                    return
+                line_id, text = item
+                n += 1
+                key = f"demo{n}"
+                self.t.say(key, text, n)
+                t_end, done, samples = time.monotonic() + self.timeout_s, False, 0
+                while not done and time.monotonic() < t_end:
+                    evs = self.t.poll()
+                    for e in evs:
+                        if e.get("sid") not in (None, key):
+                            continue
+                        if e.get("ev") == "audio":
+                            pcm = np.clip(np.asarray(e["pcm"], np.float32), -1, 1)
+                            samples += len(pcm)
+                            self.send(json.dumps({"type": "demo.audio", "id": line_id, "sr": self.t.sr,
+                                                  "pcm": base64.b64encode((pcm * 32767).astype("<i2").tobytes())
+                                                  .decode()}))
+                        elif e.get("ev") in ("done", "error"):
+                            done = True
+                    if not evs:
+                        time.sleep(0.02)
+                self.send(json.dumps({"type": "demo.done", "id": line_id, "audio_s": round(samples / self.t.sr, 2),
+                                      "complete": done}))
+        finally:
+            try:
+                self.t.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class MultiServer:
     def __init__(self, make_pipeline, max_sessions: int = 4, idle_timeout_s: float = 60.0, profile: str = "f2",
-                 languages=None):
+                 languages=None, voices=None, make_caller=None):
         """languages: callable -> [{"code", "name", "tested"}], the languages a session may ask for (sent with the
-        health probe's server.ready, so the web UI lists them)."""
+        health probe's server.ready, so the web UI lists them). voices: callable -> voice names (also in
+        server.ready). make_caller(sid, lang, voice) -> a talker client for the demo dialogue's caller (None: no
+        demo dialogue)."""
         self.make_pipeline, self.max_sessions, self.idle = make_pipeline, max_sessions, idle_timeout_s
-        self.languages = languages
+        self.languages, self.voices, self.make_caller = languages, voices, make_caller
         self.profile = profile
         self.active: dict = {}
         self.lock = threading.Lock()
@@ -86,11 +144,13 @@ class MultiServer:
         qs = parse_qs(urlparse(path).query)
         if qs.get("probe", ["0"])[0] == "1":
             msg = {"type": "server.ready", "sessions": len(self.active), "max_sessions": self.max_sessions}
-            if self.languages is not None:
-                try:
-                    msg["languages"] = list(self.languages())
-                except Exception:  # noqa: BLE001 - the probe must answer anyway
-                    pass
+            for k, f in (("languages", self.languages), ("voices", self.voices)):
+                if f is not None:
+                    try:
+                        msg[k] = list(f())
+                    except Exception:  # noqa: BLE001 - the probe must answer anyway
+                        pass
+            msg["demo_dialogue"] = self.make_caller is not None
             await ws.send(json.dumps(msg, ensure_ascii=False))
             await ws.close(code=1000, reason="health probe")
             return
@@ -122,7 +182,7 @@ class MultiServer:
                 except Exception:  # noqa: BLE001 - client gone: drop
                     pass
         send_task = asyncio.create_task(sender())
-        runner, kind = None, "cancel"
+        runner, kind, caller = None, "cancel", None
         try:
             first = await asyncio.wait_for(ws.recv(), self.idle)
             start = json.loads(first) if isinstance(first, str) else {}
@@ -159,13 +219,26 @@ class MultiServer:
                 if isinstance(msg, bytes):
                     runner.push(msg)
                 else:
-                    t = json.loads(msg).get("type")
+                    d = json.loads(msg)
+                    t = d.get("type")
                     if t in ("session.end", "session.cancel"):
                         kind = "normal" if t == "session.end" else "cancel"
                         break
+                    if t == "demo.say":
+                        if self.make_caller is None:
+                            send_threadsafe(json.dumps({"type": "error", "error": "demo dialogue not available"}))
+                            continue
+                        if caller is None:
+                            cv = start.get("caller_voice") or self._caller_voice(voice)
+                            talker = await loop.run_in_executor(None, self.make_caller, f"caller-{sid}", lang, cv)
+                            caller = CallerVoice(talker, send_threadsafe)
+                            caller.start()
+                        caller.say(d.get("id"), str(d.get("text", ""))[:400])
         except Exception as e:  # noqa: BLE001
             send_threadsafe(json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"}))
         finally:
+            if caller is not None:
+                caller.stop()
             if runner is not None:
                 runner.end(kind)
                 await loop.run_in_executor(None, runner.join, 60)
@@ -181,6 +254,15 @@ class MultiServer:
                 send_task.cancel()
             with self.lock:
                 self.active.pop(sid, None)
+
+    def _caller_voice(self, agent_voice: str) -> str:
+        """The demo caller speaks with another voice than the agent's when the server has one."""
+        try:
+            names = list(self.voices()) if self.voices is not None else []
+        except Exception:  # noqa: BLE001
+            names = []
+        others = [v for v in names if v != (agent_voice or (names[0] if names else ""))]
+        return others[0] if others else (agent_voice or (names[0] if names else ""))
 
     async def serve(self, host: str, port: int, ready=None):
         import websockets

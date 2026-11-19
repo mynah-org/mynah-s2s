@@ -56,9 +56,10 @@ f2-plan: ## Frankenstein v2: what f2-setup would download for F2_LLM / F2_LANGS,
 f2-serve: ## Frankenstein v2 WebSocket server on :8772 (paths from F2_ENV, extra flags in F2_ARGS)
 	set -a; . "$(F2_ENV)"; set +a; PYTHONPATH="$(CURDIR)/v2/src" HF_HUB_OFFLINE=1 $(F2_PYTHON) \
 		frankenstein2/server/serve.py --port 8772 --trace-dir "$(F2_TRACE_DIR)" --pocket-preload "$$F2_LANGS" $(F2_ARGS)
-f2-webui: ## Frankenstein v2 server + web UI (http://127.0.0.1:8787); the Debug log switch shows engine lines
+f2-webui: ## Frankenstein v2 server + web UI (http://127.0.0.1:8787): talk, demo dialogue, Traces tab
 	set -a; . "$(F2_ENV)"; set +a; $(MAKE) webui-gpu ENGINE=frankenstein2 WEBUI_PYTHON="$(F2_PYTHON)" \
-		FRANK2_SERVE_ARGS="--pocket-preload $$F2_LANGS $(F2_ARGS)"
+		FRANK2_SERVE_ARGS="--pocket-preload $$F2_LANGS $(F2_ARGS)" \
+		WEBUI_ARGS="--trace-db $(FRANK_DIR)/.f2-traces/f2_traces.sqlite $(WEBUI_ARGS)"
 f2-traces: ## Frankenstein v2 trace store: sessions; SESSION=<id suffix> for a timeline, SPANS=1 for durations
 	$(F2_PYTHON) -m frankenstein2.obs "$(F2_TRACE_DIR)/f2_traces.sqlite" $(if $(SESSION),--session $(SESSION)) \
 		$(if $(SPANS),--spans)
