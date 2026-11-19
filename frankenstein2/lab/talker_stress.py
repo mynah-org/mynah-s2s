@@ -115,13 +115,16 @@ def main():  # pragma: no cover - model run
         waits = pocket.waits[n_wait:]
         n_wait = len(pocket.waits)
         comp = {}
-        for k in seen:
-            xs = sched.stats[k][seen[k]:]
-            seen[k] = len(sched.stats[k])
+        et = getattr(sched, "ears_thread", None)
+        tk = sched.stats["talker_ms"][seen["talker_ms"]:]      # this wave's talker turns
+        for k in ("ears_ms", "talker_ms", "llm_ms"):
+            src = et.ms if (k == "ears_ms" and et is not None) else sched.stats[k]   # ears on their own thread
+            xs = src[seen[k]:]
+            seen[k] = len(src)
             comp[k] = round(max(xs), 1) if xs else None
         row = {"wave": wave, "t_min": round((time.monotonic() - T0) / 60, 1), "wave_s": round(time.monotonic() - tw, 1),
                "replies": len(rep), "missing": miss, "first_audio_p50": pct(fa, .5), "first_audio_p95": pct(fa, .95),
-               "reply_p50": pct(rep, .5), "lang_wait_ms_p50": pct(waits, .5), "lang_wait_ms_max": pct(waits, 1.0),
+               "reply_p50": pct(rep, .5), "talker_ms_p50": pct(tk, .5), "talker_ms_p95": pct(tk, .95), "lang_wait_ms_p50": pct(waits, .5), "lang_wait_ms_max": pct(waits, 1.0),
                "loads_disk": sum(1 for x in loads if x["tier"] == "disk"),
                "loads_host": sum(1 for x in loads if x["tier"] == "host"),
                "load_ms_max": max([x["fetch_ms"] + x["build_ms"] for x in loads], default=None),
@@ -144,6 +147,9 @@ def main():  # pragma: no cover - model run
                "cuda_allocated_first_last_max": [alloc[0], alloc[-1], max(alloc)] if alloc else None,
                "rss_first_last_max": [rss[0], rss[-1], max(rss)] if rss else None,
                "scheduler": sched.summary()}
+    from frankenstein2.tts import cross_step
+    summary["talker_step"] = cross_step.report()
+    print("TALKER_STEP", json.dumps(summary["talker_step"]), flush=True)
     (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
     print("SUMMARY", json.dumps(summary, default=str)[:4000], flush=True)
     store.close()

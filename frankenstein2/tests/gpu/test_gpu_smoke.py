@@ -197,7 +197,7 @@ def test_cross_language_step_equals_each_language_alone():
     voices = {x: m.voice_from_file(os.environ["F2_VOICE"]) for x, m in models.items()}
     text = {x: models[x].chunks(SAY.get(x, SAY["en"]))[0] for x in langs}
 
-    def run(cross, rows_per_lang=(2, 1), frames=60, timed=False):
+    def run(cross, rows_per_lang=(2, 1), frames=60, prof=None):
         pool = SlotPool(models[langs[0]], slots=16, max_len=512)
         bs = {x: PocketBatch(models[x], pool=pool) for x in langs}
         keys = {}
@@ -216,7 +216,7 @@ def test_cross_language_step_equals_each_language_alone():
             if not groups:
                 break
             if cross:
-                res = step_many(groups)
+                res = step_many(groups, prof=prof)
             else:
                 res = {}
                 for b, ks in groups:
@@ -249,3 +249,129 @@ def test_cross_language_step_equals_each_language_alone():
     _, _, ms_b = run(True, (1, 1), 40)
     print(f"TIMING {len(langs)} languages x 1 row: per-language batches {ms_a:.1f} ms/frame, "
           f"cross-language {ms_b:.1f} ms/frame ({ms_a / ms_b:.2f}x)")
+    prof: dict = {}                                          # where a cross-language frame goes: wall vs GPU
+    run(True, (1, 1), 20, prof=prof)
+    print("PROFILE " + " ".join(f"{k}=wall {w / n:.2f} gpu {g / n:.2f} ms" for k, (w, g, n) in prof.items()))
+
+
+_XL: dict = {}
+
+
+def _xl_models():
+    """The 24l languages of XL_LANGS loaded once (delta packages on the shared base, Mimi shared), their voices."""
+    if _XL:
+        return _XL
+    from frankenstein2.tts.catalog import PackageCatalog
+    from frankenstein2.tts.pocket_own import BaseBackbone, PocketOwn, _pocket_swap
+    _pocket_swap()
+    from pocket_swap.package import load_package
+    if not PKG_ROOT:
+        pytest.skip("no packages (F2_POCKET_PACKAGES)")
+    cat = PackageCatalog(PKG_ROOT, os.environ.get("F2_POCKET_PRECISION", "int4"), families=("24l",))
+    langs = [x for x in XL_LANGS if cat.family(x) == "24l"]
+    if len(langs) < 3:
+        pytest.skip(f"fewer than 3 24l languages in {PKG_ROOT}")
+    if "24l" not in _BASES:
+        _BASES["24l"] = BaseBackbone.from_package(load_package(cat.base_dir("24l")), device="cuda")
+    first = os.environ.get("F2_POCKET_BASE") or find(os.environ["F2_POCKET_WEIGHTS"],
+                                                     f"languages/{POCKET['en']}/model.safetensors")
+    models = {}
+    for x in langs:
+        models[x] = PocketOwn.from_package(load_package(cat.path(x)), x, next(iter(models.values()), None) or first,
+                                           device="cuda", base=_BASES["24l"])
+    _XL.update(langs=langs, models=models, voices={x: m.voice_from_file(os.environ["F2_VOICE"])
+                                                   for x, m in models.items()})
+    return _XL
+
+
+def _drive(step, langs, models, voices, texts, rows=1, frames=400, seed=0):
+    """Rows of every language on a fresh pool, stepped by ``step(groups)`` until done -> (latents, audio, ms/frame)."""
+    import time as _t
+    from frankenstein2.tts.pocket_own import PocketBatch, SlotPool
+    pool = SlotPool(models[langs[0]], slots=len(langs) * rows + 2, max_len=512)
+    bs = {x: PocketBatch(models[x], pool=pool) for x in langs}
+    keys = {x: [f"{x}{j}" for j in range(rows)] for x in langs}
+    for i, x in enumerate(langs):
+        for j, k in enumerate(keys[x]):
+            g = torch.Generator(device="cuda").manual_seed(seed + 100 * i + j)
+            bs[x].start(k, voices[x], texts[x][0], texts[x][1], gen=g)
+    lat = {k: [] for ks in keys.values() for k in ks}
+    aud = {k: [] for ks in keys.values() for k in ks}
+    torch.cuda.synchronize()
+    t0, n = _t.monotonic(), 0
+    for _ in range(frames):
+        groups = [(bs[x], [k for k in keys[x] if k in bs[x].rows]) for x in langs]
+        groups = [g for g in groups if g[1]]
+        if not groups:
+            break
+        res = step(groups)
+        n += 1
+        for x in langs:
+            for k in list(keys[x]):
+                if k in res:
+                    if res[k] is None:
+                        bs[x].stop(k)
+                    else:
+                        aud[k].append(res[k].float().cpu())
+                        lat[k].append(bs[x].rows[k]["x"].clone())
+    torch.cuda.synchronize()
+    return lat, aud, (_t.monotonic() - t0) * 1000 / max(n, 1), pool
+
+
+@pytest.mark.gpu
+def test_cross_step_table_and_graphs(ears):
+    """tts/cross_step.py: graph == eager (up to float rounding); close to the per-language step on the first frames; what it
+    says in several languages at once is understood by the ears; and the time per frame of every way (TIMING)."""
+    import numpy as np
+    from scipy.signal import resample_poly
+    from frankenstein2.tts import cross_step as CS
+    from frankenstein2.tts.pocket_own import step_many
+    xl = _xl_models()
+    langs, models, voices = xl["langs"], xl["models"], xl["voices"]
+    texts = {x: models[x].chunks(SAY.get(x, SAY["en"]))[0] for x in langs}
+
+    def cs(graphs):
+        def f(groups):
+            pool = groups[0][0].pool
+            if getattr(pool, "cross", None) is None:
+                pool.cross = CS.CrossStep(pool, groups[0][0].m, graphs=graphs)
+            return pool.cross.step(groups)
+        return f
+
+    def own(groups):
+        out = {}
+        for b, ks in groups:
+            out.update(b.step(ks))
+        return out
+
+    lat_e, _, _, _ = _drive(cs(False), langs, models, voices, texts, frames=40)
+    lat_g, _, _, pool_g = _drive(cs(True), langs, models, voices, texts, frames=40)
+    assert pool_g.cross.stats["replays"] > 0, pool_g.cross.stats
+    worst = 0.0                         # the same kernels; cuBLAS may pick another algorithm inside a capture
+    for k in lat_e:
+        assert len(lat_e[k]) == len(lat_g[k]), k
+        for i, (p, q) in enumerate(zip(lat_e[k], lat_g[k])):
+            worst = max(worst, (p - q).abs().max().item())
+    print(f"CROSS graph vs eager max |latent diff| = {worst:.2e}")
+    assert worst < 1e-4, worst
+    lat_o, _, _, _ = _drive(own, langs, models, voices, texts, frames=3)
+    first = max((lat_o[k][0] - lat_e[k][0]).abs().max().item() for k in lat_o)
+    print(f"CROSS first-frame max |latent - per-language| = {first:.4f}")
+    assert first < 0.1, first
+    _, aud, _, _ = _drive(cs(True), langs, models, voices, {x: models[x].chunks(SAY.get(x, SAY["en"]))[0]
+                                                           for x in langs})
+    for x in langs:                      # spoken together, understood one by one
+        if x not in SAY:
+            continue
+        y = torch.cat(aud[f"{x}0"]).numpy()
+        heard = ears.transcribe(resample_poly(y, 2, 3).astype(np.float32), x)
+        said = models[x].chunks(SAY[x])[0][0]
+        print(f"HEARD-CROSS {x}: {heard!r}")
+        assert heard_ok(heard, said, 0.6 if x in ("ja", "ko", "hi") else 0.75), (x, heard, said)
+    for rows in (1, 2):
+        ms = {}
+        for name, f in (("own", own), ("many", step_many), ("cross_eager", cs(False)), ("cross_graphs", cs(True))):
+            _drive(f, langs, models, voices, texts, rows=rows, frames=8)            # warm (compile, capture)
+            ms[name] = _drive(f, langs, models, voices, texts, rows=rows, frames=40)[2]
+        print(f"TIMING-CROSS {len(langs)} languages x {rows} rows: " +
+              " ".join(f"{k} {v:.1f} ms/frame" for k, v in ms.items()))

@@ -122,11 +122,20 @@ folder from the sources in its `SOURCES` table:
   very first one takes longer, because it also encodes the cloning voice, which every later language reuses.
 - The language of an open session is never evicted, also between its replies. The VRAM limit is therefore soft:
   with more concurrent languages than `--talker-vram-langs`, all of them stay loaded until their sessions close.
-- Sessions in different languages share one talker step. Each backbone layer is one launch of a grouped kernel:
-  the English base tile is read once for all languages, and each language's rows add their own delta. Attention
-  and the Mimi decode run once for all rows. Each row's latents are bit-identical to its language stepping alone
-  (GPU test `test_cross_language_step_equals_each_language_alone`), and a frame costs a fraction of stepping each
-  language in turn. `POCKET_CROSS_LANG=0` turns it off.
+- Sessions in different languages share one talker step (`frankenstein2/tts/cross_step.py`):
+  - **One launch per op for all rows.** The small per-language tensors (norms, flow head, ...) are copied into
+    a language table in VRAM the first time a language speaks. Each row reads its own language's tensors by index.
+  - **Backbone.** Each backbone linear is one launch of a grouped kernel: the English base tile is read once for
+    all languages, and each language's rows add their own delta.
+  - **Attention and Mimi** run once for all rows.
+  - **CUDA graphs.** The frame is captured as a CUDA graph per row count (2, 4, 8, 16).
+  - **Speed.** Under the talker stress (8 sessions, 30 rotating languages) talker turns are shorter and audio gaps
+    fewer than with one step per language.
+  - **Correctness.** The result is not bit-identical to each language stepping alone (gathered norms, batched
+    small matmuls). The GPU test checks that the difference is small, that the graph equals the eager step, and
+    that the ears understand eight languages spoken at once.
+  - **Other modes.** `POCKET_TALKER_STEP=many` steps the languages together with bit-identical latents (per-language
+    small ops); `own` steps each language on its own.
 - All languages share one pool of per-session talker state per family.
 - `frankenstein2/lab/talker_stress.py` stresses it with end-to-end sessions over many languages
   (`--talker-rotate`).

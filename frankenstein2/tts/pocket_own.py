@@ -436,7 +436,8 @@ class PocketOwn:
         self.dev, self.tdtype, self.lang, self.wq = dev, torch.bfloat16, lang, prec
         self.opts = _opts(lang)
         self.Q, self.QB, self.W = Q, QB, W
-        self.base = base if is_delta else None          # the shared backbone (QB empty: this is the base language)
+        # the shared backbone; the base language itself ("exact" package reusing it) has it too, with QB empty
+        self.base = base if (is_delta or prec == "base") else None
         self.tok = _Tok(pkg.tokenizer_path)
         self.n_layers = sum(1 for k in W if k.startswith("flow_lm.transformer.layers.") and k.endswith("norm1.weight"))
         self.d = W["flow_lm.input_linear.weight"].shape[0]
@@ -1027,8 +1028,31 @@ def _plan(models: list) -> dict:
     return terms
 
 
+class _Prof:
+    """Optional phase timing of step_many (lab): wall time and GPU time (CUDA events) per phase, synchronised."""
+
+    def __init__(self, out: dict | None, dev):
+        self.out, self.cuda = out, out is not None and dev.type == "cuda"
+        self.t = self.e = None
+
+    def mark(self, name=None):
+        if self.out is None:
+            return
+        if self.cuda:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            torch.cuda.synchronize()
+        t = time.monotonic()
+        if name is not None and self.t is not None:
+            d = self.out.setdefault(name, [0.0, 0.0, 0])
+            d[0] += (t - self.t) * 1e3
+            d[1] += self.e.elapsed_time(e) if self.cuda else 0.0
+            d[2] += 1
+        self.t, self.e = t, (e if self.cuda else None)
+
+
 @torch.no_grad()
-def step_many(groups: list) -> dict:
+def step_many(groups: list, prof: dict | None = None) -> dict:
     """One latent frame for rows of SEVERAL languages that share one SlotPool: ``groups`` = [(PocketBatch, keys)].
     The rows go through the FlowLM backbone together: attention reads the shared pool once for all rows, every
     backbone linear is one launch of pocket_swap's grouped kernel (the shared base tile is read once for all the
@@ -1078,6 +1102,8 @@ def step_many(groups: list) -> dict:
             y[a:a + n] = m._lin(x[a:a + n], key)
         return y
 
+    pf = _Prof(prof, m0.dev)
+    pf.mark()
     xs = []
     for m, rs in zip(ms, rows):
         lat_in = torch.cat([r["x"] for r in rs], 0)[:, None]
@@ -1093,9 +1119,18 @@ def step_many(groups: list) -> dict:
         from ..llm.qwen_own.kernels import HAVE_TRITON, decode_attention
         fa = HAVE_TRITON
     d, nh = m0.d, m0.nh
+    pf.mark("input")
     for li in range(m0.n_layers):
         p = f"flow_lm.transformer.layers.{li}"
-        proj = lin(ln(x, p + ".norm1"), p + ".self_attn.in_proj.weight")
+        if prof is not None:                 # lab: split one layer into its parts (the other layers time as a block)
+            if li == 1:
+                pf.mark("layer0")
+            proj = ln(x, p + ".norm1")
+            pf.mark("ln") if li == 0 else None
+            proj = lin(proj, p + ".self_attn.in_proj.weight")
+            pf.mark("lin") if li == 0 else None
+        else:
+            proj = lin(ln(x, p + ".norm1"), p + ".self_attn.in_proj.weight")
         q = proj[..., :d].view(B, 1, nh, d // nh)
         k, v = proj[..., d:].view(B, 1, 2, nh, d // nh).unbind(2)
         q, k = _rope(q, k, offs)
@@ -1112,6 +1147,7 @@ def step_many(groups: list) -> dict:
         x = x + lin(o.reshape(B, 1, d), p + ".self_attn.out_proj.weight")
         h = ln(x, p + ".norm2")
         x = x + lin(F.gelu(lin(h, p + ".linear1.weight"), approximate="tanh"), p + ".linear2.weight")
+    pf.mark("layers")
     for r in allrows:
         r["kv"].off += 1
     lats, eoss = [], []
@@ -1124,6 +1160,7 @@ def step_many(groups: list) -> dict:
         else:
             noise = m._noise(n)
         lats.append(noise + m._flow_net(y, noise))
+    pf.mark("head")
     eos_l = host(torch.cat(eoss, 0))                                              # the one host sync per frame
     out, dec = {}, []
     i = 0
@@ -1157,6 +1194,7 @@ def step_many(groups: list) -> dict:
                 audio[:n] *= torch.linspace(0, 1, SR // 200, device=m0.dev)[:n]
                 r["fade"] = False
             out[k] = audio
+    pf.mark("mimi")
     return out
 
 

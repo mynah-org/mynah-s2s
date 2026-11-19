@@ -18,6 +18,7 @@ Scheduler (one thread, the only one issuing GPU work), in priority order every t
 
 from __future__ import annotations
 
+import os
 import queue
 import re
 import contextlib
@@ -258,13 +259,21 @@ class InProcTalker:
                 c["L"].batch.stop(m["ss"])
             self.name_of.pop(m["ss"], None)
 
-    @staticmethod
-    def step_many(groups):
-        """[(batch, keys)] of languages sharing one slot pool -> {ss: audio | None}: one batch alone steps as usual,
-        several step together (pocket_own.step_many: one grouped kernel per backbone linear for all of them)."""
-        if len(groups) == 1:
-            b, keys = groups[0]
-            return b.step(keys)
+    step_mode = os.environ.get("POCKET_TALKER_STEP", "cross")   # cross | many | own
+
+    def step_many(self, groups):
+        """[(batch, keys)] of the languages sharing one slot pool -> {ss: audio | None}.
+        cross (default): tts/cross_step.py, one launch per op for all rows and a CUDA graph per row bucket;
+        many: pocket_own.step_many (grouped backbone kernel, per-language small ops, bit-identical latents);
+        own: each language's own PocketBatch.step."""
+        if self.step_mode == "cross" and hasattr(groups[0][0], "pool") and getattr(groups[0][0].m, "base", None):
+            from .tts.cross_step import cross_step
+            return cross_step(groups)
+        if len(groups) == 1 or self.step_mode == "own":
+            out = {}
+            for b, keys in groups:
+                out.update(b.step(keys))
+            return out
         from .tts.pocket_own import step_many
         return step_many(groups)
 
@@ -621,6 +630,65 @@ class ThreadedLLM(threading.Thread):
                     self.err = repr(e)
 
 
+class ThreadedEars(threading.Thread):
+    """The ears on their own thread and CUDA stream. InProcEars talks to a "scheduler" through submit / kick / mem
+    only, so this worker takes that place: opens, closes and transcriptions go to its queue, hop cohorts run as soon
+    as they are due. The talker's frames then no longer wait behind an ears cohort (up to a few hundred ms with 8-10
+    sessions) and the two interleave on the GPU. ``sched``: the main scheduler, for mem()."""
+
+    def __init__(self, sched):
+        import torch
+        super().__init__(daemon=True, name="f2-ears")
+        self.sched = sched
+        self.ears = None                    # the InProcEars this thread drives
+        self.q: queue.Queue = queue.Queue()
+        self.ev = threading.Event()
+        self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.stop_flag = False
+        self.err = None
+        self.busy_s = 0.0
+        self.ms: list = []                  # per cohort
+
+    def submit(self, item):                 # ("ears", m) from InProcEars
+        self.q.put(item[1])
+        self.ev.set()
+
+    def kick(self):
+        self.ev.set()
+
+    def mem(self):
+        return self.sched.mem()
+
+    def close(self):
+        self.stop_flag = True
+        self.ev.set()
+
+    def run(self, *args, **kw):
+        import contextlib
+        import torch
+        cm = torch.cuda.stream(self.stream) if self.stream is not None else contextlib.nullcontext()
+        with torch.inference_mode(), cm:
+            while not self.stop_flag:
+                try:
+                    while True:
+                        try:
+                            self.ears.control(self.q.get_nowait())
+                        except queue.Empty:
+                            break
+                    t = time.monotonic()
+                    if self.ears.run():
+                        dt = time.monotonic() - t
+                        self.busy_s += dt
+                        self.ms.append(dt * 1e3)
+                    else:
+                        self.ev.wait(0.003)
+                        self.ev.clear()
+                except Exception as e:  # noqa: BLE001 - keep the ears thread alive, report
+                    import traceback
+                    traceback.print_exc()
+                    self.err = repr(e)
+
+
 class Scheduler(threading.Thread):
     def __init__(self, talker_budget_ms: float = 40.0, llm_budget_ms: float = 60.0):
         super().__init__(daemon=True, name="f2-gpu")
@@ -646,9 +714,14 @@ class Scheduler(threading.Thread):
         def pc(x):
             return {"n": len(x), "p50": round(float(np.percentile(x, 50)), 1), "p95": round(float(np.percentile(x, 95)), 1),
                     "max": round(float(np.max(x)), 1)} if x else {"n": 0}
-        e = self.ears.e if self.ears is not None else None
-        tot = {k: round(sum(self.stats[k]) / 1e3, 1) for k in ("ears_ms", "talker_ms", "llm_ms")}
-        return {"turns": self.stats["turns"], "busy_s": tot, "ears_ms": pc(self.stats["ears_ms"]), "talker_ms": pc(self.stats["talker_ms"]),
+        et = getattr(self, "ears_thread", None)
+        ears = self.ears if self.ears is not None else getattr(et, "ears", None)
+        e = ears.e if ears is not None else None
+        ears_ms = et.ms if et is not None else self.stats["ears_ms"]
+        tot = {k: round(sum(self.stats[k]) / 1e3, 1) for k in ("talker_ms", "llm_ms")}
+        tot["ears_ms"] = round(sum(ears_ms) / 1e3, 1)
+        return {"turns": self.stats["turns"], "busy_s": tot, "ears_ms": pc(ears_ms), "talker_ms": pc(self.stats["talker_ms"]),
+                "ears_thread": et is not None,
                 "llm_ms": pc(self.stats["llm_ms"]), "idle_s": round(self.stats.get("idle_s", 0.0), 1),
                 "ctl": {k: {"n": len(v), "sum_s": round(sum(v) / 1e3, 2), "max_ms": round(max(v), 1)}
                         for k, v in self.stats.items() if k.startswith("ctl_")},
@@ -760,9 +833,16 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
         return e, {"load_s": round(time.monotonic() - t0, 1), "window_graphs": ng,
                    "window_graphs_s": round(time.monotonic() - t1, 1), **sched.mem(), "rss_peak_gb": rss()}
     ears_m, ready["ears"] = sched.call(load_ears)
-    ears = InProcEars(ears_m, sched)
-    ears.ready = {"ev": "ready", **ready["ears"]}
-    sched.ears = ears
+    if str(getattr(a, "ears_thread", "off")) == "on" and torch.cuda.is_available():
+        et = ThreadedEars(sched)           # the ears' own thread and stream: the talker never waits for a cohort
+        ears = InProcEars(ears_m, et)
+        et.ears = ears
+        sched.ears_thread = et
+        et.start()
+    else:
+        ears = InProcEars(ears_m, sched)
+        sched.ears = ears
+    ears.ready = {"ev": "ready", **ready["ears"], "thread": sched.ears is None}
 
     LANGS = {"it": "italian_24l", "fr": "french_24l", "en": "english_2026-09_24l", "es": "spanish_24l",
              "de": "german_24l", "pt": "portuguese_24l", "nl": "dutch_24l"}   # kyutai/pocket-tts official
@@ -837,7 +917,8 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
                 st["mimi"] = m                           # Mimi (codec + voice encoder) loaded once for all languages
             arch = (m.n_layers, m.nh, m.d // m.nh, m.mimi_layers)
             if arch not in st["pool"]:                   # one slot pool per architecture (24-layer today)
-                st["pool"][arch] = SlotPool(m, slots=slots, max_len=512)
+                # rows: every session plus a demo-dialogue caller each, +1 for CrossStep's scratch slot
+                st["pool"][arch] = SlotPool(m, slots=2 * slots + 1, max_len=512)
             pool = st["pool"][arch]
             if side is not None:
                 side.synchronize()

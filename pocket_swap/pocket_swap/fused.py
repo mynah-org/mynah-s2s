@@ -89,9 +89,9 @@ if HAVE_TRITON:
 
 
     @triton.jit
-    def _gkernel(X, B, BS, QP, SP, R0, RC, Y, N, K, sxm, sbn, sbs, sqn, ssn, sym,
+    def _gkernel(X, B, BS, QP, SP, HAS, R0, RC, Y, N, K, sxm, sbn, sbs, sqn, ssn, sym,
                  BPREC: tl.constexpr, PREC: tl.constexpr, GROUP: tl.constexpr, BLOCK_N: tl.constexpr,
-                 BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr, DOT_BF16: tl.constexpr):
+                 BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr, DOT_BF16: tl.constexpr, USE_HAS: tl.constexpr):
         g = tl.program_id(0)            # the group (language) varies fastest: one base tile, every language, in L2
         pid = tl.program_id(1)
         r0 = tl.load(R0 + g)
@@ -109,11 +109,16 @@ if HAVE_TRITON:
         nmask = rn < N
         mmask = rm < rc
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k0 in range(0, K, BLOCK_K):
+        kend = tl.where(rc > 0, K, 0)  # a group without rows (an empty table slot) reads nothing
+        for k0 in range(0, kend, BLOCK_K):
             rk = k0 + tl.arange(0, BLOCK_K)
-            # exactly fused_linear2's arithmetic (same order, no branch): language term, then += base term
-            w = _term(Q, S, rn, rk, k0, sqn, ssn, nmask, PREC, GROUP, BLOCK_N, BLOCK_K)
-            w += _term(B, BS, rn, rk, k0, sbn, sbs, nmask, BPREC, GROUP, BLOCK_N, BLOCK_K)
+            if USE_HAS:  # table mode: a slot without a delta (the base language) uses the base term alone
+                w = _term(B, BS, rn, rk, k0, sbn, sbs, nmask, BPREC, GROUP, BLOCK_N, BLOCK_K)
+                if tl.load(HAS + g) != 0:
+                    w = _term(Q, S, rn, rk, k0, sqn, ssn, nmask, PREC, GROUP, BLOCK_N, BLOCK_K) + w
+            else:  # exactly fused_linear2's arithmetic (same order, no branch): language term, then += base term
+                w = _term(Q, S, rn, rk, k0, sqn, ssn, nmask, PREC, GROUP, BLOCK_N, BLOCK_K)
+                w += _term(B, BS, rn, rk, k0, sbn, sbs, nmask, BPREC, GROUP, BLOCK_N, BLOCK_K)
             w = w.to(tl.bfloat16)
             x = tl.load(X + (r0 + rm)[:, None] * sxm + rk[None, :], mask=mmask[:, None], other=0.0).to(tl.bfloat16)
             if DOT_BF16:
@@ -155,22 +160,24 @@ class GroupedTerms:
 
 
 def fused_linear_grouped(x: torch.Tensor, n_out: int, gt: "GroupedTerms", r0: torch.Tensor, rc: torch.Tensor,
-                         group: int) -> torch.Tensor:
+                         group: int, has: torch.Tensor | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
     """x [M, K]: rows sorted by language, language g owning rows r0[g] .. r0[g] + rc[g] (at most MAX_ROWS each).
-    -> [M, n_out] = per row x @ (T_base + T_lang(row))^T, the same arithmetic as ``fused_linear2`` row by row."""
+    -> [M, n_out] = per row x @ (T_base + T_lang(row))^T, the same arithmetic as ``fused_linear2`` row by row.
+    ``has`` (int32 per group): table mode, groups with 0 use the base term alone (not bit-identical to
+    fused_linear2 on the base language); rows outside every group are left as in ``out`` (zeros by default)."""
     x2 = x.reshape(-1, x.shape[-1]).contiguous()
     M, K = x2.shape
     out_dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float16, torch.float32) else torch.bfloat16
-    y = torch.empty((M, n_out), device=x.device, dtype=out_dtype)
+    y = out if out is not None else torch.zeros((M, n_out), device=x.device, dtype=out_dtype)
     bp, bq, bs = gt.base
     bs = bs if bs is not None else bq
     g = K if group <= 0 else group
     block_k = 64 if g % 64 == 0 else g
     G = gt.qp.shape[0]
     grid = (G, triton.cdiv(n_out, 16))
-    _gkernel[grid](x2, bq, bs, gt.qp, gt.sp, r0, rc, y, n_out, K, x2.stride(0), bq.stride(0), bs.stride(0),
+    _gkernel[grid](x2, bq, bs, gt.qp, gt.sp, has if has is not None else r0, r0, rc, y, n_out, K, x2.stride(0), bq.stride(0), bs.stride(0),
                    gt.sqn, gt.ssn, y.stride(0), BPREC=CODE[bp], PREC=CODE[gt.prec], GROUP=g, BLOCK_N=16, BLOCK_K=block_k, BLOCK_M=16,
-                   DOT_BF16=not _INTERPRET)
+                   DOT_BF16=not _INTERPRET, USE_HAS=has is not None)
     return y
 
 

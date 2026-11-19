@@ -100,3 +100,52 @@ def test_a_cold_language_loads_while_another_session_keeps_talking():
     done = [m for m in t.poll("s_fr") if m["ev"] == "done"]
     assert t.waits and max(t.waits) > 0                     # the fr text waited for its language
     _ = done
+
+
+def test_ears_on_their_own_thread_open_hop_and_transcribe():
+    """ThreadedEars drives InProcEars in place of the scheduler: opens, hops and a transcription all come back."""
+    import base64
+    import numpy as np
+    from frankenstein2.runtime import InProcEars, ThreadedEars
+
+    class E:
+        def __init__(self):
+            self.sess = {}
+
+        def open(self, sid, lang, thr):
+            self.sess[sid] = lang
+
+        def close(self, sid):
+            self.sess.pop(sid, None)
+
+        def transcribe(self, x, lang):
+            return f"{lang}:{len(x)}"
+
+        def hop(self, items):
+            return [{"frames": 1, "events": [], "pieces": []} for _ in items]
+
+    class S:
+        def mem(self):
+            return {}
+
+    t = ThreadedEars(S())
+    ears = InProcEars(E(), t)
+    t.ears = ears
+    t.start()
+    try:
+        ears.send({"op": "open", "sid": "s1", "lang": "it"})
+        z = base64.b64encode(np.zeros(5120, "<f4").tobytes()).decode()
+        deadline = time.monotonic() + 5
+        while "s1" not in ears.e.sess and time.monotonic() < deadline:
+            time.sleep(0.01)
+        ears.send({"op": "hop", "sid": "s1", "n": 0, "mode": "listen", "u": z, "a": z})
+        got = []
+        while not got and time.monotonic() < deadline:
+            got = [m for m in ears.poll("s1") if m.get("ev") == "hop"]
+            time.sleep(0.01)
+        assert got and got[0]["n"] == 0
+        x = base64.b64encode(np.zeros(160, "<f4").tobytes()).decode()
+        assert ears.request({"op": "transcribe", "id": "a", "lang": "fr", "pcm": x}, "transcript", 5)["text"] == "fr:160"
+        assert t.err is None and t.ms
+    finally:
+        t.close()
