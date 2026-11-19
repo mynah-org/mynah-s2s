@@ -122,8 +122,11 @@ folder from the sources in its `SOURCES` table:
   very first one takes longer, because it also encodes the cloning voice, which every later language reuses.
 - The language of an open session is never evicted, also between its replies. The VRAM limit is therefore soft:
   with more concurrent languages than `--talker-vram-langs`, all of them stay loaded until their sessions close.
-- Every language is its own batch. Sessions in different languages do not share a talker batch, so many concurrent
-  languages cost more GPU time per audio frame than the same sessions in one language.
+- Sessions in different languages share one talker step. Each backbone layer is one launch of a grouped kernel:
+  the English base tile is read once for all languages, and each language's rows add their own delta. Attention
+  and the Mimi decode run once for all rows. Each row's latents are bit-identical to its language stepping alone
+  (GPU test `test_cross_language_step_equals_each_language_alone`), and a frame costs a fraction of stepping each
+  language in turn. `POCKET_CROSS_LANG=0` turns it off.
 - All languages share one pool of per-session talker state per family.
 - `frankenstein2/lab/talker_stress.py` stresses it with end-to-end sessions over many languages
   (`--talker-rotate`).

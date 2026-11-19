@@ -331,6 +331,7 @@ class PocketOwn:
                  for k, v in W.items()}
         self.Q: dict = {}                     # key -> (precision, codes, scales, in_features): quantised linears
         self.QB: dict = {}                    # key -> shared base term (delta packages only)
+        self.base = None
         self.wq = wq
         if wq:
             _, quant = _pocket_swap()
@@ -435,6 +436,7 @@ class PocketOwn:
         self.dev, self.tdtype, self.lang, self.wq = dev, torch.bfloat16, lang, prec
         self.opts = _opts(lang)
         self.Q, self.QB, self.W = Q, QB, W
+        self.base = base if is_delta else None          # the shared backbone (QB empty: this is the base language)
         self.tok = _Tok(pkg.tokenizer_path)
         self.n_layers = sum(1 for k in W if k.startswith("flow_lm.transformer.layers.") and k.endswith("norm1.weight"))
         self.d = W["flow_lm.input_linear.weight"].shape[0]
@@ -989,6 +991,173 @@ class PocketBatch:
             u = F.linear(F.gelu(F.linear(h, W[q_ + ".linear1.weight"]), approximate="tanh"), W[q_ + ".linear2.weight"])
             x = x + W[q_ + ".layer_scale_2.scale"] * u
         return x.transpose(1, 2)
+
+
+# ---------------------------------------------------------------------------------------------- several languages
+CROSS_LANG = os.environ.get("POCKET_CROSS_LANG", "1") != "0"
+_PLANS: dict = {}                  # (id(model), ...) -> (weakrefs, {linear key: GroupedTerms or None})
+
+
+def _plan(models: list) -> dict:
+    """Per backbone linear: the grouped terms of these languages (delta languages against one shared base), or None
+    where they cannot share a kernel launch (the base language itself, mixed precisions, no Triton)."""
+    import weakref
+    key = tuple(id(m) for m in models)
+    hit = _PLANS.get(key)
+    if hit is not None and all(r() is m for r, m in zip(hit[0], models)):
+        return hit[1]
+    fused, _ = _pocket_swap()
+    base = models[0].base
+    terms: dict = {}
+    delta = [m for m in models if m.QB]           # delta languages (the base language has none)
+    base = delta[0].base if delta else None
+    if base is not None and all(m.base is base for m in delta) and hasattr(fused, "GroupedTerms"):
+        for k in delta[0].QB:
+            if any(m.QB.get(k) is not base.terms[k] or k not in m.Q for m in delta):
+                terms[k] = None
+                continue
+            try:                         # the base language's own rows (no delta) are computed apart: see step_many
+                terms[k] = fused.GroupedTerms([m.Q[k][:3] if m.QB else None for m in models],
+                                              base.terms[k], models[0].dev)
+            except ValueError:
+                terms[k] = None
+    while len(_PLANS) >= 16:
+        _PLANS.pop(next(iter(_PLANS)))
+    _PLANS[key] = ([weakref.ref(m) for m in models], terms)
+    return terms
+
+
+@torch.no_grad()
+def step_many(groups: list) -> dict:
+    """One latent frame for rows of SEVERAL languages that share one SlotPool: ``groups`` = [(PocketBatch, keys)].
+    The rows go through the FlowLM backbone together: attention reads the shared pool once for all rows, every
+    backbone linear is one launch of pocket_swap's grouped kernel (the shared base tile is read once for all the
+    languages; each language's rows get x @ (W_base + delta_lang), the same arithmetic as their own batch), and the
+    Mimi decode (identical in every language) is one batched call. The small per-language parts (norms, input and
+    output projections, the flow head) run per language on its rows. Per row, the latents equal those of the
+    language's own ``PocketBatch.step`` (same kernels, same row counts); the audio can differ by float rounding
+    (Mimi runs batched over more rows). One language, or CROSS_LANG off: each batch steps on its own."""
+    groups = [(b, list(ks)) for b, ks in groups if ks]
+    if not groups:
+        return {}
+    pool = groups[0][0].pool
+    if len(groups) == 1 or not CROSS_LANG or any(b.pool is not pool for b, _ in groups):
+        out = {}
+        for b, ks in groups:
+            out.update(b.step(ks))
+        return out
+    b0 = groups[0][0]
+    ms = [b.m for b, _ in groups]
+    m0 = ms[0]
+    rows = [[b.rows[k] for k in ks] for b, ks in groups]
+    cnt = [len(r) for r in rows]
+    st = [sum(cnt[:i]) for i in range(len(cnt))]
+    span = list(zip(ms, st, cnt))
+    allrows = [r for rs in rows for r in rs]
+    B = len(allrows)
+    plan = _plan(ms) if max(cnt) <= 16 else {}
+    fused_mod, _ = _pocket_swap()
+    grouped = bool(plan) and m0.dev.type == "cuda" and fused_mod.available(
+        torch.empty(1, device=m0.dev), tuple({t.prec for t in plan.values() if t is not None}))
+    apart = [(m, a, n) for m, a, n in span if not m.QB]       # the base language: its own plain linears
+    if grouped:
+        r0 = torch.tensor(st, dtype=torch.int32, device=m0.dev)
+        rc = torch.tensor([0 if not m.QB else n for m, _, n in span], dtype=torch.int32, device=m0.dev)
+        md = next(m for m in ms if m.QB)
+
+    def ln(x, key):
+        return torch.cat([m._ln(x[a:a + n], key) for m, a, n in span], 0)
+
+    def lin(x, key):
+        t = plan.get(key) if grouped else None
+        if t is None:
+            return torch.cat([m._lin(x[a:a + n], key) for m, a, n in span], 0)
+        y = fused_mod.fused_linear_grouped(x.reshape(B, -1).to(torch.bfloat16), md.Q[key][1].shape[0], t, r0, rc,
+                                           128).view(B, 1, -1)
+        for m, a, n in apart:
+            y[a:a + n] = m._lin(x[a:a + n], key)
+        return y
+
+    xs = []
+    for m, rs in zip(ms, rows):
+        lat_in = torch.cat([r["x"] for r in rs], 0)[:, None]
+        seq = torch.where(torch.isnan(lat_in), m.W["flow_lm.bos_emb"], lat_in)
+        xs.append(F.linear(seq, m.W["flow_lm.input_linear.weight"]).to(m.tdtype))
+    x = torch.cat(xs, 0)
+    kv = b0.kv
+    slots = torch.tensor([r["slot"] for r in allrows], device=m0.dev)
+    offs = torch.tensor([r["kv"].off for r in allrows], device=m0.dev)
+    Lmax = int(offs.max()) + 1
+    fa = m0.tdtype == torch.bfloat16 and x.is_cuda and FUSED_ATTN
+    if fa:
+        from ..llm.qwen_own.kernels import HAVE_TRITON, decode_attention
+        fa = HAVE_TRITON
+    d, nh = m0.d, m0.nh
+    for li in range(m0.n_layers):
+        p = f"flow_lm.transformer.layers.{li}"
+        proj = lin(ln(x, p + ".norm1"), p + ".self_attn.in_proj.weight")
+        q = proj[..., :d].view(B, 1, nh, d // nh)
+        k, v = proj[..., d:].view(B, 1, 2, nh, d // nh).unbind(2)
+        q, k = _rope(q, k, offs)
+        kv[li, 0, slots, offs] = k[:, 0]
+        kv[li, 1, slots, offs] = v[:, 0]
+        if fa:
+            o = decode_attention(q[:, 0], kv[li, 0].permute(0, 2, 1, 3), kv[li, 1].permute(0, 2, 1, 3),
+                                 slots, offs + 1)[:, None]
+        else:
+            K = kv[li, 0, slots, :Lmax].transpose(1, 2)
+            V = kv[li, 1, slots, :Lmax].transpose(1, 2)
+            mask = (torch.arange(Lmax, device=m0.dev)[None] <= offs[:, None])[:, None, None, :]
+            o = F.scaled_dot_product_attention(q.transpose(1, 2), K, V, mask).transpose(1, 2)
+        x = x + lin(o.reshape(B, 1, d), p + ".self_attn.out_proj.weight")
+        h = ln(x, p + ".norm2")
+        x = x + lin(F.gelu(lin(h, p + ".linear1.weight"), approximate="tanh"), p + ".linear2.weight")
+    for r in allrows:
+        r["kv"].off += 1
+    lats, eoss = [], []
+    for (m, a, n), rs in zip(span, rows):
+        W = m.W
+        y = m._ln(x[a:a + n].float(), "flow_lm.out_norm")[:, -1]
+        eoss.append((F.linear(y, W["flow_lm.out_eos.weight"], W["flow_lm.out_eos.bias"]) > EOS_THR)[:, 0])
+        if all(r["gen"] is not None for r in rs):
+            noise = torch.cat([m._noise(1, r["gen"]) for r in rs], 0)
+        else:
+            noise = m._noise(n)
+        lats.append(noise + m._flow_net(y, noise))
+    eos_l = host(torch.cat(eoss, 0))                                              # the one host sync per frame
+    out, dec = {}, []
+    i = 0
+    for (b, ks), rs, lat in zip(groups, rows, lats):
+        mean, std = b.m.W["flow_lm.emb_mean"], b.m.W["flow_lm.emb_std"]
+        for j, (k, r) in enumerate(zip(ks, rs)):
+            e = eos_l[i]
+            i += 1
+            if e and r["eos"] is None and r["step"] >= MIN_FRAMES_BEFORE_EOS:
+                r["eos"] = r["step"]
+            if (r["eos"] is not None and r["step"] >= r["eos"] + r["after"]) or r["step"] >= r["max_len"]:
+                r["done"] = True
+                out[k] = None
+                continue
+            r["step"] += 1
+            r["x"] = lat[j:j + 1]
+            dec.append((k, r, lat[j:j + 1] * std + mean))
+    if dec:
+        if MIMI_BATCH:                          # Mimi is the same tensors in every language: one decode for all
+            idx = torch.tensor([r["slot"] for _, r, _ in dec], device=m0.dev)
+            moff = torch.tensor([r["moff"] for _, r, _ in dec], device=m0.dev)
+            wav, n = b0._mimi_decode(torch.cat([l_ for _, _, l_ in dec], 0)[:, None], idx, moff)
+            audios = [wav[i, 0] for i in range(len(dec))]
+            for _, r, _ in dec:
+                r["moff"] += n
+        else:
+            audios = [m0.mimi_decode(l_[:, None], r["st"])[0, 0] for _, r, l_ in dec]
+        for (k, r, _), audio in zip(dec, audios):
+            if r["fade"]:
+                n = min(SR // 200, audio.shape[-1])
+                audio[:n] *= torch.linspace(0, 1, SR // 200, device=m0.dev)[:n]
+                r["fade"] = False
+            out[k] = audio
+    return out
 
 
 class _SlotKV(_KV):

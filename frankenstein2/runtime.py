@@ -258,6 +258,16 @@ class InProcTalker:
                 c["L"].batch.stop(m["ss"])
             self.name_of.pop(m["ss"], None)
 
+    @staticmethod
+    def step_many(groups):
+        """[(batch, keys)] of languages sharing one slot pool -> {ss: audio | None}: one batch alone steps as usual,
+        several step together (pocket_own.step_many: one grouped kernel per backbone linear for all of them)."""
+        if len(groups) == 1:
+            b, keys = groups[0]
+            return b.step(keys)
+        from .tts.pocket_own import step_many
+        return step_many(groups)
+
     def _finish(self, ss, c, cancelled=False):
         c["L"].batch.stop(ss)
         del self.cur[ss]
@@ -313,9 +323,12 @@ class InProcTalker:
         for ss, c in self.cur.items():
             if self._ahead(c, now) <= self.ahead_s:
                 by_name.setdefault(c["name"], []).append(ss)
+        by_pool: dict = {}               # languages sharing a slot pool (one architecture) step together
         for name, keys in by_name.items():
-            L = self.cur[keys[0]]["L"]
-            res = L.batch.step(keys)
+            b = self.cur[keys[0]]["L"].batch
+            by_pool.setdefault(id(getattr(b, "pool", b)), []).append((b, keys))
+        for groups in by_pool.values():
+            res = self.step_many(groups)
             did = True
             for ss, audio in res.items():
                 c = self.cur[ss]

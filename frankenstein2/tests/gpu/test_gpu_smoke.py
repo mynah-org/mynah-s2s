@@ -151,3 +151,101 @@ def test_language_package_speaks_and_the_ears_hear_it(ears, lang):
     heard = ears.transcribe(resample_poly(x, 2, 3).astype(np.float32), lang)
     print(f"HEARD {lang} {fam} {d.name}: {heard!r} (said {SAY[lang]!r})")
     assert heard_ok(heard, SAY[lang], 0.6 if lang in ("ja", "ko", "hi") else 0.75), (heard, SAY[lang])
+
+
+XL_LANGS = [x for x in os.environ.get("F2_XL_LANGS", "it,fr,de,es,pt,nl,ko,en").split(",") if x]
+
+
+@pytest.mark.gpu
+def test_cross_language_step_equals_each_language_alone():
+    """Rows of several languages stepped together (pocket_own.step_many: one grouped kernel per backbone linear,
+    one batched Mimi decode) give, row by row, the same latents as each language's own batch, and audio equal up to
+    float rounding. Also prints the time per frame of both ways (TIMING)."""
+    import time as _t
+    from frankenstein2.tts.catalog import PackageCatalog
+    from frankenstein2.tts.pocket_own import BaseBackbone, PocketBatch, PocketOwn, SlotPool, _pocket_swap, step_many
+    _pocket_swap()
+    from pocket_swap.package import load_package
+    if not PKG_ROOT:
+        pytest.skip("no packages (F2_POCKET_PACKAGES)")
+    cat = PackageCatalog(PKG_ROOT, os.environ.get("F2_POCKET_PRECISION", "int4"), families=("24l",))
+    langs = [x for x in XL_LANGS if cat.family(x) == "24l"]
+    if len(langs) < 3:
+        pytest.skip(f"fewer than 3 24l languages in {PKG_ROOT}")
+    if "24l" not in _BASES:
+        _BASES["24l"] = BaseBackbone.from_package(load_package(cat.base_dir("24l")), device="cuda")
+    first = os.environ.get("F2_POCKET_BASE") or find(os.environ["F2_POCKET_WEIGHTS"],
+                                                     f"languages/{POCKET['en']}/model.safetensors")
+    models = {}
+    for x in langs:
+        models[x] = PocketOwn.from_package(load_package(cat.path(x)), x, next(iter(models.values()), None) or first,
+                                           device="cuda", base=_BASES["24l"])
+    fused, _ = _pocket_swap()
+    dm = [m for m in models.values() if m.QB]                 # first the kernel alone: grouped == per language
+    for key in ("flow_lm.transformer.layers.0.self_attn.in_proj.weight", "flow_lm.transformer.layers.7.linear2.weight"):
+        base = _BASES["24l"].terms[key]
+        gt = fused.GroupedTerms([m.Q[key][:3] for m in dm], base, "cuda")
+        cnt = [2] + [1] * (len(dm) - 1)
+        x = torch.randn(sum(cnt), base[1].shape[1] if base[0] == "bf16" else _BASES["24l"].cols[key],
+                        device="cuda", dtype=torch.bfloat16)
+        st = [sum(cnt[:i]) for i in range(len(cnt))]
+        y = fused.fused_linear_grouped(x, dm[0].Q[key][1].shape[0], gt, torch.tensor(st, dtype=torch.int32,
+                                       device="cuda"), torch.tensor(cnt, dtype=torch.int32, device="cuda"), 128)
+        for m, a, n in zip(dm, st, cnt):
+            ref = fused.fused_linear2(x[a:a + n], m.Q[key][1].shape[0], m.Q[key][:3], m.QB[key], 128)
+            assert torch.equal(y[a:a + n], ref), (key, m.lang, (y[a:a + n] - ref).abs().max().item())
+    voices = {x: m.voice_from_file(os.environ["F2_VOICE"]) for x, m in models.items()}
+    text = {x: models[x].chunks(SAY.get(x, SAY["en"]))[0] for x in langs}
+
+    def run(cross, rows_per_lang=(2, 1), frames=60, timed=False):
+        pool = SlotPool(models[langs[0]], slots=16, max_len=512)
+        bs = {x: PocketBatch(models[x], pool=pool) for x in langs}
+        keys = {}
+        for i, x in enumerate(langs):
+            n = rows_per_lang[0] if i == 0 else rows_per_lang[1]
+            keys[x] = [f"{x}{j}" for j in range(n)]
+            for j, k in enumerate(keys[x]):
+                g = torch.Generator(device="cuda").manual_seed(100 * i + j)
+                bs[x].start(k, voices[x], text[x][0], text[x][1], gen=g)
+        lat, aud = {k: [] for ks in keys.values() for k in ks}, {k: [] for ks in keys.values() for k in ks}
+        torch.cuda.synchronize()
+        t0, n_steps = _t.monotonic(), 0
+        for _ in range(frames):
+            groups = [(bs[x], [k for k in keys[x] if k in bs[x].rows]) for x in langs]
+            groups = [g for g in groups if g[1]]
+            if not groups:
+                break
+            if cross:
+                res = step_many(groups)
+            else:
+                res = {}
+                for b, ks in groups:
+                    res.update(b.step(ks))
+            n_steps += 1
+            for x in langs:
+                for k in list(keys[x]):
+                    if k not in res:
+                        continue
+                    if res[k] is None:
+                        bs[x].stop(k)
+                    else:
+                        aud[k].append(res[k].float().cpu())
+                        lat[k].append(bs[x].rows[k]["x"].clone())
+        torch.cuda.synchronize()
+        ms = (_t.monotonic() - t0) * 1000 / max(n_steps, 1)
+        return lat, aud, ms
+
+    lat_a, aud_a, _ = run(False)
+    lat_b, aud_b, _ = run(True)
+    for k in lat_a:
+        assert len(lat_a[k]) == len(lat_b[k]) > 5, (k, len(lat_a[k]), len(lat_b[k]))
+        for i, (p, q) in enumerate(zip(lat_a[k], lat_b[k])):
+            assert torch.equal(p, q), (k, i, (p - q).abs().max().item())
+        da = max((p - q).abs().max().item() for p, q in zip(aud_a[k], aud_b[k]))
+        assert da < 1e-2, (k, da)
+    run(False, (1, 1), 10)                                   # warm both paths, then time one row per language
+    run(True, (1, 1), 10)
+    _, _, ms_a = run(False, (1, 1), 40)
+    _, _, ms_b = run(True, (1, 1), 40)
+    print(f"TIMING {len(langs)} languages x 1 row: per-language batches {ms_a:.1f} ms/frame, "
+          f"cross-language {ms_b:.1f} ms/frame ({ms_a / ms_b:.2f}x)")
