@@ -91,6 +91,17 @@ BUILTIN = {x.code: x for x in (
 _REG: dict = dict(BUILTIN)
 
 
+# What was checked per language (docs/frankenstein2-languages.md): "e2e" = tool-call suites and multi-session gates;
+# "suite" = the language suite (talker -> ASR, LLM alone, one spoken session); "weak-voice" = the suite's voice check
+# failed (the ASR understands the talker only in part). A language folder added later is "unchecked".
+STATUS = {"it": "e2e", "en": "e2e", "fr": "e2e", "cs": "weak-voice",
+          **{c: "suite" for c in ("de", "es", "pt", "nl", "hi", "ja", "ko", "pl", "ru", "et", "tr")}}
+
+
+def status(code: str) -> str:
+    return STATUS.get(code, "unchecked")
+
+
 def get(code: str) -> LangSpec:
     """The language's spec; an unknown code gets English phrases and its code as locale (ASR auto-detect)."""
     s = _REG.get(code)

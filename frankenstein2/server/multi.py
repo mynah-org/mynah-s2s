@@ -3,7 +3,7 @@ own language, on one set of shared resources (ears process, LLM model, talker pr
 
 Wire (as mynah_v2.transport.ws_server, optional fields added):
   client -> server   {"type": "session.start", "language": "it"|"en"|"fr", "voice"?, "system_prompt"?,
-                      "input_rate"?: 16000, "caller_voice"?}  then binary PCM16 mono; {"type": "session.end"} |
+                      "input_rate"?: 16000, "caller_voice"?, "scenario"? (frankenstein2/scenarios.py)}  then binary PCM16 mono; {"type": "session.end"} |
                      {"type": "session.cancel"} | {"type": "demo.say", "id", "text"} (demo dialogue: the engine
                      speaks ``text`` with a caller voice and returns it, see below; the client plays it and streams it
                      back as the session's input, like a microphone)
@@ -128,13 +128,14 @@ class CallerVoice(threading.Thread):
 
 class MultiServer:
     def __init__(self, make_pipeline, max_sessions: int = 4, idle_timeout_s: float = 60.0, profile: str = "f2",
-                 languages=None, voices=None, make_caller=None):
+                 languages=None, voices=None, make_caller=None, scenarios=None):
         """languages: callable -> [{"code", "name", "tested"}], the languages a session may ask for (sent with the
         health probe's server.ready, so the web UI lists them). voices: callable -> voice names (also in
         server.ready). make_caller(sid, lang, voice) -> a talker client for the demo dialogue's caller (None: no
         demo dialogue)."""
         self.make_pipeline, self.max_sessions, self.idle = make_pipeline, max_sessions, idle_timeout_s
         self.languages, self.voices, self.make_caller = languages, voices, make_caller
+        self.scenarios = scenarios           # callable -> scenarios.public() (the web UI's scenario picker)
         self.profile = profile
         self.active: dict = {}
         self.lock = threading.Lock()
@@ -144,7 +145,7 @@ class MultiServer:
         qs = parse_qs(urlparse(path).query)
         if qs.get("probe", ["0"])[0] == "1":
             msg = {"type": "server.ready", "sessions": len(self.active), "max_sessions": self.max_sessions}
-            for k, f in (("languages", self.languages), ("voices", self.voices)):
+            for k, f in (("languages", self.languages), ("voices", self.voices), ("scenarios", self.scenarios)):
                 if f is not None:
                     try:
                         msg[k] = list(f())
@@ -198,8 +199,9 @@ class MultiServer:
                 if verbose or name not in QUIET:
                     send_threadsafe(json.dumps({"type": "event", **d, **({"log": line} if line else {})},
                                                default=str))
-            p = await loop.run_in_executor(None, self.make_pipeline, sid, lang, voice, start.get("system_prompt"),
-                                           sink)
+            sc = start.get("scenario")
+            p = await loop.run_in_executor(None, lambda: self.make_pipeline(
+                sid, lang, voice, start.get("system_prompt"), sink, **({"scenario": sc} if sc else {})))
             from frankenstein2.audio.playout import Resampler
             runner = SessionRunner(p, send_threadsafe, Resampler(p.talker.sr, OUT_SR), Resampler(in_rate, 16000))
             send_threadsafe(json.dumps({"type": "session.created", "session_id": sid, "language": lang, "voice": voice,
@@ -261,8 +263,11 @@ class MultiServer:
             names = list(self.voices()) if self.voices is not None else []
         except Exception:  # noqa: BLE001
             names = []
-        others = [v for v in names if v != (agent_voice or (names[0] if names else ""))]
-        return others[0] if others else (agent_voice or (names[0] if names else ""))
+        agent = agent_voice or (names[0] if names else "")
+        if "caller" in names and agent != "caller":          # setup's dedicated caller voice
+            return "caller"
+        others = [v for v in names if v != agent]
+        return others[0] if others else agent
 
     async def serve(self, host: str, port: int, ready=None):
         import websockets

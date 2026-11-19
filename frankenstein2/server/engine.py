@@ -39,11 +39,27 @@ class Resources:
     make_talker: object
     languages: object = ("it", "en", "fr")            # a tuple, or a callable -> codes (the talker's package folder)
     voices: dict = field(default_factory=dict)          # name -> reference wav (or stock name)
+    voice_map: dict = field(default_factory=dict)       # language -> {name: wav | native:<name>}, overrides voices
     ears_thr: dict = field(default_factory=dict)        # language -> threshold overrides
     client_delay_steps: int = 1
     trace_dir: str | None = None
     sinks: list = field(default_factory=list)            # extra trace listeners (obs.TraceStore.sink, LogSink.sink)
     store_text: bool = True                              # False: user / agent text never reaches a trace or sink
+
+
+def voice_for(res, name: str, language: str) -> str:
+    """What the talker gets for voice ``name`` in ``language``: the language's own entry of the voice map (a native
+    voice or a native speaker's reference), else the server-wide voice; "" = the talker's default."""
+    m = (getattr(res, "voice_map", None) or {}).get(language) or {}
+    key = name or ("default" if "default" in m else "")
+    if key in m:
+        return m[key]
+    return res.voices.get(name, name)
+
+
+def voice_names(res) -> list:
+    """Every voice name a session may ask for (server-wide names and the voice map's)."""
+    return sorted(set(res.voices) | {n for m in (getattr(res, "voice_map", None) or {}).values() for n in m})
 
 
 def served_languages(res) -> tuple:
@@ -53,7 +69,7 @@ def served_languages(res) -> tuple:
 
 
 def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", system_prompt: str | None = None,
-                  sink=None, trace: bool = True):
+                  sink=None, trace: bool = True, scenario: str | None = None):
     """One session's Pipeline on the shared resources (language and voice fixed for the session)."""
     from frankenstein2.core import Pipeline, PipelineConfig
     from frankenstein2.ears.client import EarsLink
@@ -61,13 +77,13 @@ def make_pipeline(res: Resources, sid: str, language: str, voice: str = "", syst
     served = served_languages(res)
     if language not in served:
         raise ValueError(f"language {language!r} not served; available {list(served)}")
-    if voice and res.voices and voice not in res.voices:
-        raise ValueError(f"unknown voice {voice!r}; available {sorted(res.voices)}")
+    if voice and voice_names(res) and voice not in voice_names(res):
+        raise ValueError(f"unknown voice {voice!r}; available {voice_names(res)}")
     from frankenstein2.obs import fanout
     tr = Tracer(f"{res.trace_dir}/{sid}.f2.jsonl" if (res.trace_dir and trace) else None, session_id=sid, keep=False,
                 sink=fanout(sink, *res.sinks), store_text=res.store_text)
-    llm = res.make_llm(sid, language, system_prompt)
-    talker = res.make_talker(sid, language, res.voices.get(voice, voice))
+    llm = res.make_llm(sid, language, system_prompt, **({"scenario": scenario} if scenario else {}))
+    talker = res.make_talker(sid, language, voice_for(res, voice, language))
     ears = EarsLink(res.ears, sid, language, thr=res.ears_thr.get(language))
     p = Pipeline(sid, ears, llm, talker, PipelineConfig(lang=language, client_delay_steps=res.client_delay_steps), tr)
     p.open()
@@ -163,14 +179,14 @@ class Frankenstein2Engine:
         served = served_languages(self.res)
         if opts.language not in served:
             raise ValueError(f"language {opts.language!r} not served; available {list(served)}")
-        if opts.voice and self.res.voices and opts.voice not in self.res.voices:
-            raise ValueError(f"unknown voice {opts.voice!r}; available {sorted(self.res.voices)}")
+        if opts.voice and voice_names(self.res) and opts.voice not in voice_names(self.res):
+            raise ValueError(f"unknown voice {opts.voice!r}; available {voice_names(self.res)}")
         self.n += 1
         sid = getattr(self.v2tracer, "session_id", None) or f"f2-{self.n}"
         tr = Tracer(f"{self.res.trace_dir}/{sid}.f2.jsonl" if self.res.trace_dir else None, session_id=sid,
                     keep=False, sink=self._bridge())
         llm = self.res.make_llm(sid, opts.language, system_prompt)
-        talker = self.res.make_talker(sid, opts.language, self.res.voices.get(opts.voice, opts.voice))
+        talker = self.res.make_talker(sid, opts.language, voice_for(self.res, opts.voice, opts.language))
         ears = EarsLink(self.res.ears, sid, opts.language, thr=self.res.ears_thr.get(opts.language))
         from frankenstein2.audio.playout import Resampler
         self.rs = Resampler(talker.sr, OUT_SR)

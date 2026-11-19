@@ -734,6 +734,30 @@ class PocketOwn:
             _VOICE_LATENTS[key] = lat
         return self.voice_state(None, lat=lat)
 
+    @torch.no_grad()
+    def voice_from_state(self, path: str) -> _KV:
+        """A predefined voice of Kyutai's language folder (``languages/<lang>/embeddings/<name>.safetensors``): the
+        voice prompt's FlowLM KV cache computed by Kyutai with that language's model, per layer
+        ``transformer.layers.<i>.self_attn/cache`` (2, 1, T, heads, head_dim) and its ``offset``. No cloning, and
+        the voice is native to the language."""
+        from safetensors.torch import load_file
+        d = load_file(str(path), device=str(self.dev))
+        n = sum(1 for k in d if k.endswith("self_attn/cache"))
+        if n != self.n_layers:
+            raise ValueError(f"{path}: a {n}-layer voice state for a {self.n_layers}-layer model")
+        c0 = d["transformer.layers.0.self_attn/cache"]
+        T = c0.shape[2]
+        off = int(d["transformer.layers.0.self_attn/offset"].reshape(-1)[0].item()) or T
+        if c0.shape[3] != self.nh or c0.shape[4] != self.d // self.nh or off > T:
+            raise ValueError(f"{path}: cache {tuple(c0.shape)} / offset {off} does not fit the model")
+        kv = _KV(self.n_layers, T, self.nh, self.d // self.nh, self.dev, self.tdtype)
+        for li in range(self.n_layers):
+            c = d[f"transformer.layers.{li}.self_attn/cache"]
+            kv.c[li, 0, :T] = c[0, 0].to(self.tdtype)
+            kv.c[li, 1, :T] = c[1, 0].to(self.tdtype)
+        kv.off = off
+        return kv
+
     def max_gen_len(self, n_tokens: int) -> int:
         return math.ceil((n_tokens / 3.0 + 2.0) * FRAME_RATE)
 

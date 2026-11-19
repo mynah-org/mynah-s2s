@@ -70,31 +70,40 @@ SCENARIOS = {
 
 # Frankenstein v2 demo dialogue: what the simulated caller says, per language (the engine speaks it with a caller
 # voice; the page plays it and streams it in as the session's input). The store is the fictional "Mynah Home".
-# One sentence per line where possible: a full stop makes the talker pause, and the turn-taking model may end the
-# caller's turn there (seen in French: "Parfait." heard alone).
+# One sentence per line, no full stop or question mark inside: the talker pauses there and the turn-taking model ends
+# the caller's turn (the rest lands in the next turn), and some community talkers stop speaking at the first full
+# stop. Three lines everywhere: the catalogue question, a follow-up, goodbye.
 DEMO_SCRIPT = {
-    "it": ["Buongiorno, avete un divano a tre posti? Quanto costa?", "Perfetto, e la consegna a domicilio è possibile?",
-           "Va benissimo, grazie mille. Arrivederci!"],
-    "en": ["Hello, do you have a three-seat sofa? How much is it?", "Great, and can you deliver it to my home?",
-           "Perfect, thank you very much. Goodbye!"],
-    "fr": ["Bonjour, avez-vous un canapé trois places ? Combien coûte-t-il ?",
-           "Parfait, et la livraison à domicile est possible ?", "Très bien, merci beaucoup. Au revoir !"],
-    "de": ["Guten Tag, haben Sie ein dreisitziges Sofa? Was kostet es?", "Super, und liefern Sie auch nach Hause?",
-           "Perfekt, vielen Dank. Auf Wiedersehen!"],
-    "es": ["Hola, ¿tienen un sofá de tres plazas? ¿Cuánto cuesta?", "Genial, ¿y lo pueden entregar a domicilio?",
-           "Perfecto, muchas gracias. ¡Adiós!"],
-    "pt": ["Olá, têm um sofá de três lugares? Quanto custa?", "Ótimo, e fazem entrega ao domicílio?",
-           "Perfeito, muito obrigado. Adeus!"],
-    "nl": ["Hallo, hebben jullie een driezitsbank? Wat kost die?", "Mooi, kunnen jullie hem ook thuis bezorgen?",
-           "Perfect, hartelijk dank. Tot ziens!"],
-    "ko": ["안녕하세요, 3인용 소파 있나요? 가격이 얼마예요?", "감사합니다. 안녕히 계세요!"],
-    "tr": ["Merhaba, üç kişilik kanepeniz var mı? Fiyatı ne kadar?", "Çok teşekkürler. Hoşça kalın!"],
-    "ja": ["こんにちは、三人掛けのソファはありますか？おいくらですか？", "ありがとうございました。失礼します。"],
-    "cs": ["Dobrý den, máte trojmístnou pohovku? Kolik stojí?", "Děkuji mockrát. Na shledanou!"],
-    "hi": ["नमस्ते, क्या आपके पास तीन सीटों वाला सोफ़ा है? इसकी कीमत क्या है?", "बहुत धन्यवाद। नमस्ते!"],
-    "pl": ["Dzień dobry, czy macie trzyosobową sofę? Ile kosztuje?", "Dziękuję bardzo. Do widzenia!"],
-    "ru": ["Здравствуйте, у вас есть трёхместный диван? Сколько он стоит?", "Большое спасибо. До свидания!"],
-    "et": ["Tere, kas teil on kolmekohaline diivan? Kui palju see maksab?", "Suur aitäh. Head aega!"],
+    "it": ["Buongiorno, avete un divano a tre posti e quanto costa?", "Perfetto, e la consegna a domicilio è possibile?",
+           "Va benissimo, grazie mille e arrivederci!"],
+    "en": ["Hello, do you have a three-seat sofa and how much is it?", "Great, and can you deliver it to my home?",
+           "Perfect, thank you very much and goodbye!"],
+    "fr": ["Bonjour, vous avez un canapé trois places et combien il coûte ?",
+           "Parfait, et la livraison à domicile est possible ?", "Très bien, merci beaucoup et au revoir !"],
+    "de": ["Guten Tag, haben Sie ein dreisitziges Sofa und was kostet es?", "Super, und liefern Sie auch nach Hause?",
+           "Perfekt, vielen Dank und auf Wiedersehen!"],
+    "es": ["Hola, ¿tienen un sofá de tres plazas y cuánto cuesta?", "Genial, ¿y lo pueden entregar a domicilio?",
+           "¡Perfecto, muchas gracias y adiós!"],
+    "pt": ["Olá, têm um sofá de três lugares e quanto custa?", "Ótimo, e fazem entrega ao domicílio?",
+           "Perfeito, muito obrigado e adeus!"],
+    "nl": ["Hallo, hebben jullie een driezitsbank en wat kost die?", "Mooi, kunnen jullie hem ook thuis bezorgen?",
+           "Perfect, hartelijk dank en tot ziens!"],
+    "ko": ["안녕하세요, 삼인용 소파가 있나요, 가격은 얼마인가요?", "좋아요, 집까지 배송도 되나요?",
+           "정말 감사합니다, 안녕히 계세요!"],
+    "tr": ["Merhaba, üç kişilik kanepeniz var mı ve fiyatı ne kadar?", "Harika, eve teslimat yapıyor musunuz?",
+           "Çok teşekkürler, hoşça kalın!"],
+    "ja": ["こんにちは、三人掛けのソファはありますか、おいくらですか？", "いいですね、自宅まで配送してもらえますか？",
+           "ありがとうございました、失礼します。"],
+    "cs": ["Dobrý den, máte trojmístnou pohovku a kolik stojí?", "Výborně, a doručujete i domů?",
+           "Děkuji mockrát, na shledanou!"],
+    "hi": ["नमस्ते, क्या आपके पास तीन सीटों वाला सोफ़ा है और उसकी कीमत क्या है?", "बढ़िया, क्या आप घर तक डिलीवरी करते हैं?",
+           "बहुत धन्यवाद, नमस्ते!"],
+    "pl": ["Dzień dobry, czy macie trzyosobową sofę i ile kosztuje?", "Świetnie, a czy dostarczacie do domu?",
+           "Dziękuję bardzo, do widzenia!"],
+    "ru": ["Здравствуйте, у вас есть трёхместный диван и сколько он стоит?", "Отлично, а доставка на дом возможна?",
+           "Большое спасибо, до свидания!"],
+    "et": ["Tere, kas teil on kolmekohaline diivan ja kui palju see maksab?", "Suurepärane, kas te toote ka koju?",
+           "Suur aitäh, head aega!"],
 }
 
 
@@ -177,6 +186,7 @@ class StaticHandler(SimpleHTTPRequestHandler):
                 "v2_reachable": reachable,
                 "languages": ready.get("languages") or [],
                 "voices": ready.get("voices") or [],
+                "scenarios": ready.get("scenarios") or [],
                 "demo_dialogue": bool(ready.get("demo_dialogue")),
                 "traces": bool(getattr(self.server, "trace_db", None)),
                 "profile": self.server.profile,

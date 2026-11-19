@@ -24,7 +24,8 @@ def language_list(res) -> list:
     """The served languages with their names, for the web UI's selector."""
     from frankenstein2 import langs
     from frankenstein2.server.engine import served_languages
-    return [{"code": c, "name": langs.get(c).name, "tested": langs.get(c).tested} for c in served_languages(res)]
+    return [{"code": c, "name": langs.get(c).name, "tested": langs.get(c).tested, "status": langs.status(c)}
+            for c in served_languages(res)]
 
 
 def observability(a, td: Path):
@@ -82,10 +83,10 @@ def main():  # pragma: no cover - GPU
         from frankenstein2.llm.nano import NanoShared
         shared = NanoShared(a.nano_dir, str(Path(a.lab_scripts) / "multilingual"), a.nano_precision, a.nano_graph)
         make_llm, llm_info = B.llm_factory(a, shared, spec), shared.mem
-    from frankenstein2.server.engine import Frankenstein2Engine, Resources, make_pipeline
+    from frankenstein2.server.engine import Frankenstein2Engine, Resources, make_pipeline, voice_for, voice_names
     sinks, store = observability(a, td)
     res = Resources(ears=ears, make_llm=make_llm, make_talker=B.talker_factory(a, pocket),
-                    voices=B.voices(a), ears_thr=B.thresholds(a), trace_dir=str(td), sinks=sinks,
+                    voices=B.voices(a), voice_map=B.voice_map(a), ears_thr=B.thresholds(a), trace_dir=str(td), sinks=sinks,
                     store_text=not a.trace_no_text)
     cat = getattr(getattr(pocket, "catalog", None), "languages", None)
     if cat is not None:                          # packages: every language folder is served, found by scanning
@@ -96,11 +97,14 @@ def main():  # pragma: no cover - GPU
     import asyncio
     if not a.v2_server:
         from frankenstein2.server.multi import MultiServer
-        srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
+        from frankenstein2 import scenarios as SC
+        srv = MultiServer(lambda sid, lang, voice, prompt, sink, **kw: make_pipeline(res, sid, lang, voice, prompt,
+                                                                                    sink, **kw),
                           max_sessions=a.max_sessions, idle_timeout_s=a.idle_timeout,
                           profile=f"frankenstein2-{a.llm_backend}", languages=lambda: language_list(res),
-                          voices=lambda: sorted(res.voices),
-                          make_caller=lambda sid, lang, voice: res.make_talker(sid, lang, res.voices.get(voice, voice)))
+                          voices=lambda: voice_names(res),
+                          make_caller=lambda sid, lang, voice: res.make_talker(sid, lang, voice_for(res, voice, lang)),
+                          scenarios=SC.public)
         try:
             asyncio.run(srv.serve(a.host, a.port, ready=lambda: print(
                 f"READY port={a.port} " + json.dumps(loads, default=str), flush=True)))

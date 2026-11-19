@@ -228,12 +228,32 @@ class InProcTalker:
         """Server start only: load a language and its default voice before sessions arrive (blocking)."""
         return self.langs.ensure(self.names(lang, None), timeout, self._in_use)
 
+    native_root = ""                    # Kyutai's language folders (languages/<lang>/embeddings/<name>.safetensors)
+
+    def native_path(self, L, name):
+        """The predefined voice ``name`` for the language of L, or None (no folder, a community language, missing)."""
+        from pathlib import Path
+        from . import langs as LG
+        folder = LG.get(L.model.lang).pocket or ""
+        if not self.native_root or not folder or "/" in folder:
+            return None
+        folder = folder if L.model.n_layers == 24 else folder.replace("_24l", "")
+        p = Path(self.native_root) / "languages" / folder / "embeddings" / f"{name}.safetensors"
+        return p if p.is_file() else None
+
     def _voice(self, L, voice):
         voice = voice or self.default_voice
         v = L.voices.get(voice)
         if v is None:                                      # a session's own reference voice: once per language
             t0 = time.monotonic()
-            v = L.voices[voice] = L.model.voice_from_file(voice)
+            if voice.startswith("native:"):                # Kyutai's predefined voice for this language
+                p = self.native_path(L, voice.split(":", 1)[1])
+                if p is None and (not self.default_voice or self.default_voice.startswith("native:")):
+                    raise FileNotFoundError(f"no {voice} for {L.model.lang} and no default voice to fall back to")
+                v = L.model.voice_from_state(p) if p is not None else self._voice(L, self.default_voice)
+            else:
+                v = L.model.voice_from_file(voice)
+            L.voices[voice] = v
             self.voice_ms.append(round((time.monotonic() - t0) * 1000, 1))
         return v
 
@@ -948,6 +968,7 @@ def start(a, log_dir=None) -> dict:  # pragma: no cover - GPU
     langs = TalkerLangs(fetch, build, vram_langs=int(getattr(a, "talker_vram_langs", 4)),
                         host_langs=int(getattr(a, "talker_host_langs", 8)))
     talker = InProcTalker(sched, langs, default_voice=dv, names=names)
+    talker.native_root = getattr(a, "pocket_voices", "") or os.environ.get("F2_POCKET_VOICES", "")
     sched.talker = talker
     for lang in [x for x in getattr(a, "pocket_preload", "").split(",") if x]:   # models + default voice, now
         t0 = time.monotonic()

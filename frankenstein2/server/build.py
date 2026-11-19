@@ -41,6 +41,10 @@ def add_args(ap) -> None:
     ap.add_argument("--qwen-mode", default="", help="own engine weights: int8 | bf16 (quantised checkpoints such as "
                     "NVFP4 / AWQ are detected); default from --llm-preset")
     ap.add_argument("--qwen-slots", type=int, default=8)
+    ap.add_argument("--pocket-voices", default=os.environ.get("F2_POCKET_VOICES", ""),
+                    help="a snapshot of kyutai/pocket-tts(-without-voice-cloning) with languages/<lang>/embeddings: "
+                         "voices named native:<name> (--voice giovanni=native:giovanni) use Kyutai's predefined voice "
+                         "of each session's language (community languages fall back to the default voice)")
     ap.add_argument("--ears-thread", default="off", choices=("on", "off"),
                     help="ears on their own thread and CUDA stream (talker stress: fewer audio gaps, but ears, LLM "
                          "and talker all slower from GIL and GPU contention; off: on the scheduler, before the talker)")
@@ -67,6 +71,10 @@ def add_args(ap) -> None:
     ap.add_argument("--flash-harness", default="")
     ap.add_argument("--flash-root", default="")
     ap.add_argument("--voice", action="append", default=[], help="NAME=reference.wav (first = default)")
+    ap.add_argument("--voice-map", default=os.environ.get("F2_VOICE_MAP", ""),
+                    help="JSON file {lang: {NAME: reference.wav | native:<name>}}: per-language voices (a native "
+                         "speaker's reference, or Kyutai's predefined voice) that override --voice for that "
+                         "language; relative paths are resolved from the file's folder")
     ap.add_argument("--chunking", default="", help="talker chunking override: sentence | whole | progressive")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--ep-thr", action="append", default=[], help="LANG=threshold for the endpoint head")
@@ -234,20 +242,30 @@ def qwen_factory(a, proc, spec):  # pragma: no cover - process
     from frankenstein2.llm.qwen import QwenLLM
     policy = {**P1, **POLICY}
 
-    def make(sid, lang, system_prompt=None):
+    from frankenstein2 import scenarios as SC
+
+    def make(sid, lang, system_prompt=None, scenario=None):
         L = session_lang(lang)
         said: list = []
+        sc = SC.get(scenario)
         backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
         backend._said = said
         reg = ToolRegistry()
-        hs = slowed(backend.handlers(), getattr(a, "tool_delay_s", 0.0))
-        for t in spec["tools"]:
-            reg.register(t["name"], hs[t["name"]], t["description"], t["parameters"])
+        if sc.tools:                     # a demo scenario: its own tools (scenarios.py), its own persona
+            for t in sc.tools:
+                reg.register(t.name, slowed({t.name: SC.timed(t.handler)}, getattr(a, "tool_delay_s", 0.0))[t.name],
+                             t.description, t.parameters)
+            base_prompt, rules = sc.system_prompt, SC.TOOL_RULE
+        else:                            # the store: the tenant's tools and prompt
+            hs = slowed(backend.handlers(), getattr(a, "tool_delay_s", 0.0))
+            for t in spec["tools"]:
+                reg.register(t["name"], hs[t["name"]], t["description"], t["parameters"])
+            base_prompt, rules = spec["system_prompt"], TOOL_RULE
         led = ToolLedger(sid, None)
         tmo = getattr(a, "tool_timeout", 10.0)
         bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=tmo)   # backend in its own thread, ledger timeout
-        rule = ("\n" + TOOL_RULE.get(lang, TOOL_RULE["en"])) if a.tool_rule else ""
-        system = (with_language(system_prompt or spec["system_prompt"], L) + "\n" + policy.get(lang, policy["en"])
+        rule = ("\n" + rules.get(lang, rules["en"])) if a.tool_rule else ""
+        system = (with_language(system_prompt or base_prompt, L) + "\n" + policy.get(lang, policy["en"])
                   + "\n" + BRIEF.get(lang, BRIEF["en"]) + rule)
         llm = QwenLLM(proc, sid, system, tool_schemas(reg), bound, lang, tool_timeout_s=tmo + 0.5,
                       first_wait_s=getattr(a, "tool_first_wait_s", 1.5),
@@ -275,7 +293,7 @@ def llm_factory(a, shared, spec, on_ledger=None):  # pragma: no cover - GPU
     from frankenstein2.llm.nano import BRIEF, POLICY, TOOL_RULE, NanoLLM
     policy = {**P1, **POLICY}
 
-    def make(sid, lang, system_prompt=None):
+    def make(sid, lang, system_prompt=None, scenario=None):   # Nano (legacy): the store scenario only
         L = session_lang(lang)
         said: list = []
         backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
@@ -314,6 +332,22 @@ def thresholds(a) -> dict:
     for x in a.ep_thr:
         lang, _, v = x.partition("=")
         out[lang] = {"ep_thr": float(v)}
+    return out
+
+
+def voice_map(a) -> dict:
+    """--voice-map: {lang: {name: wav path | native:<name>}}; relative wav paths are relative to the map file."""
+    path = getattr(a, "voice_map", "")
+    if not path:
+        return {}
+    base = Path(path).resolve().parent
+    raw = json.loads(Path(path).read_text())
+    out = {}
+    for lang, m in raw.items():
+        if lang.startswith("_"):                          # "_comment", "_sources": documentation only
+            continue
+        out[lang] = {n: (v if v.startswith("native:") or Path(v).is_absolute() else str(base / v))
+                     for n, v in m.items()}
     return out
 
 
