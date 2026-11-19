@@ -61,8 +61,9 @@ def add_args(ap) -> None:
     ap.add_argument("--tool-timeout", type=float, default=8.0,
                     help="seconds a tool may run; then the model gets the reference timeout error (late results are "
                          "recorded in the ledger, never used)")
-    ap.add_argument("--tool-reminder-s", type=float, default=4.0,
-                    help="an on-hold reminder every N seconds while a tool runs (0 = none)")
+    ap.add_argument("--tool-reminder-s", type=float, default=2.5,
+                    help="an on-hold reminder every N seconds while a tool runs (0 = none); the tool starts ~2 s after "
+                         "the holding phrase (call generation), so 4 s left 4-5 s of silence and callers spoke over it")
     ap.add_argument("--tool-delay-s", type=float, default=0.0, help="lab: every tool backend sleeps N seconds first")
     ap.add_argument("--no-tool-rule", dest="tool_rule", action="store_false",
                     help="v2b: without the tool rule in the system prompt and the localized decision question")
@@ -189,7 +190,7 @@ def qwen_factory(a, proc, spec):  # pragma: no cover - process
         system = (with_language(system_prompt or spec["system_prompt"], L) + "\n" + policy.get(lang, policy["en"])
                   + "\n" + BRIEF.get(lang, BRIEF["en"]) + rule)
         llm = QwenLLM(proc, sid, system, tool_schemas(reg), bound, lang, tool_timeout_s=tmo + 1.0,
-                      reminder_s=getattr(a, "tool_reminder_s", 4.0))
+                      reminder_s=getattr(a, "tool_reminder_s", 2.5))
         llm.backend, llm.ledger = backend, led
         return llm
     return make

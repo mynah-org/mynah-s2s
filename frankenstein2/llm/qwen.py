@@ -116,7 +116,7 @@ class QwenLLM:
     The calls' tool messages go back in call order."""
 
     def __init__(self, proc, ss: str, system: str, tool_schemas: list, bound: dict, lang: str, max_rounds: int = 3,
-                 user_texts=None, tool_timeout_s: float = 10.0, reminder_s: float = 4.0, max_reminders: int = 2,
+                 user_texts=None, tool_timeout_s: float = 10.0, reminder_s: float = 2.5, max_reminders: int = 2,
                  pool=None, clock=time.monotonic):
         self.p, self.ss, self.system, self.schemas, self.lang = proc, ss, system, tool_schemas, lang
         self.record: list = []
