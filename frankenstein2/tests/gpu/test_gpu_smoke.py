@@ -34,6 +34,14 @@ SAY = {"it": "Buongiorno, il suo ordine arriverà domani mattina.",
        "nl": "Goedemorgen, uw bestelling komt morgenochtend aan."}
 
 
+def find(root, rel):
+    """As the runtime: a snapshot dir, a snapshots dir, or any sibling snapshot of the repository."""
+    r = Path(root)
+    hits = sorted(r.glob(rel)) or sorted(r.glob(f"*/{rel}")) or sorted(r.parent.glob(f"*/{rel}"))
+    assert hits, f"{rel} not under {root}"
+    return hits[0]
+
+
 def words(s):
     return re.findall(r"\w+", s.lower())
 
@@ -52,8 +60,8 @@ def test_pocket_speaks_and_the_ears_hear_it(ears, lang):
     from scipy.signal import resample_poly
     from frankenstein2.tts.pocket_own import PocketOwn
     name = POCKET[lang]
-    w = next(Path(os.environ["F2_POCKET_WEIGHTS"]).glob(f"languages/{name}/model.safetensors"))
-    tk = next(Path(os.environ["F2_POCKET_TOKENIZERS"]).glob(f"languages/{name}/tokenizer.json"))
+    w = find(os.environ["F2_POCKET_WEIGHTS"], f"languages/{name}/model.safetensors")
+    tk = find(os.environ["F2_POCKET_TOKENIZERS"], f"languages/{name}/tokenizer.json")
     m = PocketOwn(w, tk, lang=lang, device="cuda", dtype=torch.bfloat16, wq="w4")
     torch.manual_seed(0)
     voice = m.voice_from_file(os.environ["F2_VOICE"])
