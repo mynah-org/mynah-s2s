@@ -30,18 +30,26 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--line-level", type=float, default=0.95)
     ap.add_argument("--dialogue-level", type=float, default=0.97)
+    ap.add_argument("--dialogues-only", action="store_true", help="take only the recorded dialogues of these runs "
+                    "(e.g. an e2e run that streamed the packed lines: no second re-encoding of the lines)")
+    ap.add_argument("--drop-langs", default="", help="first remove these languages' lines and dialogues from the "
+                    "manifest (their voices changed); files are left in place and overwritten by the runs")
     a = ap.parse_args(argv)
     out = Path(a.out)
     (out / "lines").mkdir(parents=True, exist_ok=True)
     (out / "dialogues").mkdir(parents=True, exist_ok=True)
     mf = out / "manifest.json"
     man = json.loads(mf.read_text()) if mf.exists() else {"lines": {}, "dialogues": {}, "verified": {}}
+    for lang in [x for x in a.drop_langs.split(",") if x]:
+        man["lines"] = {t: f for t, f in man["lines"].items() if f.split("/")[1] != lang}
+        man["dialogues"].pop(lang, None)
+        man["verified"].pop(lang, None)
     for run in map(Path, a.runs):
         res = json.loads((run / "demo_dialogue.json").read_text())
         for key, r in res.items():
             sc, lang = r.get("scenario", "store"), r["lang"]
             tag = lang if sc == "store" else f"{sc}_{lang}"
-            for i, line in enumerate(r["lines"]):
+            for i, line in enumerate([] if a.dialogues_only else r["lines"]):
                 src = run / f"{tag}_line{i}.ogg"
                 if src.exists() and line.get("text"):
                     dst = f"lines/{lang}/{sc}_{i}.ogg"

@@ -59,3 +59,5 @@ id_*
 .DS_Store
 .idea/
 .vscode/
+# the web UI demo samples: small Opus files, kept in the repository (webui/f2/samples/SOURCES.md)
+!webui/f2/samples/**/*.ogg

@@ -1,0 +1,196 @@
+{
+ "dialogues": {
+  "cs": {
+   "store": "dialogues/cs_store.ogg"
+  },
+  "de": {
+   "store": "dialogues/de_store.ogg"
+  },
+  "en": {
+   "restaurant": "dialogues/en_restaurant.ogg",
+   "store": "dialogues/en_store.ogg",
+   "travel": "dialogues/en_travel.ogg",
+   "weather": "dialogues/en_weather.ogg"
+  },
+  "es": {
+   "store": "dialogues/es_store.ogg"
+  },
+  "et": {
+   "store": "dialogues/et_store.ogg"
+  },
+  "fr": {
+   "store": "dialogues/fr_store.ogg"
+  },
+  "hi": {
+   "store": "dialogues/hi_store.ogg"
+  },
+  "it": {
+   "store": "dialogues/it_store.ogg",
+   "travel": "dialogues/it_travel.ogg",
+   "weather": "dialogues/it_weather.ogg"
+  },
+  "ja": {
+   "store": "dialogues/ja_store.ogg"
+  },
+  "ko": {
+   "store": "dialogues/ko_store.ogg"
+  },
+  "nl": {
+   "store": "dialogues/nl_store.ogg"
+  },
+  "pl": {
+   "store": "dialogues/pl_store.ogg"
+  },
+  "pt": {
+   "store": "dialogues/pt_store.ogg"
+  },
+  "ru": {
+   "store": "dialogues/ru_store.ogg"
+  },
+  "tr": {
+   "store": "dialogues/tr_store.ogg"
+  }
+ },
+ "lines": {
+  "A nome Rossi.": "lines/it/restaurant_1.ogg",
+  "And how about London?": "lines/en/weather_1.ogg",
+  "And what will the weather be like there tomorrow?": "lines/en/travel_1.ogg",
+  "Au nom de Martin.": "lines/fr/restaurant_1.ogg",
+  "Bonjour, je prépare un voyage à Rome, combien font cinq cents dollars en euros ?": "lines/fr/travel_0.ogg",
+  "Bonjour, quel temps fera-t-il demain à Paris ?": "lines/fr/weather_0.ogg",
+  "Bonjour, qui était Marie Curie ?": "lines/fr/knowledge_0.ogg",
+  "Bonjour, vous avez un canapé trois places et combien il coûte ?": "lines/fr/store_0.ogg",
+  "Bonsoir, je voudrais une table pour quatre personnes demain à vingt heures trente.": "lines/fr/restaurant_0.ogg",
+  "Buonasera, vorrei prenotare un tavolo per quattro persone domani alle otto e mezza.": "lines/it/restaurant_0.ogg",
+  "Buongiorno, avete un divano a tre posti e quanto costa?": "lines/it/store_0.ogg",
+  "Buongiorno, che tempo fa domani a Milano?": "lines/it/weather_0.ogg",
+  "Ciao, chi era Leonardo da Vinci?": "lines/it/knowledge_0.ogg",
+  "Ciao, sto organizzando un viaggio a New York, quanti dollari sono cinquecento euro?": "lines/it/travel_0.ogg",
+  "Combien font trois cent quarante fois douze ?": "lines/fr/knowledge_1.ogg",
+  "Dobrý den, máte trojmístnou pohovku a kolik stojí?": "lines/cs/store_0.ogg",
+  "Dzień dobry, czy macie trzyosobową sofę i ile kosztuje?": "lines/pl/store_0.ogg",
+  "Dziękuję bardzo, do widzenia!": "lines/pl/store_2.ogg",
+  "Děkuji mockrát, na shledanou!": "lines/cs/store_2.ogg",
+  "E a New York, invece?": "lines/it/weather_1.ogg",
+  "E che tempo farà là domani?": "lines/it/travel_1.ogg",
+  "Et quel temps fera-t-il là-bas demain ?": "lines/fr/travel_1.ogg",
+  "Et à Montréal ?": "lines/fr/weather_1.ogg",
+  "Genial, ¿y lo pueden entregar a domicilio?": "lines/es/store_1.ogg",
+  "Good evening, I'd like a table for four people tomorrow at eight thirty.": "lines/en/restaurant_0.ogg",
+  "Grazie mille, arrivederci!": "lines/it/weather_2.ogg",
+  "Grazie, ciao!": "lines/it/knowledge_2.ogg",
+  "Great, and can you deliver it to my home?": "lines/en/store_1.ogg",
+  "Great, thank you!": "lines/en/travel_2.ogg",
+  "Guten Tag, haben Sie ein dreisitziges Sofa und was kostet es?": "lines/de/store_0.ogg",
+  "Hallo, hebben jullie een driezitsbank en wat kost die?": "lines/nl/store_0.ogg",
+  "Harika, eve teslimat yapıyor musunuz?": "lines/tr/store_1.ogg",
+  "Hello, do you have a three-seat sofa and how much is it?": "lines/en/store_0.ogg",
+  "Hi, I'm planning a trip to Rome, how much is five hundred dollars in euros?": "lines/en/travel_0.ogg",
+  "Hi, what's the weather like in New York tomorrow?": "lines/en/weather_0.ogg",
+  "Hi, who was Ada Lovelace?": "lines/en/knowledge_0.ogg",
+  "Hola, ¿tienen un sofá de tres plazas y cuánto cuesta?": "lines/es/store_0.ogg",
+  "Merci beaucoup, au revoir !": "lines/fr/weather_2.ogg",
+  "Merci, au revoir !": "lines/fr/knowledge_2.ogg",
+  "Merhaba, üç kişilik kanepeniz var mı ve fiyatı ne kadar?": "lines/tr/store_0.ogg",
+  "Mooi, kunnen jullie hem ook thuis bezorgen?": "lines/nl/store_1.ogg",
+  "Olá, têm um sofá de três lugares e quanto custa?": "lines/pt/store_0.ogg",
+  "Oui, je confirme, merci !": "lines/fr/restaurant_2.ogg",
+  "Parfait, et la livraison à domicile est possible ?": "lines/fr/store_1.ogg",
+  "Parfait, merci !": "lines/fr/travel_2.ogg",
+  "Perfect, hartelijk dank en tot ziens!": "lines/nl/store_2.ogg",
+  "Perfect, thank you very much and goodbye!": "lines/en/store_2.ogg",
+  "Perfeito, muito obrigado e adeus!": "lines/pt/store_2.ogg",
+  "Perfekt, vielen Dank und auf Wiedersehen!": "lines/de/store_2.ogg",
+  "Perfetto, e la consegna a domicilio è possibile?": "lines/it/store_1.ogg",
+  "Perfetto, grazie!": "lines/it/travel_2.ogg",
+  "Quanto fa trecentoquaranta per dodici?": "lines/it/knowledge_1.ogg",
+  "Super, und liefern Sie auch nach Hause?": "lines/de/store_1.ogg",
+  "Suur aitäh, head aega!": "lines/et/store_2.ogg",
+  "Suurepärane, kas te toote ka koju?": "lines/et/store_1.ogg",
+  "Sì, confermo, grazie!": "lines/it/restaurant_2.ogg",
+  "Tere, kas teil on kolmekohaline diivan ja kui palju see maksab?": "lines/et/store_0.ogg",
+  "Thanks, bye!": "lines/en/knowledge_2.ogg",
+  "Thanks, goodbye!": "lines/en/weather_2.ogg",
+  "The name is Smith.": "lines/en/restaurant_1.ogg",
+  "Très bien, merci beaucoup et au revoir !": "lines/fr/store_2.ogg",
+  "Va benissimo, grazie mille e arrivederci!": "lines/it/store_2.ogg",
+  "Výborně, a doručujete i domů?": "lines/cs/store_1.ogg",
+  "What's three hundred forty times twelve?": "lines/en/knowledge_1.ogg",
+  "Yes, please confirm, thank you!": "lines/en/restaurant_2.ogg",
+  "¡Perfecto, muchas gracias y adiós!": "lines/es/store_2.ogg",
+  "Çok teşekkürler, hoşça kalın!": "lines/tr/store_2.ogg",
+  "Ótimo, e fazem entrega ao domicílio?": "lines/pt/store_1.ogg",
+  "Świetnie, a czy dostarczacie do domu?": "lines/pl/store_1.ogg",
+  "Большое спасибо, до свидания!": "lines/ru/store_2.ogg",
+  "Здравствуйте, у вас есть трёхместный диван и сколько он стоит?": "lines/ru/store_0.ogg",
+  "Отлично, а доставка на дом возможна?": "lines/ru/store_1.ogg",
+  "नमस्ते, क्या आपके पास तीन सीटों वाला सोफ़ा है और उसकी कीमत क्या है?": "lines/hi/store_0.ogg",
+  "बढ़िया, क्या आप घर तक डिलीवरी करते हैं?": "lines/hi/store_1.ogg",
+  "बहुत धन्यवाद, नमस्ते!": "lines/hi/store_2.ogg",
+  "ありがとうございました、失礼します。": "lines/ja/store_2.ogg",
+  "いいですね、自宅まで配送してもらえますか？": "lines/ja/store_1.ogg",
+  "こんにちは、三人掛けのソファはありますか、おいくらですか？": "lines/ja/store_0.ogg",
+  "안녕하세요, 삼인용 소파가 있나요, 가격은 얼마인가요?": "lines/ko/store_0.ogg",
+  "정말 감사합니다, 안녕히 계세요!": "lines/ko/store_2.ogg",
+  "좋아요, 집까지 배송도 되나요?": "lines/ko/store_1.ogg"
+ },
+ "verified": {
+  "cs": {
+   "store": true
+  },
+  "de": {
+   "store": true
+  },
+  "en": {
+   "knowledge": false,
+   "restaurant": true,
+   "store": true,
+   "travel": true,
+   "weather": true
+  },
+  "es": {
+   "store": true
+  },
+  "et": {
+   "store": true
+  },
+  "fr": {
+   "knowledge": false,
+   "restaurant": false,
+   "store": true,
+   "travel": false,
+   "weather": false
+  },
+  "hi": {
+   "store": true
+  },
+  "it": {
+   "knowledge": false,
+   "restaurant": false,
+   "store": true,
+   "travel": true,
+   "weather": true
+  },
+  "ja": {
+   "store": true
+  },
+  "ko": {
+   "store": true
+  },
+  "nl": {
+   "store": true
+  },
+  "pl": {
+   "store": true
+  },
+  "pt": {
+   "store": true
+  },
+  "ru": {
+   "store": true
+  },
+  "tr": {
+   "store": true
+  }
+ }
+}

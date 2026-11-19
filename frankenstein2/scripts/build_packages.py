@@ -68,12 +68,11 @@ SOURCES = [s for c, (n24, n6) in OFFICIAL.items() for s in (_ky(c, "24l", n24), 
 # the ASR must understand it; the LLM alone calls the catalogue tool and answers in the language; one spoken
 # end-to-end session). Shown in the repository card.
 STATUS = {
-    "it": "tested end to end (tool-call suites, multi-session gates)",
-    "en": "tested end to end (tool-call suites, multi-session gates)",
-    "fr": "tested end to end (tool-call suites, multi-session gates)",
-    **{c: "language suite passed" for c in ("de", "es", "pt", "nl", "hi", "ja", "ko", "pl", "ru", "et")},
-    "tr": "language suite passed; the voice sometimes drops the end of a sentence",
-    "cs": "weak voice: the ASR understands it only in part; the LLM and the session work",
+    "it": "tested end to end (tool-call suites, multi-session gates, recorded samples)",
+    "en": "tested end to end (tool-call suites, multi-session gates, recorded samples)",
+    "fr": "tested end to end (tool-call suites, multi-session gates, recorded samples)",
+    **{c: "tested end to end (recorded samples: heard, answered, tool called)"
+       for c in ("de", "es", "pt", "nl", "hi", "ja", "ko", "pl", "ru", "et", "tr", "cs")},
 }
 
 

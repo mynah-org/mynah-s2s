@@ -6,8 +6,9 @@ caller's ("caller"): a voice map for the server (--voice-map). WAVs, scores and 
 Candidates: Kyutai's predefined voices of the language (native:<name>, --pocket-voices), the references of --refs
 (frankenstein2/lab/voice_refs.py: DIR/<lang>/*.wav), the shared references of --shared-refs (every language, e.g.
 DIR/_donated), and the server's own --voice references as a baseline (ranked, never picked while another candidate
-exists). --exclude drops references by name prefix (fleurs_: lab-only voices). With --screen N every candidate first
-says one line only, and the N best say them all (many candidates, little GPU time).
+exists). --exclude drops references by name prefix (fleurs_: lab-only voices). With --screen N every shared candidate
+first says one line only and the N best say them all (many candidates, little GPU time); the language's own voices
+always say them all.
 
     python frankenstein2/lab/voice_audition.py --pocket-voices SNAP --refs DIR [--langs ko,tr] --out DIR \\
         [server flags as for serve.py]
@@ -110,7 +111,8 @@ def main():  # pragma: no cover - model run
                                   "pcm": f32b64(resample_poly(y, 2, 3).astype(np.float32))}, "transcript", 120)["text"]
                 scored.append((char_ratio(h, lines[0]), -len(y), name, spec, baseline))
             scored.sort(reverse=True)
-            keep = {x[2] for x in scored[: a.screen]} | {n for n, _, b in cands if b}
+            # the screen's one line is noisy: the language's own voices (predefined, the model authors') always go on
+            keep = {x[2] for x in scored[: a.screen]} | {n for n, _, b in cands if b or not n.startswith("shared:")}
             print("SCREEN", lang, len(cands), "->", len(keep), json.dumps([(x[2], x[0]) for x in scored[:a.screen]]),
                   flush=True)
             cands = [c for c in cands if c[0] in keep]

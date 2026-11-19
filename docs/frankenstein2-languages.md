@@ -7,15 +7,20 @@ is the limit.
 - **15 languages have a talker voice with an open licence** that the ASR and the LLM also cover:
   - Kyutai's official seven: Italian, English, French, German, Spanish, Portuguese, Dutch;
   - eight community models: Korean, Turkish, Japanese, Czech, Hindi, Polish, Russian, Estonian.
-- **Tested end to end**, with tool-call suites and multi-session gates: Italian, English, French.
-- **The other twelve** passed the language suite (`make f2-lang-suite`), with one exception: Czech, whose voice the
-  ASR understands only in part. The suite checks three things per language:
-  - the talker speaks a question and the ears must understand it;
-  - the LLM alone must call the catalogue tool and answer in the language;
-  - one spoken end-to-end session must call the tool and answer with audio in the language.
-
-  It uses synthetic speech and one scenario per language: it shows the parts work together, not conversation
-  quality.
+- **All 15 pass the end-to-end test from recorded samples** (`make test-f2-e2e`, opt-in, GPU). A simulated caller's
+  recorded lines (`webui/f2/samples`, the store scenario, three lines per language) are streamed in real time, three
+  languages at once, while the talker's VRAM cache swaps language packages. Per language: the ASR heard the lines,
+  every line got a spoken answer, the catalogue tool was called. Each language speaks with its own voices
+  (`--voice-map`): Kyutai's predefined voices for the official seven, the community models' published voices
+  otherwise, picked by how well the ASR understands them (`frankenstein2/lab/voice_audition.py`).
+- **Italian, English and French** also have tool-call suites and multi-session gates, and the other demo scenarios
+  (weather, travel, knowledge, restaurant).
+- The streaming ASR sometimes drops the first word or two of a short turn ("Perfekt, vielen Dank" heard as "vielen
+  Dank"): sporadic, in any language, not caused by silence, turn resets or the stream's age (replays in
+  `frankenstein2/lab/asr_onset_replay.py`, `asr_silence_probe.py`). The answer still comes; the lost words are not
+  in the transcript.
+- The language suite (`make f2-lang-suite`) checks the parts one by one: the talker speaks a question and the ears
+  must understand it; the LLM alone must call the catalogue tool and answer in the language; one spoken session.
 - **Adding a language is copying a folder**, see "Adding a language" below.
 
 ## What each model covers
@@ -31,8 +36,8 @@ session language and never auto-detects.
 | adaptation-ready (needs fine-tuning) | el-GR, lt-LT, lv-LV, mt-MT, sl-SI, he-IL, th-TH, nn-NO |
 
 The turn-taking GRU in the same bundle was trained and evaluated on English (Tyger model card). In our tests it also
-ends Italian and French turns correctly, with a per-language threshold (`--ep-thr xx=...`). Any other language needs
-the same check.
+ends turns in the other 14 languages (the end-to-end test above), Italian with its own threshold (`--ep-thr it=0.85`);
+measuring its early and late endpoints per language is still to do.
 
 **Brain: Qwen3.5-4B (201 languages and dialects).** Source: [model card](https://huggingface.co/Qwen/Qwen3.5-4B).
 We measured tool-call quality in Italian, English and French only.
@@ -45,18 +50,18 @@ engine's default) and **6l** (6-layer students: smaller and faster, lower qualit
 | it | Italian | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | **tested** |
 | en | English | ready | Kyutai official (the base) | 24l, 6l | CC-BY-4.0 | **tested** |
 | fr | French | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | **tested** |
-| de | German | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
-| es | Spanish | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
-| pt | Portuguese | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
-| nl | Dutch | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | suite passed |
-| ko | Korean | ready | [seastar105/pocket-tts-korean-300m](https://huggingface.co/seastar105/pocket-tts-korean-300m) | 24l | CC-BY-4.0 | suite passed |
-| tr | Turkish | ready | [alperiox/pocket-tts-turkish](https://huggingface.co/alperiox/pocket-tts-turkish) | 24l, 6l | MIT | suite passed; the voice sometimes drops a sentence end |
-| ja | Japanese | ready | [takuma104/pocket-tts-ja-cc](https://huggingface.co/takuma104/pocket-tts-ja-cc) | 24l, 6l | CC-BY-4.0 | suite passed |
-| cs | Czech | broad | [vvolhejn/pocket-tts-czech](https://huggingface.co/vvolhejn/pocket-tts-czech) | 6l | CC-BY-4.0 | weak voice (ASR understands it in part) |
-| hi | Hindi | ready | [saryps-labs/pocket-tts-hindi](https://huggingface.co/saryps-labs/pocket-tts-hindi) | 6l | CC-BY-4.0 | suite passed |
-| pl | Polish | broad | [shefowl/pocket-tts-polish-6l](https://huggingface.co/shefowl/pocket-tts-polish-6l) | 6l | CC-BY-4.0 | suite passed |
-| ru | Russian | ready | [ArtShtorm/Shtorm-PocketTTS-RU](https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU) | 6l | CC-BY-4.0 | suite passed |
-| et | Estonian | broad | [cbentes/pocket-tts-estonian](https://huggingface.co/cbentes/pocket-tts-estonian) | 6l | CC-BY-SA-4.0 | suite passed |
+| de | German | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| es | Spanish | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| pt | Portuguese | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| nl | Dutch | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| ko | Korean | ready | [seastar105/pocket-tts-korean-300m](https://huggingface.co/seastar105/pocket-tts-korean-300m) | 24l | CC-BY-4.0 | tested end to end (recorded samples) |
+| tr | Turkish | ready | [alperiox/pocket-tts-turkish](https://huggingface.co/alperiox/pocket-tts-turkish) | 24l, 6l | MIT | tested end to end (recorded samples) |
+| ja | Japanese | ready | [takuma104/pocket-tts-ja-cc](https://huggingface.co/takuma104/pocket-tts-ja-cc) | 24l, 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| cs | Czech | broad | [vvolhejn/pocket-tts-czech](https://huggingface.co/vvolhejn/pocket-tts-czech) | 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| hi | Hindi | ready | [saryps-labs/pocket-tts-hindi](https://huggingface.co/saryps-labs/pocket-tts-hindi) | 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| pl | Polish | broad | [shefowl/pocket-tts-polish-6l](https://huggingface.co/shefowl/pocket-tts-polish-6l) | 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| ru | Russian | ready | [ArtShtorm/Shtorm-PocketTTS-RU](https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU) | 6l | CC-BY-4.0 | tested end to end (recorded samples) |
+| et | Estonian | broad | [cbentes/pocket-tts-estonian](https://huggingface.co/cbentes/pocket-tts-estonian) | 6l | CC-BY-SA-4.0 | tested end to end (recorded samples) |
 
 **Left out:**
 - Persian, Indonesian, Welsh, Gujarati and Tamil have community voices but are not in the ASR.

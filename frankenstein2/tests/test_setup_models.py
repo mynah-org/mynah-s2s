@@ -79,4 +79,4 @@ def test_package_card_rows_come_from_the_folders_manifests(tmp_path):
     assert [(r["code"], r["precision"]) for r in rows] == [("en", "base"), ("it", "int4"), ("it", "int8"), ("ko", "int4")]
     write_card(tmp_path, rows)
     card = (tmp_path / "README.md").read_text()
-    assert "| ko | language suite passed |" in card and "it@03" not in card
+    assert "| ko | tested end to end (recorded samples: heard, answered, tool called) |" in card and "it@03" not in card

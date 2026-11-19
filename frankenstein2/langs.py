@@ -91,11 +91,12 @@ BUILTIN = {x.code: x for x in (
 _REG: dict = dict(BUILTIN)
 
 
-# What was checked per language (docs/frankenstein2-languages.md): "e2e" = tool-call suites and multi-session gates;
-# "suite" = the language suite (talker -> ASR, LLM alone, one spoken session); "weak-voice" = the suite's voice check
-# failed (the ASR understands the talker only in part). A language folder added later is "unchecked".
-STATUS = {"it": "e2e", "en": "e2e", "fr": "e2e", "cs": "weak-voice",
-          **{c: "suite" for c in ("de", "es", "pt", "nl", "hi", "ja", "ko", "pl", "ru", "et", "tr")}}
+# What was checked per language (docs/frankenstein2-languages.md): "e2e" = the end-to-end test from recorded caller
+# samples passed (make test-f2-e2e: the caller's spoken lines heard by the ASR, every line answered aloud, the
+# catalogue tool called; several languages at once, the talker's packages swapping); it/en/fr also have the tool-call
+# suites and multi-session gates. "suite" = the language suite only (talker -> ASR, LLM alone, one spoken session);
+# "weak-voice" = the suite's voice check failed. A language folder added later is "unchecked".
+STATUS = {c: "e2e" for c in ("it", "en", "fr", "de", "es", "pt", "nl", "ko", "tr", "ja", "cs", "hi", "pl", "ru", "et")}
 
 
 def status(code: str) -> str:

@@ -66,3 +66,17 @@ def test_demo_script_one_sentence_per_line():
         for x in lines:
             inner = x.strip()[:-1]                                  # the line's own end mark aside
             assert not any(c in inner for c in ".?!。？！।"), (lang, x)
+
+
+def test_samples_sources_name_every_voice_and_licence():
+    from frankenstein2.lab.samples_sources import render
+    md = render({"it": {"default": "native:giovanni", "caller": "native:charles"},
+                 "et": {"default": "/x/refs/et/et_f_sobak.wav"}},
+                {"et/et_f_sobak": {"source": "https://huggingface.co/a/b/blob/main/voices/et_f_sobak.wav",
+                                   "licence": "CC-BY-SA-4.0"}},
+                {"et": {"source": "https://huggingface.co/c/d", "licence": "CC-BY-SA-4.0"}})
+    assert "| it | agent | giovanni | Kyutai Pocket TTS predefined voice" in md
+    assert "| it | caller | charles |" in md
+    assert "| et | agent | a published voice prompt | https://huggingface.co/a/b | CC-BY-SA-4.0 |" in md
+    assert "sobak" not in md
+    assert "| et | https://huggingface.co/c/d | CC-BY-SA-4.0 |" in md
