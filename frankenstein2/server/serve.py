@@ -60,6 +60,7 @@ def main():  # pragma: no cover - GPU
                     help="V2's single-session VoiceServer instead of the multi-session server")
     B.add_args(ap)
     a = ap.parse_args()
+    B.resolve_llm(a)
     td = Path(a.trace_dir)
     td.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()

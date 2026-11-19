@@ -381,6 +381,7 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--content", action="store_true")
     ap.add_argument("--budget-s", type=float, default=1e9)
     a = ap.parse_args()
+    B.resolve_llm(a)
     T0 = time.monotonic()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)

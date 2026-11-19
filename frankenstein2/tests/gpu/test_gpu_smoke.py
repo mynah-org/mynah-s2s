@@ -42,6 +42,13 @@ def find(root, rel):
     return hits[0]
 
 
+def heard_ok(heard, ref, min_ratio=0.75):
+    """Character-level match on letters only (compounds such as "morgenochtend" / "morgen ochtend" are the same)."""
+    import difflib
+    a, b = "".join(re.findall(r"\w", heard.lower())), "".join(re.findall(r"\w", ref.lower()))
+    return difflib.SequenceMatcher(None, a, b).ratio() >= min_ratio
+
+
 def words(s):
     return re.findall(r"\w+", s.lower())
 
@@ -72,9 +79,7 @@ def test_pocket_speaks_and_the_ears_hear_it(ears, lang):
     dur = len(x) / 24000
     assert np.isfinite(x).all() and 1.0 < dur < 10.0, dur
     heard = ears.transcribe(resample_poly(x, 2, 3).astype(np.float32), lang)   # unknown prompt -> auto
-    ref = words(SAY[lang])
-    hit = sum(1 for t in ref if t in set(words(heard)))
-    assert hit >= 0.6 * len(ref), (heard, SAY[lang])
+    assert heard_ok(heard, SAY[lang]), (heard, SAY[lang])
     del m
     torch.cuda.empty_cache()
 
@@ -120,5 +125,4 @@ def test_language_package_speaks_and_the_ears_hear_it(ears, lang):
     x = torch.cat(list(m.stream(voice, SAY[lang]))).float().cpu().numpy()
     assert np.isfinite(x).all() and 1.0 < len(x) / 24000 < 10.0
     heard = ears.transcribe(resample_poly(x, 2, 3).astype(np.float32), lang)
-    ref = words(SAY[lang])
-    assert sum(1 for t in ref if t in set(words(heard))) >= 0.6 * len(ref), (heard, SAY[lang])
+    assert heard_ok(heard, SAY[lang]), (heard, SAY[lang])

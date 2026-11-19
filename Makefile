@@ -10,7 +10,7 @@ GROUP ?=
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-all setup-tts setup-asr doctor ws-check corpus test-cpu test-gpu demo e2e-fc e2e-corpus multi multi-notools \
         multi-mixed custom serve int4-pack w8-pack client webui webui-gpu asr score reproduce \
-        f2-setup f2-serve f2-webui f2-traces test-f2 test-f2-torch test-f2-gpu
+        f2-setup f2-plan f2-serve f2-webui f2-traces test-f2 test-f2-torch test-f2-gpu
 
 help: ## show this list
 	@echo "mynah-s2s (work in progress)"
@@ -37,17 +37,22 @@ test-cpu: ## unit tests, no GPU or weights needed
 test-gpu: ## GPU tests (weights needed)
 	$(M) test-gpu
 
-# ---- Frankenstein v2: the recommended engine (multilingual, ~14 GB of weights, one GPU process) ----------------
+# ---- Frankenstein v2: the recommended engine (multilingual, one GPU process) -----------------------------------
 # F2_PYTHON: a Python with frankenstein2/requirements.txt installed (torch with CUDA for serving; only pytest +
-# numpy for test-f2). F2_ENV: the paths written by f2-setup.
+# numpy for test-f2). F2_ENV: the paths written by f2-setup (it records F2_LLM, read by the server).
+# F2_LLM: qwen4b (recommended: Qwen3.5-4B int8) | moe (Qwen3.6-35B-A3B NVFP4, Blackwell) | moe-awq (same MoE in
+# AWQ int4, any recent GPU) | nano (Nemotron Nano 9B v2, legacy). Sizes and memory: docs/frankenstein2.md.
 F2_PYTHON ?= python3
+F2_LLM ?= qwen4b
 F2_LANGS ?= it,en,fr
 F2_HF_HOME ?= $(HOME)/mynah-s2s/hf
 F2_ENV ?= $(F2_HF_HOME)/f2.env
 F2_TRACE_DIR ?= $(CURDIR)/.f2-traces
 F2_ARGS ?=
-f2-setup: ## Frankenstein v2: download ears + Qwen3.5-4B + Pocket TTS for F2_LANGS (default it,en,fr)
-	$(F2_PYTHON) frankenstein2/scripts/setup_models.py --langs $(F2_LANGS) --hf-home $(F2_HF_HOME)
+f2-setup: ## Frankenstein v2: download ears + the F2_LLM brain + Pocket TTS packages for F2_LANGS (it,en,fr)
+	$(F2_PYTHON) frankenstein2/scripts/setup_models.py --llm $(F2_LLM) --langs $(F2_LANGS) --hf-home $(F2_HF_HOME)
+f2-plan: ## Frankenstein v2: what f2-setup would download for F2_LLM / F2_LANGS, with sizes (nothing downloaded)
+	$(F2_PYTHON) frankenstein2/scripts/setup_models.py --llm $(F2_LLM) --langs $(F2_LANGS) --hf-home $(F2_HF_HOME) --dry-run
 f2-serve: ## Frankenstein v2 WebSocket server on :8772 (paths from F2_ENV, extra flags in F2_ARGS)
 	set -a; . "$(F2_ENV)"; set +a; PYTHONPATH="$(CURDIR)/v2/src" HF_HUB_OFFLINE=1 $(F2_PYTHON) \
 		frankenstein2/server/serve.py --port 8772 --trace-dir "$(F2_TRACE_DIR)" --pocket-preload "$$F2_LANGS" $(F2_ARGS)

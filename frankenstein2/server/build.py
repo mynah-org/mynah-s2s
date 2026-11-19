@@ -26,14 +26,20 @@ def add_args(ap) -> None:
     ap.add_argument("--lab-scripts", default=str(ROOT / "labs" / "multilingual" / "scripts"),
                     help="agentbench + multilingual lab scripts (tenant tools; default: this repository's copy)")
     ap.add_argument("--tenant", default="tenant_furniture.json")
-    ap.add_argument("--nano-dir", default="")
-    ap.add_argument("--llm-backend", default="qwen", choices=["nano", "qwen"],
+    ap.add_argument("--nano-dir", default=env("F2_NANO_DIR", ""))
+    ap.add_argument("--llm-preset", dest="llm_choice", default=env("F2_LLM", "qwen4b"),
+                    choices=["qwen4b", "moe", "moe-awq", "nano"],
+                    help="the brain (env F2_LLM): qwen4b = Qwen3.5-4B int8 (recommended), moe = Qwen3.6-35B-A3B "
+                         "(NVFP4 or AWQ checkpoint), nano = Nemotron Nano 9B v2 (legacy); sets --llm-backend and "
+                         "--qwen-mode unless they are given")
+    ap.add_argument("--llm-backend", default="", choices=["", "nano", "qwen"],
                     help="nano = Nemotron Nano 9B v2 in this process; qwen = a Qwen3.5 process (own inference engine "
                          "if --qwen-src points at it, else HF generate)")
     ap.add_argument("--qwen-python", default="")
     ap.add_argument("--qwen-src", default="", help="root that contains frankenstein2.llm.qwen_own (own engine)")
     ap.add_argument("--qwen-model", default=env("F2_QWEN_MODEL", ""), help="Qwen3.5 snapshot dir (env F2_QWEN_MODEL)")
-    ap.add_argument("--qwen-mode", default="int8", help="own engine weights: int8 (default) | bf16 | MoE AWQ 4-bit")
+    ap.add_argument("--qwen-mode", default="", help="own engine weights: int8 | bf16 (quantised checkpoints such as "
+                    "NVFP4 / AWQ are detected); default from --llm-preset")
     ap.add_argument("--qwen-slots", type=int, default=8)
     ap.add_argument("--nano-precision", default="int4-decode", choices=["bf16", "int4-decode"])
     ap.add_argument("--nano-graph", action="store_true", help="decode CUDA graph for the spoken reply (v1 G8)")
@@ -97,6 +103,17 @@ def add_args(ap) -> None:
     ap.add_argument("--talker-budget-ms", type=float, default=40.0)
     ap.add_argument("--child-env", action="append", default=[],
                     help="KEY=VALUE for the ears and talker processes (their own environments' caches / headers)")
+
+
+def resolve_llm(a) -> None:
+    """Fill --llm-backend / --qwen-mode from --llm-preset when they were not given (call right after parse_args)."""
+    ch = getattr(a, "llm_choice", "qwen4b")
+    if not getattr(a, "llm_backend", ""):
+        a.llm_backend = "nano" if ch == "nano" else "qwen"
+    if not getattr(a, "qwen_mode", ""):
+        a.qwen_mode = "int8" if ch == "qwen4b" else "bf16"
+    if ch == "qwen4b":
+        os.environ.setdefault("QWEN_OWN_LMHEAD", "int8")      # the measured default: int8 lm_head too
 
 
 def child_env(a, extra: dict | None = None) -> dict:

@@ -52,6 +52,7 @@ def main():  # pragma: no cover - model run
     ap.add_argument("--cut-s", type=float, default=52.0)
     ap.add_argument("--session-voice", default="")
     a = ap.parse_args()
+    B.resolve_llm(a)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
     t_load = time.monotonic()
