@@ -346,7 +346,14 @@ class InProcTalker:
                 if nx is None:
                     continue
                 L, j = nx
-                L.batch.start(ss, self._voice(L, j["voice"]), j["text"], j["after"])
+                try:
+                    L.batch.start(ss, self._voice(L, j["voice"]), j["text"], j["after"])
+                except ValueError as e:                     # a chunk that cannot fit a slot: skip it, say so
+                    self.box.put(ss, {"ev": "error", "ss": ss, "sid": j["sid"], "error": str(e)[:200]})
+                    if j.get("last"):
+                        self.box.put(ss, {"ev": "done", "ss": ss, "sid": j["sid"], "cancelled": False,
+                                          "audio_s": 0.0, "first_audio_ms": None})
+                    continue
                 self.cur[ss] = dict(j, L=L, t0=None, samples=0, start=now, first_ms=None)
                 did = True
         by_name: dict = {}

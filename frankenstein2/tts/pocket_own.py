@@ -132,7 +132,15 @@ def split_sentences(tok: _Tok, text: str, remove_semicolons: bool, max_tokens: i
         st = tok(s.strip())
         sb = _bounds(st, set(fb))
         sub = [(sb[i + 1] - sb[i], tok.decode(st[sb[i]:sb[i + 1]])) for i in range(len(sb) - 1)]
-        refined.extend(sub if len(sub) > 1 else [(n, s)])
+        for m_, t_ in (sub if len(sub) > 1 else [(n, s)]):
+            if m_ <= max_tokens:
+                refined.append((m_, t_))
+                continue
+            # no sentence or comma mark to cut at (e.g. Japanese 、。): cut by token count, so a chunk never needs
+            # more KV positions than a slot holds (PocketBatch.start)
+            tt = tok(t_.strip())
+            refined.extend((len(tt[i:i + max_tokens]), tok.decode(tt[i:i + max_tokens]))
+                           for i in range(0, len(tt), max_tokens))
     chunks, cur, cn = [], "", 0
     for n, s in refined:
         if cur == "":
@@ -876,9 +884,12 @@ class PocketBatch:
     def start(self, key, voice: _KV, text: str, after: int, gen=None):
         """A new row for one prepared text chunk (PocketOwn.chunks gives them with their frames-after-EOS)."""
         m = self.m
-        s = self.free.pop(0)
         ids = m.tok(text)
         n0 = voice.off
+        room = self.max_len - n0 - len(ids) - 1           # KV positions left for the frames after the prompt
+        if room < 1:
+            raise ValueError(f"segment longer than the KV slot ({n0} voice + {len(ids)} text >= {self.max_len})")
+        s = self.free.pop(0)
         self.kv[:, :, s, :n0] = voice.c[:, :, :n0].to(self.kv.dtype)
         kv = _SlotKV(self, s, n0)
         m._flow_step(kv, text_ids=ids, gen=gen)          # text prefill on this row alone
@@ -886,7 +897,7 @@ class PocketBatch:
         self.mpos[s] = -10 ** 9
         self.rows[key] = {"slot": s, "kv": kv, "x": torch.full((1, self.m.ldim), float("nan"), device=m.dev),
                           "st": {}, "moff": 0, "fade": True, "eos": None, "step": 0, "after": after, "gen": gen,
-                          "max_len": m.max_gen_len(len(ids)), "done": False}
+                          "max_len": min(m.max_gen_len(len(ids)), room), "done": False}
         return self.rows[key]
 
     def stop(self, key):

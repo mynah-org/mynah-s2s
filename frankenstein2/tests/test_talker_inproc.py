@@ -149,3 +149,42 @@ def test_ears_on_their_own_thread_open_hop_and_transcribe():
         assert t.err is None and t.ms
     finally:
         t.close()
+
+
+def test_a_chunk_too_long_for_a_slot_is_skipped_not_fatal():
+    t = make({})
+    t.preload("it")
+    lang = t.langs.get(t.names("it", None))
+    real_start = lang.batch.start
+
+    def start(key, voice, text, after):
+        if "LONG" in text:
+            raise ValueError("segment longer than the KV slot")
+        return real_start(key, voice, text, after)
+    lang.batch.start = start
+    it = PocketTalker(t, "s_it", "it")
+    it.say("e0t1s0", "LONG text", 0)
+    it.say("e0t1s1", "Ciao.", 0)
+    t._ahead = staticmethod(lambda c, now: -1.0)
+    evs = []
+    for _ in range(20):
+        t.run(40.0)
+        evs += t.poll("s_it")
+    kinds = [m["ev"] for m in evs]
+    assert "error" in kinds and "audio" in kinds                 # the next segment still speaks
+    assert sum(1 for m in evs if m["ev"] == "done") == 2
+
+
+def test_split_sentences_cuts_a_text_without_marks_by_tokens():
+    from frankenstein2.tts import pocket_own as P
+
+    class Tok:                                                   # one token per character
+        def __call__(self, s):
+            return [ord(c) for c in s]
+
+        def decode(self, ids):
+            return "".join(chr(i) for i in ids)
+    text = "締" * 210                                             # Japanese-like: no . , ; : to cut at
+    chunks = P.split_sentences(Tok(), text, False)
+    assert len(chunks) >= 5 and all(len(c) <= P.MAX_TOKENS + 2 for c in chunks)
+    assert "".join(chunks).replace(" ", "").replace(".", "").count("締") == 210
