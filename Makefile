@@ -10,7 +10,7 @@ GROUP ?=
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-all setup-tts setup-asr doctor ws-check corpus test-cpu test-gpu demo e2e-fc e2e-corpus multi multi-notools \
         multi-mixed custom serve int4-pack w8-pack client webui webui-gpu asr score reproduce \
-        f2-setup f2-plan f2-serve f2-webui f2-traces test-f2 test-f2-torch test-f2-gpu
+        f2-setup f2-plan f2-serve f2-webui f2-traces f2-lang-suite test-f2 test-f2-torch test-f2-gpu
 
 help: ## show this list
 	@echo "mynah-s2s (work in progress)"
@@ -66,6 +66,9 @@ test-f2: ## Frankenstein v2 unit tests: pure Python + numpy, no torch / GPU / we
 	$(F2_PYTHON) -m pytest -q frankenstein2/tests
 test-f2-torch: ## Frankenstein v2 unit tests + the torch CPU tests on tiny random weights
 	$(F2_PYTHON) -m pytest -q frankenstein2/tests --torch
+f2-lang-suite: ## Frankenstein v2 language suite (opt-in, GPU): talker, LLM and e2e per language in F2_LANGS
+	set -a; . "$(F2_ENV)"; set +a; PYTHONPATH="$(CURDIR)/v2/src" HF_HUB_OFFLINE=1 $(F2_PYTHON) frankenstein2/lab/lang_suite.py \
+		--langs "$(F2_LANGS)" --out "$(F2_TRACE_DIR)/lang-suite-$$(date +%Y%m%d-%H%M%S)" $(F2_ARGS)
 test-f2-gpu: ## Frankenstein v2 unit tests + GPU smoke tests on the real models (after f2-setup)
 	set -a; . "$(F2_ENV)"; set +a; $(F2_PYTHON) -m pytest -q frankenstein2/tests --gpu
 

@@ -13,7 +13,7 @@ Modules of an opted-out tier are not even imported (torch is never loaded by the
 import os
 from pathlib import Path
 
-TORCH_MODULES = {"test_qwen_own.py", "test_jump_forward.py"}
+TORCH_MODULES = {"test_qwen_own.py", "test_jump_forward.py", "test_talker_inproc.py"}
 HERE = Path(__file__).parent
 
 

@@ -1,7 +1,8 @@
 # Frankenstein v2: the recommended engine
 
 **Status: experimental, work in progress.** Frankenstein v2 is the engine we recommend for working with this
-repository today. It is multilingual and light: about 14 GB of open weights for three languages, one GPU process.
+repository today. It is multilingual and light: with Qwen3.5-4B and three languages, about 12 GB of open weights
+and 15–17 GB of GPU memory, in one GPU process.
 
 It is a full-duplex voice agent assembled from separate open models, with no training:
 
@@ -9,7 +10,7 @@ It is a full-duplex voice agent assembled from separate open models, with no tra
 |---|---|---|
 | **ears**: streaming transcript + turn-taking (end of turn, barge-in, backchannel) | [NVIDIA Nemotron 3.5 ASR Streaming 0.6B](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) with the [Tyger](https://huggingface.co/nineninesix/tyger) turn-taking GRU (one bundle) | OpenMDW-1.1 |
 | **brain**: the reply and the tool calls | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), int8 weights on our own inference engine | Apache-2.0 |
-| **talker**: the voice | [Kyutai Pocket TTS](https://huggingface.co/kyutai/pocket-tts), 24-layer language models, voice cloning from one reference clip, 4-bit weights | CC-BY-4.0 |
+| **talker**: the voice | [Kyutai Pocket TTS](https://huggingface.co/kyutai/pocket-tts), voice cloning from one reference clip; each language a 4-bit delta on a shared English base | CC-BY-4.0 (community languages: their own open licence) |
 
 The VoiceChat engine (`v2/`, one 11B duplex model, English only) and Frankenstein v1 (`frankenstein/`) stay in
 the repository unchanged. Frankenstein v2 lives in `frankenstein2/`. Its design notes are in
@@ -17,14 +18,63 @@ the repository unchanged. Frankenstein v2 lives in `frankenstein2/`. Its design 
 
 ## Why it is the default
 
-- **Languages.** Italian, English and French are wired and tested end to end. More are possible with the same
-  models: see [`frankenstein2-languages.md`](frankenstein2-languages.md).
+- **Languages.** 15 languages have a voice (Kyutai's seven plus eight community models), and adding one is
+  copying a folder. Italian, English and French are tested end to end: see
+  [`frankenstein2-languages.md`](frankenstein2-languages.md).
 - **Light.** One process holds the three models (`--runtime single`), several sessions share them, and each session
   has its own language and voice.
 - **Tools are first-class.** Calls are parsed from the LLM's own format and run asynchronously. Arguments are checked
   against what the caller said. Every call is traced (see below).
 - **Inspectable.** Every decision is an event with a session, turn and call id. The events go to a short log, a
   SQLite store and the web UI's debug view.
+
+## Choosing the brain
+
+Three LLMs run on the engine. `F2_LLM` (Make) or `--llm-preset` (server) picks one:
+
+| `F2_LLM` | model | download | GPU memory, whole engine* | status |
+|---|---|---|---|---|
+| `qwen4b` (**recommended**) | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), int8 weights + int8 output head on our engine | 8.7 GB | ~17 GB allocated, ~20 GB reserved | the default: tool-call suites and the multi-session gates run on it |
+| `moe` | [Qwen3.6-35B-A3B NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) (35B parameters, 3B active per token; FP4 weights need a Blackwell GPU) | 21.8 GB | ~30 GB allocated, 32–38 GB reserved | runs end to end with tool calls; candidate for more varied small talk, **not evaluated yet** |
+| `moe-awq` | the same MoE as [AWQ int4](https://huggingface.co/cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit), for GPUs without FP4 | 23.3 GB | similar to `moe` (not measured end to end) | loads and decodes in benchmarks; **not verified end to end** |
+| `nano` | [Nemotron Nano 9B v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2), int4 decode copies | 16.6 GB | ~32 GB (Nano alone ~22 GB) | legacy (the first brain of this engine); not re-tested in the current runtime |
+
+\* The whole engine: ears, LLM with 12 session slots of 8k context, talker with three languages. These are CUDA
+allocator figures (`torch.cuda.memory_allocated` / `memory_reserved`) from our runs. They depend on the model sizes
+and slot counts, not on the GPU model.
+
+**Why `qwen4b`.** In our tool suites it calls tools as well as Nano 9B. It is the smallest of the three, and a
+24 GB GPU holds the whole engine. Its decode is also the cheapest per session, and the engine batches the decode
+across sessions.
+
+**Why try `moe`.** With only 3B active parameters it decodes at a cost close to a 3–4B model, but it has 35B
+parameters of knowledge. It may give more varied, natural small talk. Nobody has evaluated that yet; it is the
+next thing to measure. It needs 40–48 GB.
+
+```bash
+make f2-plan F2_LLM=moe              # what it downloads, with sizes
+make f2-setup F2_LLM=moe             # then make f2-serve / f2-webui as usual (the env file records F2_LLM)
+```
+
+## Swappable parts
+
+The brain and the talker are plugins behind small interfaces: `llm/base.py` (submit / cancel / poll) and the talker
+protocol (say / cancel / poll audio). Other models can replace them without touching the duplex control.
+
+- **Brain:** the presets above.
+- **Talker: Kyutai Pocket TTS is the default, and the one we recommend.** It is small and cheap per session. It
+  clones a voice from one clip and runs many languages as small deltas on one shared base (see the language page).
+  Other talkers we used in this project:
+  - **Sophon Flash** (Qwen3-TTS, 12 Hz codec): the talker of Frankenstein v1, good zero-shot clones in IT / FR /
+    EN. It has a process adapter here (`--runtime procs --talker flash`), but it is not wired into the
+    one-process runtime and not measured in the current gates.
+  - **VoxCPM2**: tried in the lab, not wired.
+
+  Adding a talker means implementing the protocol (`tts/procs.py`, `runtime.py` `InProcTalker`). We do not plan
+  our own runtime for these until one is needed.
+- **Ears: not swappable today.** The turn-taking GRU (end of turn, barge-in, backchannel) was trained on the
+  Nemotron encoder's layer-15 features. The same encoder pass feeds the transcript and the duplex control, so
+  another ASR would mean retraining the controller.
 
 ## Quick start
 
@@ -127,8 +177,9 @@ A plain `pytest frankenstein2/tests` runs the first tier on any machine. The GPU
 
 ## Limits (read before relying on it)
 
-- Languages beyond it / en / fr are not wired yet (holding phrases, number normaliser, prompts): see the language
-  page.
+- Languages beyond it / en / fr have their voice checked (the talker speaks, the ears understand it) but no
+  conversation gate yet. Their numbers are read as digits (no normaliser), and their fixed phrases were not
+  reviewed by native speakers.
 - The turn-taking GRU was trained on English. Italian and French work in our tests with per-language end-of-turn
   thresholds (`--ep-thr it=0.85`).
 - Concurrency: several sessions share one GPU. How many stay in real time depends on the GPU. We have not published

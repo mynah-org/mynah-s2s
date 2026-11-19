@@ -17,13 +17,15 @@ open models, with no training:
 - **brain:** Qwen3.5-4B with tools, on our own int8 inference engine;
 - **talker:** Kyutai Pocket TTS with voice cloning.
 
-It needs about 14 GB of weights for three languages and runs as one GPU process that several sessions share, each
-in its own language.
+With Qwen3.5-4B and three languages it needs about 12 GB of downloads and about 15–17 GB of GPU memory. It runs
+as one GPU process that several sessions share, each in its own language. A larger MoE brain is optional (see
+"Choosing the brain" in the docs).
 
-- **Languages:** Italian, English and French are tested end to end. German, Spanish, Portuguese and Dutch have
-  official models for all three parts and are not wired yet. Community voices exist for a few more. The ASR covers
-  40 locales and the LLM 201 languages; the talker sets the limit. Matrix and how to add one:
-  [`docs/frankenstein2-languages.md`](docs/frankenstein2-languages.md).
+- **Languages:** 15 with an open-licence voice that the ASR and the LLM also cover. They are Kyutai's official
+  seven (it, en, fr, de, es, pt, nl) and eight community models (ko, tr, ja, cs, hi, pl, ru, et). Italian, English
+  and French are tested end to end.
+- **Language folder:** each language is a small delta against one English base. Adding one is copying its folder;
+  the running server picks it up. Details: [`docs/frankenstein2-languages.md`](docs/frankenstein2-languages.md).
 - **Tools:** calls run asynchronously and the agent keeps the caller informed: a holding phrase, a reminder when a
   call is slow, and an apology when a call times out (10 s by default).
 - **Tracing:** short per-event log lines, a per-server SQLite store of events and spans with durations, and a

@@ -20,6 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "frankenstein"))
 
 
+def language_list(res) -> list:
+    """The served languages with their names, for the web UI's selector."""
+    from frankenstein2 import langs
+    from frankenstein2.server.engine import served_languages
+    return [{"code": c, "name": langs.get(c).name, "tested": langs.get(c).tested} for c in served_languages(res)]
+
+
 def observability(a, td: Path):
     """The server's trace listeners: the SQLite store and the short event log (frankenstein2/obs.py)."""
     import logging
@@ -91,7 +98,7 @@ def main():  # pragma: no cover - GPU
         from frankenstein2.server.multi import MultiServer
         srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
                           max_sessions=a.max_sessions, idle_timeout_s=a.idle_timeout,
-                          profile=f"frankenstein2-{a.llm_backend}")
+                          profile=f"frankenstein2-{a.llm_backend}", languages=lambda: language_list(res))
         try:
             asyncio.run(srv.serve(a.host, a.port, ready=lambda: print(
                 f"READY port={a.port} " + json.dumps(loads, default=str), flush=True)))

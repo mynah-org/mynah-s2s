@@ -72,7 +72,7 @@ def main():  # pragma: no cover - model run
         res.languages = pocket.catalog.languages
     sched = a._single["sched"]
     print("LOADED", json.dumps({"load_s": round(time.monotonic() - t_load, 1), **sched.mem(), "rss_gb": rss_gb(),
-                                "talker": pocket.langs.stats()}, default=str), flush=True)
+                                "talker": pocket.langs.stats(), "loads": pocket.langs.loads}, default=str), flush=True)
     port = 8793
     srv = MultiServer(lambda sid, lang, voice, prompt, sink: make_pipeline(res, sid, lang, voice, prompt, sink),
                       max_sessions=a.wave_n + 2)

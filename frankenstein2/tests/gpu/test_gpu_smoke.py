@@ -129,9 +129,10 @@ def test_language_package_speaks_and_the_ears_hear_it(ears, lang):
     delta on the family's shared English base, Mimi from the base checkpoint. The ears must understand it."""
     import numpy as np
     from scipy.signal import resample_poly
-    from pocket_swap.package import load_package
     from frankenstein2.tts.catalog import PackageCatalog
-    from frankenstein2.tts.pocket_own import BaseBackbone, PocketOwn
+    from frankenstein2.tts.pocket_own import BaseBackbone, PocketOwn, _pocket_swap
+    _pocket_swap()                                   # puts the repository's pocket_swap on sys.path
+    from pocket_swap.package import load_package
     if lang == "none":
         pytest.skip("no packages (F2_POCKET_PACKAGES)")
     cat = PackageCatalog(PKG_ROOT, os.environ.get("F2_POCKET_PRECISION", "int4"))

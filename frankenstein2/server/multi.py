@@ -71,8 +71,12 @@ class SessionRunner(threading.Thread):
 
 
 class MultiServer:
-    def __init__(self, make_pipeline, max_sessions: int = 4, idle_timeout_s: float = 60.0, profile: str = "f2"):
+    def __init__(self, make_pipeline, max_sessions: int = 4, idle_timeout_s: float = 60.0, profile: str = "f2",
+                 languages=None):
+        """languages: callable -> [{"code", "name", "tested"}], the languages a session may ask for (sent with the
+        health probe's server.ready, so the web UI lists them)."""
         self.make_pipeline, self.max_sessions, self.idle = make_pipeline, max_sessions, idle_timeout_s
+        self.languages = languages
         self.profile = profile
         self.active: dict = {}
         self.lock = threading.Lock()
@@ -81,8 +85,13 @@ class MultiServer:
         path = getattr(getattr(ws, "request", None), "path", None) or getattr(ws, "path", "/")
         qs = parse_qs(urlparse(path).query)
         if qs.get("probe", ["0"])[0] == "1":
-            await ws.send(json.dumps({"type": "server.ready", "sessions": len(self.active),
-                                      "max_sessions": self.max_sessions}))
+            msg = {"type": "server.ready", "sessions": len(self.active), "max_sessions": self.max_sessions}
+            if self.languages is not None:
+                try:
+                    msg["languages"] = list(self.languages())
+                except Exception:  # noqa: BLE001 - the probe must answer anyway
+                    pass
+            await ws.send(json.dumps(msg, ensure_ascii=False))
             await ws.close(code=1000, reason="health probe")
             return
         verbose = qs.get("verbose", ["0"])[0] == "1"

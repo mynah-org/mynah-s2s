@@ -23,6 +23,7 @@ async function boot() {
   state.gpuConfigured = Boolean(config.gpu_configured && config.v2_reachable !== false);
   state.wsPort = config.ws_port ? String(config.ws_port) : null;
   state.engine = config.engine || "voicechat";
+  fillLanguages(config.languages);
   updateEngineFields();
   if (!config.gpu_configured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · not configured"; }
   else if (!state.gpuConfigured) { [...$("transportSelect").options].find((o) => o.value === "gpu").textContent = "GPU · offline"; }
@@ -204,6 +205,17 @@ function stopSample() { if (state.sampleRun) state.sampleRun.cancelled = true; s
 function playPcm(buffer) { if (!state.audioOut) state.audioOut = new AudioContext({sampleRate:22050}); const ctx = state.audioOut; if (ctx.state === "suspended") ctx.resume(); const pcm = new Int16Array(buffer); const data = ctx.createBuffer(1, pcm.length, 22050); const channel = data.getChannelData(0); for (let i=0;i<pcm.length;i++) channel[i] = pcm[i] / 32768; const src = ctx.createBufferSource(); src.buffer = data; src.connect(ctx.destination); state.nextPlayback = Math.max(state.nextPlayback, ctx.currentTime) + data.duration; src.start(Math.max(ctx.currentTime, state.nextPlayback - data.duration)); (state.sources = state.sources || []).push(src); src.onended = () => { state.sources = (state.sources || []).filter((x) => x !== src); }; }
 // Frankenstein engine: a barge-in cancels the reply server-side and sends "audio.flush": drop what is still queued
 function flushPlayback() { (state.sources || []).forEach((src) => { try { src.stop(); } catch (_) {} }); state.sources = []; if (state.audioOut) state.nextPlayback = state.audioOut.currentTime; }
+// The engine's served languages (Frankenstein v2: the talker's language folder), tested ones marked; the static list
+// in index.html stays when the server does not send one.
+function fillLanguages(list) {
+  const sel = $("languageSelect"); if (!sel || !Array.isArray(list) || !list.length) return;
+  const keep = sel.value; sel.innerHTML = "";
+  [...list].sort((a, b) => (b.tested - a.tested) || a.name.localeCompare(b.name)).forEach((l) => {
+    const o = document.createElement("option"); o.value = l.code;
+    o.textContent = `${l.name} (${l.code})${l.tested ? "" : " · preview"}`; sel.append(o);
+  });
+  if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+}
 function fillVoices(list) { const sel = $("voiceSelect"); if (!sel || !Array.isArray(list)) return; const keep = sel.value; sel.innerHTML = '<option value="">Default</option>'; list.forEach((v) => { const o = document.createElement("option"); o.value = v; o.textContent = v; sel.append(o); }); sel.value = keep; }
 function speakDemo(text) { if (state.transport !== "demo" || !window.speechSynthesis || !text) return; window.speechSynthesis.cancel(); const voices = window.speechSynthesis.getVoices(); const voice = voices.find((v) => /^en-US$/i.test(v.lang) && /Samantha|Alex|Google US English/i.test(v.name)) || voices.find((v) => /^en(-|_)/i.test(v.lang)); const utterance = new SpeechSynthesisUtterance(text); utterance.lang = "en-US"; if (voice) utterance.voice = voice; utterance.rate = .96; utterance.pitch = 1; window.speechSynthesis.speak(utterance); }
 function trySuggestion() { if (!state.ws || state.ws.readyState !== 1) { setMicNote("Connect first, then run the guided example."); setSession("Connect first"); return; } if (state.transport !== "demo") { if (selectedSample()) playSample(); else setMicNote("Choose a guided sample in INPUT, or start the microphone."); return; } state.ws.send(JSON.stringify({type:"demo.request", scenario:currentScenario().id})); setMicNote("Running guided example — watch the activity stream."); setSession("Agent working", true); }

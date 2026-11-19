@@ -93,9 +93,11 @@ class StaticHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/config":
             configured = bool(self.server.v2_ws)
+            reachable, ready = probe_v2_info(self.server.v2_ws) if configured else (False, {})
             self._json({
                 "gpu_configured": configured,
-                "v2_reachable": probe_v2(self.server.v2_ws) if configured else False,
+                "v2_reachable": reachable,
+                "languages": ready.get("languages") or [],
                 "profile": self.server.profile,
                 "engine": self.server.engine,
                 "profile_label": profile_label(self.server.profile),
@@ -163,6 +165,19 @@ def profile_label(profile: str) -> str:
 
 
 def probe_v2(v2_ws: str | None) -> bool:
+    return bool(probe_v2_info(v2_ws)[0])
+
+
+def probe_v2_info(v2_ws: str | None) -> tuple:
+    """(reachable, server.ready payload or {}): the payload may list the engine's languages."""
+    if not v2_ws:
+        return False, {}
+    box: dict = {}
+    ok = _probe(v2_ws, box)
+    return ok, box.get("payload", {})
+
+
+def _probe(v2_ws: str | None, box: dict) -> bool:
     """Check the V2 WebSocket protocol without creating a model session.
 
     The TCP fallback is intentionally kept for minimal/demo environments, but a
@@ -185,6 +200,7 @@ def probe_v2(v2_ws: str | None) -> bool:
             async with websockets.connect(probe_url, open_timeout=0.4, close_timeout=0.4, max_size=1 << 20) as ws:
                 message = await asyncio.wait_for(ws.recv(), timeout=0.6)
                 payload = json.loads(message)
+                box["payload"] = payload
                 return payload.get("type") == "server.ready" and not payload.get("unhealthy")
 
         return bool(asyncio.run(check()))

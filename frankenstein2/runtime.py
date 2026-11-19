@@ -182,6 +182,7 @@ class InProcTalker:
         self.ahead_s = ahead_s
         self.ready = {"ev": "ready", "inproc": True}
         self.lock = threading.Lock()
+        self.open_lock = threading.Lock()      # PocketTalker's client protocol (one "voice" exchange at a time)
         self.voice_ms: list = []        # non-default voice states computed on the scheduler (rare)
         self.waits: list = []           # per raw text: ms from request to its first segment if its language was
                                         # not resident when requested (load + queue), else 0

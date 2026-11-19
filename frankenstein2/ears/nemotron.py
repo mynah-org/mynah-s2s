@@ -427,4 +427,8 @@ class NemotronASR:
         return [self.tokenizer.id_to_token(i) for i in ids]
 
     def prompt_id(self, lang: str) -> int:
-        return int(self.prompts.get(lang, {"auto": 101, "en": 0, "it": 15, "fr": 8}.get(lang, 101)))
+        if lang in self.prompts:
+            return int(self.prompts[lang])
+        from .. import langs                     # a language.json's asr_locale (e.g. "sv-SE"), else auto-detect
+        loc = langs.get(lang).asr_locale
+        return int(self.prompts.get(loc, {"auto": 101, "en": 0, "it": 15, "fr": 8}.get(lang, 101)))

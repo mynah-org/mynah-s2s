@@ -80,3 +80,25 @@ def test_two_languages_concurrently():
     assert len(a_it) > 0 and len(a_en) > 0
     hist = {p.lang: p.conv.messages for p, _ in made.values()}
     assert hist["it"][-1]["content"] == REPLY["it"] and hist["en"][-1]["content"] == REPLY["en"]
+
+
+def test_health_probe_lists_the_served_languages():
+    make, _ = build()
+    langs = [{"code": "it", "name": "Italian", "tested": True}, {"code": "ko", "name": "Korean", "tested": False}]
+    srv = MultiServer(make, max_sessions=2, languages=lambda: langs)
+
+    async def main():
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        ready = asyncio.Event()
+        task = asyncio.create_task(srv.serve("127.0.0.1", port, ready=ready.set))
+        await asyncio.wait_for(ready.wait(), 5)
+        async with websockets.connect(f"ws://127.0.0.1:{port}/v1/session?probe=1") as ws:
+            msg = json.loads(await ws.recv())
+        task.cancel()
+        return msg
+    msg = asyncio.run(main())
+    assert msg["type"] == "server.ready" and msg["languages"] == langs

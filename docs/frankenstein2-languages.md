@@ -1,12 +1,16 @@
 # Frankenstein v2: languages
 
 A session has one language, chosen at start. The ears, the LLM and the talker are separate models, so a language
-works when all three cover it and the engine has its small per-language pieces. In short:
+works when all three cover it. The ASR covers 40 locales and Qwen3.5 201 languages; the talker, Kyutai Pocket TTS,
+is the limit.
 
-- **Tested end to end:** Italian, English, French.
-- **Possible with official models, not wired yet:** German, Spanish, Portuguese, Dutch.
-- **Possible with community voices, not verified:** Czech, Polish, Estonian, Hindi, Korean.
-- **Not possible with this ASR:** languages outside its 40 locales.
+- **15 languages have a talker voice with an open licence** that the ASR and the LLM also cover:
+  - Kyutai's official seven: Italian, English, French, German, Spanish, Portuguese, Dutch;
+  - eight community models: Korean, Turkish, Japanese, Czech, Hindi, Polish, Russian, Estonian.
+- **Tested end to end**, with tool-call suites and multi-session gates: Italian, English, French.
+- **The rest** is checked for the voice only: a GPU test has the talker speak a sentence and the ears must
+  understand it. The conversation is not tested yet.
+- **Adding a language is copying a folder**, see "Adding a language" below.
 
 ## What each model covers
 
@@ -21,73 +25,119 @@ session language and never auto-detects.
 | adaptation-ready (needs fine-tuning) | el-GR, lt-LT, lv-LV, mt-MT, sl-SI, he-IL, th-TH, nn-NO |
 
 The turn-taking GRU in the same bundle was trained and evaluated on English (Tyger model card). In our tests it also
-ends Italian and French turns correctly, with a per-language threshold. Any other language needs the same check.
+ends Italian and French turns correctly, with a per-language threshold (`--ep-thr xx=...`). Any other language needs
+the same check.
 
 **Brain: Qwen3.5-4B (201 languages and dialects).** Source: [model card](https://huggingface.co/Qwen/Qwen3.5-4B).
-We measured the tool-call quality in Italian, English and French only.
+We measured tool-call quality in Italian, English and French only.
 
-**Talker: Kyutai Pocket TTS.**
+**Talker: Kyutai Pocket TTS.** Two model families share one architecture per family: **24l** (24 layers, the
+engine's default) and **6l** (6-layer students: smaller and faster, lower quality).
 
-- **Official** ([kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts), CC-BY-4.0): English, French, German,
-  Portuguese, Italian, Spanish, Dutch. Each has a 6-layer and a 24-layer model; the engine uses the 24-layer ones.
-  The voice-cloning repository is gated (accept the terms); tokenizers come from
-  [kyutai/pocket-tts-without-voice-cloning](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning).
-  Reference voices: [kyutai/tts-voices](https://huggingface.co/kyutai/tts-voices). Each folder has its own licence;
-  some are non-commercial. The setup script takes one CC-BY-4.0 clip.
-- **Community models** listed on Kyutai's model card, not by Kyutai, not tested here:
-  [Czech](https://huggingface.co/vvolhejn/pocket-tts-czech), [Hindi](https://huggingface.co/saryps-labs/pocket-tts-hindi),
-  [Korean](https://huggingface.co/seastar105/pocket-tts-korean-300m), [Persian](https://huggingface.co/mehdi-hf/pocket-tts-farsi),
-  [Indonesian](https://huggingface.co/anak10thn/pocket-tts-indonesian), [Estonian](https://huggingface.co/cbentes/pocket-tts-estonian),
-  [Welsh](https://huggingface.co/EryriLabs/pocket-tts-cymraeg), [Polish](https://huggingface.co/shefowl/pocket-tts-polish-6l).
-  For more, search the Hub for "pocket-tts" and check each licence.
+| code | language | ASR tier | talker source | family | licence | status |
+|---|---|---|---|---|---|---|
+| it | Italian | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | **tested** |
+| en | English | ready | Kyutai official (the base) | 24l, 6l | CC-BY-4.0 | **tested** |
+| fr | French | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | **tested** |
+| de | German | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
+| es | Spanish | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
+| pt | Portuguese | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
+| nl | Dutch | ready | Kyutai official | 24l, 6l | CC-BY-4.0 | voice checked |
+| ko | Korean | ready | [seastar105/pocket-tts-korean-300m](https://huggingface.co/seastar105/pocket-tts-korean-300m) | 24l | CC-BY-4.0 | voice check pending |
+| tr | Turkish | ready | [alperiox/pocket-tts-turkish](https://huggingface.co/alperiox/pocket-tts-turkish) | 24l, 6l | MIT | voice check pending |
+| ja | Japanese | ready | [takuma104/pocket-tts-ja-cc](https://huggingface.co/takuma104/pocket-tts-ja-cc) | 24l, 6l | CC-BY-4.0 | voice check pending |
+| cs | Czech | broad | [vvolhejn/pocket-tts-czech](https://huggingface.co/vvolhejn/pocket-tts-czech) | 6l | CC-BY-4.0 | voice check pending |
+| hi | Hindi | ready | [saryps-labs/pocket-tts-hindi](https://huggingface.co/saryps-labs/pocket-tts-hindi) | 6l | CC-BY-4.0 | voice check pending |
+| pl | Polish | broad | [shefowl/pocket-tts-polish-6l](https://huggingface.co/shefowl/pocket-tts-polish-6l) | 6l | CC-BY-4.0 | voice check pending |
+| ru | Russian | ready | [ArtShtorm/Shtorm-PocketTTS-RU](https://huggingface.co/ArtShtorm/Shtorm-PocketTTS-RU) | 6l | CC-BY-4.0 | voice check pending |
+| et | Estonian | broad | [cbentes/pocket-tts-estonian](https://huggingface.co/cbentes/pocket-tts-estonian) | 6l | CC-BY-SA-4.0 | voice check pending |
 
-## Combinations
+**Left out:**
+- Persian, Indonesian, Welsh, Gujarati and Tamil have community voices but are not in the ASR.
+- A Persian and a Japanese model are non-commercial (CC-BY-NC).
+- Arabic, Vietnamese, Ukrainian, Chinese, Swedish and others are in the ASR, but we found no Pocket voice for them.
+- Several community repositories are ONNX / CoreML / MLX exports only, which the torch runtime does not load.
 
-| language | ears (locale tier) | LLM | talker | engine pieces | status |
-|---|---|---|---|---|---|
-| Italian | it-IT, ready | ✓ | official | ✓ | **tested** |
-| English | en-US / en-GB, ready | ✓ | official | ✓ | **tested** |
-| French | fr-FR / fr-CA, ready | ✓ | official | ✓ | **tested** |
-| German | de-DE, ready | ✓ | official | partial (holding, reminder, apology) | possible, not wired |
-| Spanish | es-ES / es-US, ready | ✓ | official | partial (holding, reminder, apology) | possible, not wired |
-| Portuguese | pt-PT / pt-BR, ready | ✓ | official | – | possible, not wired |
-| Dutch | nl-NL, ready | ✓ | official | – | possible, not wired |
-| Czech, Polish, Estonian | broad coverage | ✓ | community | – | not verified |
-| Hindi, Korean | ready | ✓ | community | – | not verified |
-| Persian, Indonesian, Welsh | not in the ASR | ✓ | community | – | not possible with this ASR |
-| Turkish, Russian, Arabic, Japanese, Vietnamese, Ukrainian, Chinese, … | ready / broad | ✓ | none found | – | needs a TTS |
+The fixed phrases of the community languages (holding, reminder, apology, backchannel) were written by us, not by
+native speakers. Each one can be corrected in its `language.json` without touching code.
 
-"Community" means: the model exists, but nobody has checked here that our Pocket runtime loads it (some are 6-layer
-or a different size) or how it sounds.
+## The language folder
 
-## Downloading languages
+The talker reads every language from one folder. The engine scans it; there is no configuration:
 
-```bash
-python frankenstein2/scripts/setup_models.py --langs it,en,fr              # default
-python frankenstein2/scripts/setup_models.py --langs de,es,pt,nl --dry-run # files and sizes, nothing downloaded
+```
+pocket-tts-deltas/
+  en/
+    language.json
+    24l/base/                  English 24-layer, verbatim: the shared base of every 24l language (and English)
+    6l/base/                   English 6-layer: the base of the 6l languages
+  it/
+    language.json              name, ASR locale, fixed phrases
+    24l/int4/  24l/int8/  24l/bf16/     Italian as a delta against en/24l/base, at three precisions
+    6l/int4/   6l/int8/   6l/bf16/      the same for the 6-layer family
+  cs/
+    language.json
+    6l/int4/ ...               a language that only exists as a 6-layer model
 ```
 
-Each official 24-layer Pocket language is 0.7–0.9 GB. The ears bundle (about 2.4 GB) and the LLM (about 8.7 GB
-in bf16 on disk; the engine keeps int8 weights) are shared by every language.
+- **Packages.** Each `<code>/<family>/<precision>/` is a `pocket_swap` package. It holds `manifest.json` (source,
+  licence and base identity, sizes, error), the transformer backbone as a delta against the family's English base,
+  the language's own text embedding and head (stored as they are: vocabularies differ), and its tokenizer
+  (`tokenizer.json`, or `tokenizer.model` for SentencePiece).
+- **Precisions.** `int4` is the default: about the size of a 4-bit model, and much more accurate, because only the
+  difference from English is quantised. `int8` is closer still. `bf16` is the exact difference.
+- **At run time.** The GPU holds one copy of each family's English backbone. Every language adds only its delta;
+  the fused kernel computes x·(W_en + Δ) without ever writing the language's full weights.
+- **Picking a package.** For each language the engine uses the first family in `--pocket-families` (default
+  `24l,6l`) that has the precision `--pocket-precision` (default `int4`).
+- **Mimi.** The Mimi codec and its voice-cloning encoder are identical in every language. They come from Kyutai's
+  English checkpoint, which is gated: accept Kyutai's terms on the model page.
 
-**Many languages on one GPU: `pocket_swap`.** Each loaded Pocket language holds its own weights. `pocket_swap/`
-keeps one shared base checkpoint plus a small package per language: a quantised delta or quantised weights. It moves
-languages between GPU, host RAM and disk as sessions need them. Packages are built locally from the official
-checkpoints (`python -m pocket_swap.cli build ...`, see [`pocket_swap/README.md`](../pocket_swap/README.md)).
-Prebuilt packages are not published yet.
+**Download.** The packages are published at
+[pocket-tts-deltas](https://huggingface.co/gabrione/pocket-tts-deltas); `F2_PACKAGES_REPO` uses another repo.
+`make f2-setup F2_LANGS=it,en,fr,ko` fetches the languages you list in their best family, the needed English bases,
+and the gated Mimi checkpoint. `make f2-plan ...` shows the sizes first.
+
+**Build it yourself.** `python frankenstein2/scripts/build_packages.py --out pocket-tts-deltas` rebuilds the whole
+folder from the sources in its `SOURCES` table:
+- Kyutai's official languages come from the non-gated `kyutai/pocket-tts-without-voice-cloning`. Their weights are
+  identical to the gated ones, and no package contains Mimi, so no voice-cloning weights are redistributed.
+- Each package records its source's licence and attribution, and is verified against its source after the build.
+
+**The cache at run time.** The engine keeps up to `--talker-vram-langs` languages on the GPU (default 4) and
+`--talker-host-langs` packages in pinned host RAM (default 8). The rest stay on disk.
+- A session whose language is not loaded waits for it; every other session keeps talking. The load runs on its own
+  thread and CUDA stream, never on the scheduler.
+- A language in use is never evicted.
+- All languages share one pool of per-session talker state per family.
+- `frankenstein2/lab/talker_stress.py` stresses it with end-to-end sessions over many languages
+  (`--talker-rotate`).
 
 ## Adding a language
 
-Each step is one row or table entry:
+Copy a folder with this layout into the language folder; the server picks it up at the next session that asks for
+it, without a restart:
 
-1. **Talker:** the Pocket folder name in `frankenstein2/runtime.py` (`LANGS`) and in
-   `frankenstein2/scripts/setup_models.py` (`POCKET`).
-2. **Ears:** the locale prompt, and an end-of-turn threshold checked on real speech (`--ep-thr xx=...`).
-3. **Phrases:** the holding phrase, reminder and backchannel in `frankenstein2/core.py`; the timeout apology and the
-   "I'm checking" pattern in `frankenstein2/llm/qwen.py`.
-4. **Prompts:** the reply brief and tool policy in `frankenstein2/llm/nano.py`, and the language row in
-   `frankenstein/frankenstein_s2s/lang.py`.
-5. **Text:** numbers, dates and currencies to words for the talker (`frankenstein2/text/normalize.py`), and spoken
-   numbers to digits for tool arguments (`frankenstein2/text/spoken_numbers.py`).
-6. **Serve it:** the session language list (`Resources.languages`). Then run a gate in that language, checking the
-   model text, an ASR of the spoken audio and the tool ground truth.
+1. **Choose the code.** Use its ISO 639-1 code (`sv`, `ko`, ...), and check that the ASR has its locale (table
+   above).
+2. **Build the package.** You need a Pocket TTS model of that language in one of the two families: a 24-layer or
+   6-layer model with the same architecture as Kyutai's English one (fine-tuned from it, or not).
+   - Add a row to `SOURCES` in `frankenstein2/scripts/build_packages.py` (repo, file, tokenizer, licence) and
+     run it with `--langs <code>`.
+   - Or call `pocket_swap`'s `build_package` directly, with `en/<family>/base` as the base.
+3. **Write `<code>/language.json`:**
+
+   ```json
+   {"code": "sv", "name": "Swedish", "asr_locale": "sv-SE",
+    "phrases": {"holding": "Ett ögonblick, jag kollar.", "reminder": "Snart klart, ett ögonblick till.",
+                "apology": "Tyvärr kunde jag inte hämta informationen i tid. Kan du försöka igen om en stund?",
+                "backchannel": "Mm."}}
+   ```
+
+   `name` goes into the LLM's instruction ("the caller speaks Swedish"). `asr_locale` selects the ASR prompt.
+   Missing phrases fall back to English.
+4. **Optional, for quality.** A per-language end-of-turn threshold (`--ep-thr sv=0.88`), checked on real speech.
+   The number normaliser (`frankenstein2/text/normalize.py`, digits to words for the talker) exists for it / en /
+   fr only. Other languages pass digits to the talker as they are.
+5. **Before calling it supported**, run a gate in that language: the model's text, an ASR of the spoken audio and
+   the tool ground truth.
