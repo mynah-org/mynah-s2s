@@ -107,3 +107,13 @@ def test_a_broken_language_fails_alone():
             break
         time.sleep(0.002)
     assert c.want("xx").startswith("failed") and c.get("it") is not None
+
+
+def test_talker_counts_an_open_sessions_language_as_in_use_between_replies():
+    from types import SimpleNamespace
+    from frankenstein2.runtime import InProcTalker
+    t = SimpleNamespace(name_of={"s1": "it@03"}, cur={}, jobs={})
+    assert InProcTalker._in_use(t, "it@03")          # no reply running or queued: still the session's language
+    assert not InProcTalker._in_use(t, "fr")
+    t.name_of.clear()
+    assert not InProcTalker._in_use(t, "it@03")      # closed: evictable

@@ -218,7 +218,9 @@ class InProcTalker:
         return n
 
     def _in_use(self, name):
-        return any(c["name"] == name for c in self.cur.values()) or \
+        """A language an open session speaks is in use, also between its replies: evicting it there only makes the
+        session's next reply wait for a reload (with more sessions than --talker-vram-langs it thrashed)."""
+        return name in self.name_of.values() or any(c["name"] == name for c in self.cur.values()) or \
             any(j["name"] == name for q in self.jobs.values() for j in q)
 
     def preload(self, lang, timeout=600.0):
