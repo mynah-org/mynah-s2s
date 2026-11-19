@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from frankenstein2.core import HOLDING, Pipeline, PipelineConfig  # noqa: E402
+from frankenstein2.core import HOLD_REMINDER, HOLDING, Pipeline, PipelineConfig  # noqa: E402
 from frankenstein2.ears.client import EarsLink  # noqa: E402
 from frankenstein2.llm.base import ScriptedLLM  # noqa: E402
 from frankenstein2.tests.fakes import FakeEarsBackend, pieces  # noqa: E402
@@ -73,6 +73,20 @@ def test_tool_turn_holding_phrase_digits_and_history():
     roles = [m["role"] for m in p.conv.messages]
     assert roles == ["user", "assistant", "tool", "assistant"]
     assert HOLDING["it"] not in json.dumps(p.conv.messages)     # the holding phrase never enters the history
+
+
+def test_slow_tool_gets_a_spoken_reminder_outside_the_history():
+    db = {"XYZ123": {"status": "shipped"}}
+    ears = {"s": {2: {"pieces": pieces(4, "dov'è il mio ordine X Y Z uno due tre"), "events": [ev("ENDPOINT", 11)]}}}
+    script = lambda m: [("decided",), ("wait", 30), ("waiting", 4.0, "get_order_status"), ("wait", 5),
+                        ("tool", "get_order_status", {"order_id": "X Y Z uno due tre"}),
+                        ("text", "Il suo ordine è stato spedito.")]
+    p, be, llm, talker, tr = make("s", "it", ears, script, tools={"get_order_status": orders_handler(db)})
+    run(p, 120)
+    assert [s["text"] for s in talker.said][:2] == [HOLDING["it"], HOLD_REMINDER["it"]]
+    assert talker.said[-1]["text"] == "Il suo ordine è stato spedito."
+    assert HOLD_REMINDER["it"] not in json.dumps(p.conv.messages)
+    assert [m["role"] for m in p.conv.messages] == ["user", "assistant", "tool", "assistant"]
 
 
 def test_barge_in_keeps_only_heard_text_and_flushes():

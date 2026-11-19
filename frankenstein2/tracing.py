@@ -8,7 +8,7 @@ Families:
              asr.drop (speech heard while the agent spoke, not part of a barge-in)
   ctl.*      every controller intent and action (with epoch, turn_id, request_id)
   llm.*      llm.request, llm.text, llm.decided, llm.tool, llm.done, llm.stale
-  tool.*     tool.completed (name, normalised args, raw args, result, call_id)
+  tool.*     tool.completed (name, normalised args, raw args, result, call_id, status, ms), tool.waiting (s, names)
   tts.*      tts.segment (text, speech text, lane, sid), tts.first_audio, tts.done, tts.cancel, tts.error
   audio.*    audio.release (per step with audio: samples, lane), audio.flush, audio.underrun, audio.stale
   history.*  history.agent (heard text, cut flag), history.drop_user
@@ -28,7 +28,7 @@ EVENTS = frozenset({
     "asr.piece", "asr.turn", "asr.drop",
     "ctl.intent", "ctl.action",
     "llm.request", "llm.text", "llm.decided", "llm.tool", "llm.done", "llm.stale",
-    "tool.completed",
+    "tool.completed", "tool.waiting",
     "tts.segment", "tts.first_audio", "tts.done", "tts.cancel", "tts.error",
     "audio.release", "audio.flush", "audio.underrun", "audio.stale",
     "history.agent", "history.drop_user",

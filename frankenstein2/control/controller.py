@@ -21,6 +21,8 @@ Intents                          ->  actions
                                      turn); the user text carries into the next endpoint
   BACKCHANNEL (ears, listen)         BACKCHANNEL (short audio, not in the 2nd ear, not in history)
   LLM_DECIDED (tool step chose a call)  HOLDING_PHRASE once per turn if nothing was spoken yet
+  LLM_WAIT (a tool is still running)  HOLDING_PHRASE(reminder) up to ``max_reminders`` per turn; keeps the reply
+                                     timer alive (tools run asynchronously, the caller can still barge in)
   LLM_TOOL                           TOOL_RECORD (history: the call and its result, kept even if later barged)
   LLM_TEXT                           SPEAK(text) (-> chunker -> normaliser -> talker)
   LLM_DONE                           END_TEXT (chunker flush); the turn closes when its audio has played out
@@ -43,7 +45,7 @@ class St(Enum):
     SPEAKING = "speaking"
 
 
-PRIORITY = {"BARGE": 0, "CANCEL": 1, "USER_CONTINUES": 1, "LLM_DECIDED": 2, "LLM_TOOL": 2, "LLM_TEXT": 3, "LLM_DONE": 4,
+PRIORITY = {"BARGE": 0, "CANCEL": 1, "USER_CONTINUES": 1, "LLM_DECIDED": 2, "LLM_WAIT": 2, "LLM_TOOL": 2, "LLM_TEXT": 3, "LLM_DONE": 4,
             "AUDIO_STARTED": 5, "PLAYED_OUT": 6, "ENDPOINT": 7, "BACKCHANNEL": 8}
 SOURCE_RANK = {"app": 0, "ears": 1, "llm": 2, "talker": 3, "playout": 4}
 
@@ -84,6 +86,7 @@ class ControllerConfig:
     min_user_chars: int = 1            # an endpoint with a shorter transcript does not open a turn
     merge_unheard: bool = True         # a barge before anything was heard: the user's text carries into the next turn
     continue_window: int = 25          # steps (2 s) after an open in which new user words mean "not finished"
+    max_reminders: int = 2             # on-hold reminders per turn while a tool runs
 
 
 class Controller:
@@ -102,6 +105,7 @@ class Controller:
         self.text_done = False
         self.spoken = False               # reply text handed to the talker in this turn
         self.holding_done = False
+        self.reminders = 0
         self.last_activity_k = None
         self.done_k = None
         self.carry = ""                   # user text of a turn cancelled before anything was heard
@@ -161,6 +165,7 @@ class Controller:
         self.state = St.THINKING
         self.opened_k = self.last_activity_k = k
         self.text_done = self.spoken = self.holding_done = False
+        self.reminders = 0
         self.done_k = None
         self.user_text = user_text
         self._act("OPEN_TURN", k, reason, user_text=user_text)
@@ -224,6 +229,16 @@ class Controller:
         if self.cfg.holding_phrase and not self.holding_done and not self.spoken:
             self.holding_done = True
             self._act("HOLDING_PHRASE", k, "tool_decided", request_id=it.request_id)
+
+    def _on_llm_wait(self, it, k):
+        why = self._is_stale(it)
+        if why or self.state is St.LISTENING:
+            return self._stale(it, k, why or "state_listening")
+        self.last_activity_k = k
+        if self.cfg.holding_phrase and self.reminders < self.cfg.max_reminders:
+            self.reminders += 1
+            self._act("HOLDING_PHRASE", k, "tool_wait", request_id=it.request_id, reminder=self.reminders,
+                      waited_s=(it.payload or {}).get("s"))
 
     def _on_llm_tool(self, it, k):
         why = self._is_stale(it)

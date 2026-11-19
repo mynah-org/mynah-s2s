@@ -8,15 +8,32 @@ client plugin. Tool calls are executed engine-side through the session's bound h
 and code grounding first), then the results go back for the next round (at most ``max_rounds``).
 
 Qwen3.5 call format: <tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>\n</tool_call>
-STATUS: parser and splitter unit-tested; the process path is NOT VERIFIED on a GPU yet.
+Tool calls run asynchronously on a thread pool (see ``QwenLLM``).
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from .base import wrap_tools
+
+# Tool backends run here, never on the engine's scheduler thread (which drives the ears, the talker and the LLM of
+# every session): a slow backend only delays its own session's reply. Shared by all sessions of the process.
+_POOL = None
+
+
+def tool_pool() -> ThreadPoolExecutor:
+    global _POOL
+    if _POOL is None:
+        _POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="f2-tool")
+    return _POOL
+
+
+# Reference shapes (VoiceChat engine, mynah_v2.agent.tools): a call still running at the deadline gets this error.
+TIMEOUT_PAYLOAD = json.dumps({"error": "timeout", "message": "I'm sorry, that's taking longer than expected."})
 
 TAG = "<tool_call>"
 FN = re.compile(r"<function=([\w.\-]+)>(.*?)</function>", re.S)
@@ -87,12 +104,20 @@ class SpeechSplitter:
         return s
 
 
-class QwenLLM:  # pragma: no cover - needs the Qwen process
+class QwenLLM:
     """Client plugin. ``proc`` speaks: {"op": "gen", "ss", "rid", "messages", "tools"} -> {"ev": "delta", "ss", "rid",
-    "text"}* then {"ev": "end", "ss", "rid"}; {"op": "cancel", "ss", "rid"}."""
+    "text"}* then {"ev": "end", "ss", "rid"}; {"op": "cancel", "ss", "rid"}.
+
+    Tool calls are asynchronous (as in the VoiceChat engine): the calls of a round start together on the tool pool
+    and ``poll()`` never waits for them. While they run the request is parked; a ``waiting`` event goes out every
+    ``reminder_s`` (at most ``max_reminders``) so the controller can keep the caller company and the reply timer
+    alive; at ``tool_timeout_s`` a call still running gets the reference timeout error and the round goes on without
+    it (its later result is counted as late, never used). A cancelled request (barge-in) drops its pending results.
+    The calls' tool messages go back in call order."""
 
     def __init__(self, proc, ss: str, system: str, tool_schemas: list, bound: dict, lang: str, max_rounds: int = 3,
-                 user_texts=None):
+                 user_texts=None, tool_timeout_s: float = 10.0, reminder_s: float = 4.0, max_reminders: int = 2,
+                 pool=None, clock=time.monotonic):
         self.p, self.ss, self.system, self.schemas, self.lang = proc, ss, system, tool_schemas, lang
         self.record: list = []
         self.last_msgs: list = []
@@ -104,6 +129,11 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
         self.jobs: dict = {}
         self.out: list = []
         self.calls: list = []
+        self.tool_timeout_s, self.reminder_s, self.max_reminders = tool_timeout_s, reminder_s, max_reminders
+        self.pool, self.clock = pool, clock
+        self.ledger = None                     # the session's ToolLedger when bound (open calls cancelled on close)
+        self.late = 0                          # results that arrived after their deadline or their request's cancel
+        self.dropped = 0                       # calls whose request was cancelled while they ran
 
     def _gen(self, rid, msgs, assistant_prefix=None):
         m = {"op": "gen", "ss": self.ss, "rid": rid, "tools": self.schemas,
@@ -125,11 +155,68 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
         self._gen(rid, self.jobs[rid]["msgs"])
 
     def cancel(self, rid):
-        if self.jobs.pop(rid, None) is not None:
+        j = self.jobs.pop(rid, None)
+        if j is None:
+            return
+        w = j.get("wait")
+        if w is not None:                       # parked on tools: nothing is generating, the results are dropped
+            for c in w["calls"]:
+                if not c["fut"].done():
+                    self.dropped += 1
+                    c["fut"].add_done_callback(lambda f: self._count_late())
+        else:
             self.p.send({"op": "cancel", "ss": self.ss, "rid": rid})
+
+    def _count_late(self):
+        self.late += 1
+
+    def _start_tools(self, rid, j, calls):
+        pool = self.pool or tool_pool()
+        w = {"t0": self.clock(), "calls": [], "reminded": 0}
+        for c in calls:
+            box: list = []
+            if c["name"] in self.tools:
+                fut = pool.submit(self.tools[c["name"]], c["arguments"], box)
+            else:
+                fut = pool.submit(lambda n=c["name"]: json.dumps({"error": f"unknown tool {n}"}))
+            w["calls"].append({"c": c, "fut": fut, "rec": box})
+        j["wait"] = w
+
+    def _check_tools(self, rid, j, out):
+        w = j["wait"]
+        el = self.clock() - w["t0"]
+        if not all(c["fut"].done() for c in w["calls"]) and el < self.tool_timeout_s:
+            if self.reminder_s and w["reminded"] < self.max_reminders and el >= self.reminder_s * (w["reminded"] + 1):
+                w["reminded"] += 1
+                out.append({"ev": "waiting", "rid": rid, "s": round(el, 2),
+                            "names": [c["c"]["name"] for c in w["calls"] if not c["fut"].done()]})
+            return
+        del j["wait"]
+        for x in w["calls"]:
+            c, fut = x["c"], x["fut"]
+            if not fut.done():
+                res, status = TIMEOUT_PAYLOAD, "timed_out"
+                fut.add_done_callback(lambda f: self._count_late())
+            elif fut.exception() is not None:
+                res, status = json.dumps({"error": str(fut.exception())}), "failed"
+            else:
+                res, status = fut.result(), "completed"
+            rec = x["rec"][0] if x["rec"] else {"args": c["arguments"], "fixes": []}
+            ev = {"ev": "tool", "rid": rid, "name": c["name"], "args": rec["args"], "args_raw": c["arguments"],
+                  "fixes": rec.get("fixes"), "result": res, "status": status, "ms": round(el * 1000, 1),
+                  "call_id": f"call{len(self.calls) + 1}"}
+            self.calls.append(ev)
+            out.append(ev)
+            j["msgs"].append({"role": "tool", "content": res})
+        j["round"] += 1
+        j["split"] = SpeechSplitter()
+        self._gen(rid, j["msgs"])
 
     def poll(self):
         out = []
+        for rid, j in list(self.jobs.items()):
+            if "wait" in j:
+                self._check_tools(rid, j, out)
         for m in self.p.poll(self.ss):
             j = self.jobs.get(m.get("rid"))
             if j is None:
@@ -166,19 +253,8 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
                 if calls and j["round"] < self.max_rounds:
                     j["msgs"].append({"role": "assistant", "content": (j.pop("said_before_call", "") + "\n" + sp.call)
                                       .lstrip("\n")})
-                    for c in calls:
-                        res = self.tools[c["name"]](c["arguments"]) if c["name"] in self.tools else \
-                            json.dumps({"error": f"unknown tool {c['name']}"})
-                        rec = self.record[-1] if c["name"] in self.tools else {"args": c["arguments"], "fixes": []}
-                        ev = {"ev": "tool", "rid": rid, "name": c["name"], "args": rec["args"],
-                              "args_raw": c["arguments"], "fixes": rec.get("fixes"), "result": res,
-                              "call_id": f"call{len(self.calls) + 1}"}
-                        self.calls.append(ev)
-                        out.append(ev)
-                        j["msgs"].append({"role": "tool", "content": res})
-                    j["round"] += 1
-                    j["split"] = SpeechSplitter()
-                    self._gen(rid, j["msgs"])
+                    self._start_tools(rid, j, calls)
+                    self._check_tools(rid, j, out)      # fast backends: the round goes on in this same poll
                 else:
                     rest = sp.flush()
                     if rest:
@@ -191,5 +267,7 @@ class QwenLLM:  # pragma: no cover - needs the Qwen process
     def close(self):
         for rid in list(self.jobs):
             self.cancel(rid)
+        if self.ledger is not None:             # open calls -> cancelled; a later result is recorded as late
+            self.ledger.cancel_open("session_closed")
         if getattr(self.p, "releases_slots", False):       # the in-process engine frees the session's slot
             self.p.send({"op": "close", "ss": self.ss})

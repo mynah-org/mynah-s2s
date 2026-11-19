@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -57,6 +58,12 @@ def add_args(ap) -> None:
     ap.add_argument("--chunking", default="", help="talker chunking override: sentence | whole | progressive")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--ep-thr", action="append", default=[], help="LANG=threshold for the endpoint head")
+    ap.add_argument("--tool-timeout", type=float, default=8.0,
+                    help="seconds a tool may run; then the model gets the reference timeout error (late results are "
+                         "recorded in the ledger, never used)")
+    ap.add_argument("--tool-reminder-s", type=float, default=4.0,
+                    help="an on-hold reminder every N seconds while a tool runs (0 = none)")
+    ap.add_argument("--tool-delay-s", type=float, default=0.0, help="lab: every tool backend sleeps N seconds first")
     ap.add_argument("--no-tool-rule", dest="tool_rule", action="store_false",
                     help="v2b: without the tool rule in the system prompt and the localized decision question")
     ap.add_argument("--runtime", default="procs", choices=["procs", "single"],
@@ -143,6 +150,19 @@ def start_qwen(a, log_dir: Path):  # pragma: no cover - process
     return p
 
 
+def slowed(handlers: dict, delay_s: float) -> dict:
+    """Lab: tool backends that take ``delay_s`` first (a slow CRM / network), to exercise the async tool path."""
+    if not delay_s:
+        return handlers
+
+    def mk(fn):
+        def h(args):
+            time.sleep(delay_s)
+            return fn(args)
+        return h
+    return {n: mk(f) for n, f in handlers.items()}
+
+
 def qwen_factory(a, proc, spec):  # pragma: no cover - process
     sys.path.insert(0, str(ROOT / "frankenstein"))
     from tenant_backend import TenantBackend
@@ -159,14 +179,18 @@ def qwen_factory(a, proc, spec):  # pragma: no cover - process
         backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
         backend._said = said
         reg = ToolRegistry()
+        hs = slowed(backend.handlers(), getattr(a, "tool_delay_s", 0.0))
         for t in spec["tools"]:
-            reg.register(t["name"], backend.handlers()[t["name"]], t["description"], t["parameters"])
-        bound = reg.bind(ToolLedger(sid, None), lambda: 0, lambda: None, timeout_s=None)
+            reg.register(t["name"], hs[t["name"]], t["description"], t["parameters"])
+        led = ToolLedger(sid, None)
+        tmo = getattr(a, "tool_timeout", 8.0)
+        bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=tmo)   # backend in its own thread, ledger timeout
         rule = ("\n" + TOOL_RULE.get(lang, TOOL_RULE["en"])) if a.tool_rule else ""
         system = (with_language(system_prompt or spec["system_prompt"], L) + "\n" + policy.get(lang, policy["en"])
                   + "\n" + BRIEF.get(lang, BRIEF["en"]) + rule)
-        llm = QwenLLM(proc, sid, system, tool_schemas(reg), bound, lang)
-        llm.backend = backend
+        llm = QwenLLM(proc, sid, system, tool_schemas(reg), bound, lang, tool_timeout_s=tmo + 1.0,
+                      reminder_s=getattr(a, "tool_reminder_s", 4.0))
+        llm.backend, llm.ledger = backend, led
         return llm
     return make
 
@@ -195,8 +219,9 @@ def llm_factory(a, shared, spec, on_ledger=None):  # pragma: no cover - GPU
         backend = TenantBackend(spec, user_activity=lambda: len(said), user_transcript=lambda: said)
         backend._said = said
         reg = ToolRegistry()
+        hs = slowed(backend.handlers(), getattr(a, "tool_delay_s", 0.0))
         for t in spec["tools"]:
-            reg.register(t["name"], backend.handlers()[t["name"]], t["description"], t["parameters"])
+            reg.register(t["name"], hs[t["name"]], t["description"], t["parameters"])
         led = ToolLedger(sid, None)
         bound = reg.bind(led, lambda: 0, lambda: None, timeout_s=None)
         rule = ("\n" + TOOL_RULE.get(lang, TOOL_RULE["en"])) if a.tool_rule else ""

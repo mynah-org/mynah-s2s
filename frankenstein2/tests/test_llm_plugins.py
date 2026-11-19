@@ -2,11 +2,13 @@
 
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from frankenstein2.llm.qwen import QwenLLM, SpeechSplitter, parse_calls  # noqa: E402
+from frankenstein2.llm.qwen import TIMEOUT_PAYLOAD, QwenLLM, SpeechSplitter, parse_calls  # noqa: E402
 from frankenstein2.text.spoken_numbers import ground_codes  # noqa: E402
 
 CALL = ("<tool_call>\n<function=find_customer>\n<parameter=name>\nMario Rossi\n</parameter>\n"
@@ -48,13 +50,24 @@ class FakeQwenProc:
         return out
 
 
+def drain(q, until="done", limit_s=3.0):
+    """Poll until an event of kind ``until`` (tools run on a thread pool, so a round may take several polls)."""
+    evs, t_end = [], time.monotonic() + limit_s
+    while time.monotonic() < t_end:
+        evs += q.poll()
+        if any(e["ev"] == until for e in evs):
+            return evs
+        time.sleep(0.002)
+    raise AssertionError(f"no {until!r} event: {[e['ev'] for e in evs]}")
+
+
 def test_qwen_round_trip_runs_tool_and_resumes():
     seen = []
     proc = FakeQwenProc([CALL, "Trovato, signor Rossi."])
     q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: (seen.append(a), json.dumps({"ok": 1}))[1]}, "it",
                 user_texts=lambda: ["il mio cap è uno zero uno due uno"])
     q.submit(1, [{"role": "user", "content": "Mario Rossi, cap uno zero uno due uno"}])
-    evs = q.poll() + q.poll()
+    evs = drain(q)
     kinds = [e["ev"] for e in evs]
     assert kinds[0] == "decided" and "tool" in kinds and kinds[-1] == "done"
     assert seen == [{"name": "Mario Rossi", "postcode": "10121"}]
@@ -75,7 +88,7 @@ def test_qwen_forces_the_call_a_turn_only_announced():
     proc = FakeQwenProc(["Cerco il divano a tre posti nel catalogo.", FORCED, "C'è il divano Fjordby."])
     q = QwenLLM(proc, "s", "sys", [], {"search_catalog": lambda a: (seen.append(a), json.dumps({"ok": 1}))[1]}, "it")
     q.submit(1, [{"role": "user", "content": "Avete divani a tre posti?"}])
-    evs = q.poll() + q.poll() + q.poll()
+    evs = drain(q)
     assert proc.sent[1]["assistant_prefix"] == "Cerco il divano a tre posti nel catalogo.\n<tool_call>\n"
     assert seen == [{"query": "divano tre posti"}] and q.forced == 1
     said = "".join(e["text"] for e in evs if e["ev"] == "text")
@@ -91,3 +104,82 @@ def test_qwen_does_not_force_a_plain_answer():
     q.submit(1, [{"role": "user", "content": "Che orari fate?"}])
     evs = q.poll()
     assert [e["ev"] for e in evs][-1] == "done" and len(proc.sent) == 1 and q.forced == 0
+
+
+CALL2 = ("<tool_call>\n<function=search_catalog>\n<parameter=query>\ndivano\n</parameter>\n</function>\n</tool_call>\n"
+         "<tool_call>\n<function=find_customer>\n<parameter=name>\nMario Rossi\n</parameter>\n</function>\n"
+         "</tool_call>")
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_qwen_slow_tool_never_blocks_poll_and_sends_reminders():
+    gate, clock = threading.Event(), Clock()
+    proc = FakeQwenProc([CALL, "Trovato."])
+    q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: (gate.wait(5), json.dumps({"ok": 1}))[1]}, "it",
+                reminder_s=4.0, max_reminders=2, tool_timeout_s=10.0, clock=clock)
+    q.submit(1, [{"role": "user", "content": "Mario Rossi"}])
+    t0 = time.monotonic()
+    evs = q.poll()
+    assert time.monotonic() - t0 < 0.5                     # the backend is blocked, poll() is not
+    assert [e["ev"] for e in evs] == ["decided"] and len(proc.sent) == 1
+    waits = []
+    for t in (3.9, 4.1, 5.0, 8.2, 9.5):
+        clock.t = t
+        waits += [e for e in q.poll() if e["ev"] == "waiting"]
+    assert [round(w["s"], 1) for w in waits] == [4.1, 8.2] and waits[0]["names"] == ["find_customer"]
+    gate.set()
+    evs = drain(q)
+    tool = next(e for e in evs if e["ev"] == "tool")
+    assert tool["status"] == "completed" and tool["result"] == '{"ok": 1}'
+    assert proc.sent[1]["messages"][-1] == {"role": "tool", "content": '{"ok": 1}'}
+
+
+def test_qwen_tool_past_the_deadline_gets_the_reference_timeout_error():
+    gate, clock = threading.Event(), Clock()
+    proc = FakeQwenProc([CALL, "Mi scusi, il sistema è lento."])
+    q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: (gate.wait(5), "late")[1]}, "it",
+                tool_timeout_s=10.0, reminder_s=0, clock=clock)
+    q.submit(1, [{"role": "user", "content": "Mario Rossi"}])
+    q.poll()
+    clock.t = 10.5
+    evs = drain(q)
+    tool = next(e for e in evs if e["ev"] == "tool")
+    assert tool["status"] == "timed_out" and tool["result"] == TIMEOUT_PAYLOAD
+    assert proc.sent[1]["messages"][-1]["content"] == TIMEOUT_PAYLOAD
+    gate.set()
+    t_end = time.monotonic() + 2
+    while q.late == 0 and time.monotonic() < t_end:
+        time.sleep(0.005)
+    assert q.late == 1                                     # the backend's answer arrived later: counted, not used
+
+
+def test_qwen_runs_the_calls_of_a_round_in_parallel_and_answers_in_call_order():
+    barrier = threading.Barrier(2, timeout=2)              # each backend waits for the other: only passes if parallel
+    def slow(name):
+        return lambda a: (barrier.wait(), json.dumps({"tool": name}))[1]
+    proc = FakeQwenProc([CALL2, "Ecco."])
+    q = QwenLLM(proc, "s", "sys", [], {"search_catalog": slow("search"), "find_customer": slow("customer")}, "it")
+    q.submit(1, [{"role": "user", "content": "divano, Mario Rossi"}])
+    evs = drain(q)
+    assert [e["name"] for e in evs if e["ev"] == "tool"] == ["search_catalog", "find_customer"]
+    assert [m["content"] for m in proc.sent[1]["messages"][-2:]] == ['{"tool": "search"}', '{"tool": "customer"}']
+
+
+def test_qwen_cancel_while_a_tool_runs_drops_its_result():
+    gate = threading.Event()
+    proc = FakeQwenProc([CALL, "never"])
+    q = QwenLLM(proc, "s", "sys", [], {"find_customer": lambda a: (gate.wait(5), "{}")[1]}, "it")
+    q.submit(1, [{"role": "user", "content": "Mario Rossi"}])
+    q.poll()
+    q.cancel(1)
+    gate.set()
+    time.sleep(0.05)
+    assert q.poll() == [] and len(proc.sent) == 1 and q.dropped == 1
+    assert not any(m["op"] == "cancel" for m in proc.sent)   # nothing was generating: no cancel to the engine

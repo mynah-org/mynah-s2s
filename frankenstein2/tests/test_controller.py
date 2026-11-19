@@ -129,3 +129,25 @@ def test_order_of_arrival_does_not_matter():
         seen.add(tuple((a.kind, a.reason) for a in c.tick(2)))
     assert len(seen) == 1
     assert list(seen)[0][0] == ("CANCEL", "barge_in")
+
+
+def test_tool_wait_reminds_twice_and_keeps_the_reply_alive():
+    c = Controller()
+    endpoint(c, 1)
+    acts = []
+    for k in range(2, 260):
+        if k in (50, 100, 150, 200):                       # a slow tool: "waiting" every 4 s
+            c.post(Intent("LLM_WAIT", "llm", k, payload={"s": k * 0.08}, request_id=1))
+        acts += c.tick(k)
+    rem = [a for a in acts if a.kind == "HOLDING_PHRASE"]
+    assert [a.reason for a in rem] == ["tool_wait", "tool_wait"] and rem[1].data["reminder"] == 2
+    assert "CANCEL" not in kinds(acts)        # without the waits the 12 s reply timeout fires at step 152
+
+
+def test_tool_wait_after_a_barge_is_stale():
+    c = Controller()
+    endpoint(c, 1)
+    c.post(Intent("CANCEL", "app", 2))
+    c.tick(2)
+    c.post(Intent("LLM_WAIT", "llm", 3, payload={"s": 4.0}, request_id=1))
+    assert "HOLDING_PHRASE" not in kinds(c.tick(3))

@@ -37,6 +37,10 @@ from .tts.base import parse_sid, seg_id
 
 HOLDING = {"it": "Un momento, controllo.", "fr": "Un instant, je vérifie.", "en": "One moment, let me check.",
            "de": "Einen Moment, ich schaue nach.", "es": "Un momento, lo compruebo."}
+# On-hold reminder while a tool is still running (VoiceChat engine: on-hold messages + reminders during FC).
+HOLD_REMINDER = {"it": "Ci sono quasi, ancora un attimo.", "fr": "J'y suis presque, encore un instant.",
+                 "en": "Almost there, just a moment more.", "de": "Gleich habe ich es, noch einen Moment.",
+                 "es": "Ya casi, un momento más."}
 BACKCHANNEL = {"it": "Mh-mh.", "fr": "Mh-mh.", "en": "Mm-hmm.", "de": "Mh-mh.", "es": "Mh-mh."}
 STEP = 1280
 
@@ -144,7 +148,7 @@ class Pipeline:
             on = self.barge_cand["onset"]
             to = self.turns.get((self.ctl.epoch, self.ctl.turn))
             why = self.barge.decide(self.barge_cand, [{"f": f, "p": p} for f, p in self.user.pieces if f >= on - 1],
-                                    agent_text=(to.text if to else "") + " " + HOLDING.get(self.lang, ""))
+                                    agent_text=(to.text if to else "") + " " + self._canned())
             if why:
                 self.stats["barges"].append({"frame": on, "step": k, "by": why})
                 self.tr.emit("ears.event", k, kind="BARGE", by=why, onset_frame=on,
@@ -186,7 +190,7 @@ class Pipeline:
         if r.get("pieces"):
             asr_delta.append(self.user.add(r["pieces"]))
             to = self.turns.get((self.ctl.epoch, self.ctl.turn))
-            self.barge.words(r["pieces"], (to.text if to else "") + " " + HOLDING.get(self.lang, ""))
+            self.barge.words(r["pieces"], (to.text if to else "") + " " + self._canned())
             self.tr.emit("asr.piece", k, pieces=[[p["f"], p["p"]] for p in r["pieces"]])
             c = self.ctl
             if c.state is not St.LISTENING and self.last_ep_frame is not None and not self.continues_posted and \
@@ -211,6 +215,10 @@ class Pipeline:
                 self.stats["backchannels"].append({"frame": e["k"], "step": k})
                 self.ctl.post(Intent("BACKCHANNEL", "ears", k, payload={"frame": e["k"]}))
 
+    def _canned(self) -> str:
+        """Fixed phrases the agent may be saying (the barge check must not take their echo for the user)."""
+        return HOLDING.get(self.lang, "") + " " + HOLD_REMINDER.get(self.lang, "")
+
     def _on_llm(self, e: dict, k: int) -> None:
         kind, rid = e["ev"], e.get("rid")
         if kind == "text":
@@ -219,11 +227,16 @@ class Pipeline:
         elif kind == "decided":
             self.tr.emit("llm.decided", k, request_id=rid)
             self.ctl.post(Intent("LLM_DECIDED", "llm", k, request_id=rid))
+        elif kind == "waiting":
+            self.tr.emit("tool.waiting", k, request_id=rid, s=e.get("s"), names=e.get("names"))
+            self.ctl.post(Intent("LLM_WAIT", "llm", k, payload={"s": e.get("s"), "names": e.get("names")},
+                                 request_id=rid))
         elif kind == "tool":
             self.conv.tool(e["name"], e.get("args") or {}, e.get("result", ""),
                            markup=getattr(self.llm, "call_markup", None))
             self.tr.emit("tool.completed", k, request_id=rid, name=e["name"], args=e.get("args"),
                          args_raw=e.get("args_raw"), result=e.get("result"), call_id=e.get("call_id"),
+                         status=e.get("status", "completed"), ms=e.get("ms"),
                          turn_id=self.ctl.turn)
             self.ctl.post(Intent("LLM_TOOL", "llm", k, payload={"name": e["name"], "call_id": e.get("call_id")},
                                  request_id=rid))
@@ -263,7 +276,8 @@ class Pipeline:
             self.tr.emit("llm.request", k, request_id=d["request_id"], turn_id=a.turn,
                          n_messages=len(self.conv.messages))
         elif a.kind == "HOLDING_PHRASE":
-            txt = HOLDING.get(self.lang, HOLDING["en"])
+            table = HOLD_REMINDER if a.reason == "tool_wait" else HOLDING
+            txt = table.get(self.lang, table["en"])
             self._say(self._turn_out(), txt, speech_text(txt, self.lang), holding=True)
         elif a.kind == "SPEAK":
             to = self._turn_out()

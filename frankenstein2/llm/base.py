@@ -7,6 +7,8 @@ loaded model. Non-blocking:
   cancel(rid)             stop that request as soon as possible (its later events are stale anyway)
   poll() -> [events]      {"ev": "text", "rid", "text"}            reply text delta (spoken)
                           {"ev": "decided", "rid"}                  the tool step chose to call a tool (holding phrase)
+                          {"ev": "waiting", "rid", "s", "names"}    a tool is still running after s seconds
+                                                                    (the controller may say an on-hold reminder)
                           {"ev": "tool", "rid", "name", "args", "args_raw", "result", "call_id"}   a tool RAN
                           {"ev": "done", "rid", "text", "info"}     the reply is complete
   close()
@@ -29,16 +31,20 @@ class LLMPlugin(Protocol):
 
 def wrap_tools(bound: dict, lang: str, record: list, user_texts=None) -> dict:
     """Handlers that normalise spoken numbers in the arguments first and ground code-like values on what the caller
-    said (``user_texts() -> [str]``); ``record`` gets {name, args_raw, args, fixes}."""
+    said (``user_texts() -> [str]``); ``record`` gets {name, args_raw, args, fixes}. ``h(args, rec_out=list)`` also
+    hands that record to the caller, which is what concurrent calls use (``record[-1]`` may be another call's)."""
     from frankenstein2.text.spoken_numbers import ground_codes, normalize_args
 
     def mk(name, fn):
-        def h(args):
+        def h(args, rec_out=None):
             norm = normalize_args(args if isinstance(args, dict) else {}, lang)
             fixes = []
             if user_texts is not None:
                 norm, fixes = ground_codes(norm, list(user_texts()), lang)
-            record.append({"name": name, "args_raw": args, "args": norm, "fixes": fixes})
+            rec = {"name": name, "args_raw": args, "args": norm, "fixes": fixes}
+            record.append(rec)
+            if rec_out is not None:
+                rec_out.append(rec)
             return fn(norm)
         return h
     return {n: mk(n, f) for n, f in bound.items()}
@@ -46,7 +52,7 @@ def wrap_tools(bound: dict, lang: str, record: list, user_texts=None) -> dict:
 
 class ScriptedLLM:
     """Deterministic fake: ``script(messages) -> list of steps``; a step is ("text", str) | ("decided",) |
-    ("tool", name, args) | ("wait", n_polls). Steps are released one per poll, so tests control the timing."""
+    ("tool", name, args) | ("wait", n_polls) | ("waiting", seconds, *names) (a slow tool). Steps are released one per poll, so tests control the timing."""
 
     def __init__(self, script, tools: dict | None = None, lang: str = "en"):
         self.script, self.lang = script, lang
@@ -91,6 +97,8 @@ class ScriptedLLM:
             self.calls.append({"name": name, "args": rec["args"], "result": res})
             out.append({"ev": "tool", "rid": rid, "name": name, "args": rec["args"], "args_raw": args,
                         "result": res, "call_id": f"c{len(self.calls)}"})
+        elif st[0] == "waiting":
+            out.append({"ev": "waiting", "rid": rid, "s": st[1], "names": list(st[2:])})
         elif st[0] == "wait" and st[1] > 1:
             steps.insert(0, ("wait", st[1] - 1))
         return out
